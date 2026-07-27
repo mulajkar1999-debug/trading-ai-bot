@@ -1,5 +1,6 @@
 from flask import Flask, jsonify, request
 import requests
+import numpy as np
 
 app = Flask(__name__)
 
@@ -18,7 +19,7 @@ def send_telegram_alert(message):
         }
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
-        print(f"Telegram Send Error: {e}")
+        print(f"Telegram Alert Error: {e}")
 
 def get_binance_klines(symbol, interval="15m", limit=210):
     try:
@@ -36,9 +37,10 @@ def get_binance_klines(symbol, interval="15m", limit=210):
             return closes, opens, highs, lows, volumes
         return [], [], [], [], []
     except Exception as e:
-        print(f"Error fetching data: {e}")
+        print(f"Data Fetch Error: {e}")
         return [], [], [], [], []
 
+# Exponential Moving Average
 def calculate_ema(prices, period):
     if len(prices) < period:
         return 0
@@ -48,6 +50,7 @@ def calculate_ema(prices, period):
         ema = (price * k) + (ema * (1 - k))
     return ema
 
+# RSI Momentum Oscillator
 def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
         return 50
@@ -65,117 +68,129 @@ def calculate_rsi(prices, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# 🧠 PRICE ACTION FUNCTION 1: Market Structure (BOS - Break of Structure)
-def check_market_structure(highs, lows, closes):
-    recent_high = max(highs[-20:-1])  # Last 20 candles highest peak
-    recent_low = min(lows[-20:-1])    # Last 20 candles lowest trough
-    current_close = closes[-1]
+# Average True Range (Dynamic Risk Adjustment)
+def calculate_atr(highs, lows, closes, period=14):
+    if len(closes) < period + 1:
+        return 1.0
+    tr_list = []
+    for i in range(1, len(closes)):
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        tr_list.append(tr)
+    return sum(tr_list[-period:]) / period
+
+# Smart Money Concepts: Break of Structure (BOS) & Order Blocks
+def analyze_smc_structure(highs, lows, closes):
+    recent_high = max(highs[-25:-1])
+    recent_low = min(lows[-25:-1])
+    curr_close = closes[-1]
     
-    bos_bullish = current_close > recent_high  # High broken = Bullish BOS
-    bos_bearish = current_close < recent_low   # Low broken = Bearish BOS
+    bos_bullish = curr_close > recent_high
+    bos_bearish = curr_close < recent_low
     return bos_bullish, bos_bearish, recent_high, recent_low
 
-# 🧠 PRICE ACTION FUNCTION 2: Wick Rejection (Liquidity Rejection Test)
-def check_wick_rejection(opens, closes, highs, lows):
-    curr_open = opens[-1]
-    curr_close = closes[-1]
-    curr_high = highs[-1]
-    curr_low = lows[-1]
+# Fakeout & Rejection Detection
+def analyze_candle_traps(opens, closes, highs, lows):
+    c_open, c_close, c_high, c_low = opens[-1], closes[-1], highs[-1], lows[-1]
+    body = abs(c_close - c_open)
+    upper_wick = c_high - max(c_open, c_close)
+    lower_wick = min(c_open, c_close) - c_low
     
-    body_size = abs(curr_close - curr_open)
-    lower_wick = min(curr_open, curr_close) - curr_low
-    upper_wick = curr_high - max(curr_open, curr_close)
-    
-    # Strong rejection from bottom (Bullish)
-    bullish_rejection = lower_wick > (body_size * 1.5)
-    # Strong rejection from top (Bearish)
-    bearish_rejection = upper_wick > (body_size * 1.5)
-    
+    bullish_rejection = lower_wick > (body * 1.8) and lower_wick > upper_wick
+    bearish_rejection = upper_wick > (body * 1.8) and upper_wick > lower_wick
     return bullish_rejection, bearish_rejection
 
 @app.route('/api/signal', methods=['GET'])
 def get_signal():
     asset = request.args.get('asset', 'GOLD').upper()
+    symbol = 'PAXGUSDT' if asset == 'GOLD' else 'BTCUSDT'
     
-    symbol_map = {
-        'GOLD': 'PAXGUSDT',
-        'BTC': 'BTCUSDT'
-    }
-    
-    symbol = symbol_map.get(asset, 'PAXGUSDT')
     closes, opens, highs, lows, volumes = get_binance_klines(symbol, interval="15m", limit=210)
     
     if not closes or len(closes) < 200:
         return jsonify({
             "asset": asset,
-            "status": "Scanning Technicals & Market Structure...",
+            "status": "PRO ENGINE SCANNING MARKET...",
             "action": "WAIT 🟡",
             "confidence": 50
         }), 200
-    
+
     current_price = closes[-1]
     
-    # Technical Indicators
+    # Technical Calculations
     ema_fast = calculate_ema(closes, 9)
     ema_slow = calculate_ema(closes, 21)
     ema_trend = calculate_ema(closes, 200)
     rsi = calculate_rsi(closes, 14)
+    atr = calculate_atr(highs, lows, closes, 14)
     
-    # Price Action Logic Checks
-    bos_bullish, bos_bearish, demand_level, supply_level = check_market_structure(highs, lows, closes)
-    bullish_wick, bearish_wick = check_wick_rejection(opens, closes, highs, lows)
+    # SMC & Price Action Engine
+    bos_bull, bos_bear, supply_zone, demand_zone = analyze_smc_structure(highs, lows, closes)
+    bull_reject, bear_reject = analyze_candle_traps(opens, closes, highs, lows)
     
-    confidence = 50
-    action = "WAIT / CONSOLIDATION 🟡"
+    avg_vol = sum(volumes[-20:]) / 20
+    volume_surge = volumes[-1] > (avg_vol * 1.3)
     
-    # 🎯 HYBRID CONFLUENCE LOGIC (Price Action + Indicators)
-    # BUY SETUP
-    if current_price > ema_trend and ema_fast > ema_slow:
-        if 48 <= rsi <= 68:
-            if bos_bullish or bullish_wick:  # Price Action Confirmation
-                confidence = 88
-                action = "STRONG BUY (BOS CONFIRMED) 🟢"
-            else:
-                confidence = 75
-                action = "BUY WATCH 🟢"
-                
-    # SELL SETUP
-    elif current_price < ema_trend and ema_fast < ema_slow:
-        if 32 <= rsi <= 52:
-            if bos_bearish or bearish_wick:  # Price Action Confirmation
-                confidence = 88
-                action = "STRONG SELL (BOS CONFIRMED) 🔴"
-            else:
-                confidence = 75
-                action = "SELL WATCH 🔴"
+    score = 0
+    action = "WAIT / NO CLEAR ENTRY 🟡"
+    
+    # 🎯 HIGH PRECISION BUY ALGORITHM (85%+ Target)
+    if current_price > ema_trend: # Major Trend Filter
+        score += 25
+        if ema_fast > ema_slow: # Momentum Alignment
+            score += 20
+        if 48 <= rsi <= 67: # Healthy Zone
+            score += 20
+        if bos_bull or bull_reject: # Structural Confirmation
+            score += 20
+        if volume_surge: # Institutional Presence
+            score += 10
+            
+        if score >= 85:
+            action = "INSTITUTIONAL BUY 🟢"
 
-    pips_margin = 2.0 if asset == 'GOLD' else 150
+    # 🎯 HIGH PRECISION SELL ALGORITHM (85%+ Target)
+    elif current_price < ema_trend: # Major Trend Filter
+        score += 25
+        if ema_fast < ema_slow: # Momentum Alignment
+            score += 20
+        if 33 <= rsi <= 52: # Healthy Zone
+            score += 20
+        if bos_bear or bear_reject: # Structural Confirmation
+            score += 20
+        if volume_surge: # Institutional Presence
+            score += 10
+            
+        if score >= 85:
+            action = "INSTITUTIONAL SELL 🔴"
+
+    # Dynamic ATR Risk Allocation
+    tp_distance = round(atr * 1.8, 2)
+    sl_distance = round(atr * 1.0, 2)
     
     if "BUY" in action:
-        tp = round(current_price + pips_margin, 2)
-        sl = round(current_price - (pips_margin * 0.65), 2)
+        tp = round(current_price + tp_distance, 2)
+        sl = round(current_price - sl_distance, 2)
     else:
-        tp = round(current_price - pips_margin, 2)
-        sl = round(current_price + pips_margin, 2)
+        tp = round(current_price - tp_distance, 2)
+        sl = round(current_price + sl_distance, 2)
 
-    tv_symbol = "PAXGUSDT" if asset == "GOLD" else "BTCUSDT"
-    chart_link = f"https://www.tradingview.com/chart/?symbol=BINANCE:{tv_symbol}"
+    chart_symbol = "PAXGUSDT" if asset == "GOLD" else "BTCUSDT"
+    chart_link = f"https://www.tradingview.com/chart/?symbol=BINANCE:{chart_symbol}"
 
-    # Telegram Notification Trigger (85%+ High Precision Only)
-    if confidence >= 85:
+    # Auto Telegram Notification (Triggers ONLY when Score >= 85)
+    if score >= 85:
         alert_msg = (
-            f"🔥 *PRO HYBRID SIGNAL ({asset})*\n\n"
+            f"🚀 *PRO ALGO SIGNAL ({asset})*\n\n"
             f"Action: *{action}*\n"
-            f"Current Price: `{current_price}`\n"
-            f"Target (TP): `{tp}`\n"
+            f"Entry Price: `{current_price}`\n"
+            f"Take Profit (TP): `{tp}`\n"
             f"Stop Loss (SL): `{sl}`\n\n"
-            f"🧠 *Price Action Data:*\n"
-            f"• Demand/Low Level: `{round(supply_level, 2)}`\n"
-            f"• Supply/High Level: `{round(demand_level, 2)}`\n"
-            f"• Structure Break (BOS): `{'YES ⚡' if (bos_bullish or bos_bearish) else 'NO'}`\n"
-            f"• Rejection Wick: `{'DETECTED 🕯️' if (bullish_wick or bearish_wick) else 'NONE'}`\n"
-            f"• Confidence: *{confidence}%*\n\n"
-            f"📈 [TradingView Chart Link]({chart_link})"
+            f"🔬 *Institutional Analysis:* \n"
+            f"• Confluence Score: *{score}%*\n"
+            f"• Structure Break: `{'YES ⚡' if (bos_bull or bos_bear) else 'NORMAL'}`\n"
+            f"• Volume Expansion: `{'STRONG 📊' if volume_surge else 'MODERATE'}`\n"
+            f"• Dynamic Volatility (ATR): `{round(atr, 2)}`\n\n"
+            f"📈 [Open Live Chart]({chart_link})"
         )
         send_telegram_alert(alert_msg)
 
@@ -183,12 +198,10 @@ def get_signal():
         "asset": asset,
         "price": current_price,
         "action": action,
-        "confidence": confidence,
+        "confluence_score": score,
         "rsi": round(rsi, 2),
-        "bos_break": bos_bullish or bos_bearish,
-        "wick_rejection": bullish_wick or bearish_wick,
-        "tp": tp if confidence >= 85 else 0,
-        "sl": sl if confidence >= 85 else 0
+        "tp": tp if score >= 85 else 0,
+        "sl": sl if score >= 85 else 0
     })
 
 if __name__ == '__main__':
