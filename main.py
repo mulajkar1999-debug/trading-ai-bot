@@ -1,139 +1,98 @@
-import os
-import time
-import requests
 from flask import Flask, jsonify, request
-from flask_cors import CORS
+import requests
+import os
 
 app = Flask(__name__)
-CORS(app)
 
-# ==========================================
-# 📱 TELEGRAM CONFIGURATION
-# ==========================================
-TELEGRAM_BOT_TOKEN = "8723192534:AAHSR0Ysj2LdxWQGwbHOImIoNx0DgnZ7uNs"
-TELEGRAM_CHAT_ID = "1317739622"
+# Telegram Configuration
+TELEGRAM_BOT_TOKEN = "7963384242:AAEg3L2d_g8w-vR8fInS4YtS2NqE3Y3L-S8"  # Aapka Bot Token
+TELEGRAM_CHAT_ID = "1317739622"      # Aapki Chat ID
 
-last_sent_signal = {"GOLD": "", "BTC": ""}
-
-def send_telegram_alert(asset, action, price, sl, tp, confidence):
-    global last_sent_signal
-    if not TELEGRAM_BOT_TOKEN:
-        return
-        
-    signal_key = f"{action}_{price}"
-    if ("BUY" in action or "SELL" in action) and last_sent_signal.get(asset) != signal_key:
-        message = (
-            f"🚀 **HIGH PRECISION TRADE ALERT** 🚀\n\n"
-            f"📊 **Asset:** {asset}\n"
-            f"⚡ **Signal:** {action}\n"
-            f"💵 **Price:** ${price}\n"
-            f"🛑 **Stop Loss (SL):** ${sl}\n"
-            f"🎯 **Take Profit (TP):** ${tp}\n"
-            f"🔥 **AI Confidence:** {confidence}%\n\n"
-            f"📱 Execute trade now!"
-        )
+def send_telegram_alert(message):
+    try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-        try:
-            requests.post(url, json=payload, timeout=5)
-            last_sent_signal[asset] = signal_key
-            print(f"[ALERT] Telegram sent for {asset}")
-        except Exception as e:
-            print("[ALERT ERROR]", e)
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        print(f"Telegram Send Error: {e}")
 
-# ==========================================
-# 📊 DATA FETCHERS
-# ==========================================
-def get_btc_data():
+def get_binance_data(symbol, interval="15m", limit=50):
     try:
-        url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=50"
-        res = requests.get(url, timeout=5).json()
-        closes = [float(k[4]) for k in res]
-        return closes[-1], closes
-    except:
-        return 65000.0, [65000.0]*50
-
-def get_gold_data():
-    try:
-        url = "https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=15m&limit=50"
-        res = requests.get(url, timeout=5).json()
-        closes = [float(k[4]) for k in res]
-        return closes[-1], closes
-    except:
-        return 2350.0, [2350.0]*50
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        closes = [float(candle[4]) for candle in data]
+        return closes
+    except Exception as e:
+        print(f"Error fetching data: {e}")
+        return []
 
 def calculate_sma(data, period):
-    if len(data) < period: return data[-1]
+    if len(data) < period:
+        return 0
     return sum(data[-period:]) / period
 
-def analyze_market(price, history, is_gold=False):
-    sma20 = calculate_sma(history, 20)
-    sma50 = calculate_sma(history, 50)
-    
-    sl_offset = 8 if is_gold else 400
-    tp_offset = 16 if is_gold else 800
-    
-    if price > sma20 and sma20 > sma50:
-        action = "BUY NOW 🟢"
-        color = "GREEN"
-        confidence = 85
-        sl = round(price - sl_offset, 2)
-        tp = round(price + tp_offset, 2)
-        note = "Strong Uptrend Detected (SMA20 > SMA50)"
-    elif price < sma20 and sma20 < sma50:
-        action = "SELL NOW 🔴"
-        color = "RED"
-        confidence = 85
-        sl = round(price + sl_offset, 2)
-        tp = round(price - tp_offset, 2)
-        note = "Strong Downtrend Detected (SMA20 < SMA50)"
-    else:
-        action = "WAIT / CONSOLIDATION 🟡"
-        color = "GRAY"
-        confidence = 50
-        sl = 0
-        tp = 0
-        note = "Market in Range. Waiting for breakout."
-        
-    return {
-        "action": action,
-        "color": color,
-        "confidence": confidence,
-        "sl": sl,
-        "tp": tp,
-        "status_note": note
-    }
-
-# ==========================================
-# 🌐 API ENDPOINT
-# ==========================================
 @app.route('/api/signal', methods=['GET'])
 def get_signal():
     asset = request.args.get('asset', 'GOLD').upper()
-    if asset == 'BTC':
-        price, history = get_btc_data()
-        analysis = analyze_market(price, history, is_gold=False)
-    else:
-        price, history = get_gold_data()
-        analysis = analyze_market(price, history, is_gold=True)
-        
-    # Trigger Alert if valid signal
-    send_telegram_alert(asset, analysis["action"], price, analysis["sl"], analysis["tp"], analysis["confidence"])
     
+    # Binance Pair Mapping
+    symbol_map = {
+        'GOLD': 'PAXGUSDT',
+        'BTC': 'BTCUSDT'
+    }
+    
+    symbol = symbol_map.get(asset, 'PAXGUSDT')
+    prices = get_binance_data(symbol, interval="15m", limit=50)
+    
+    if not prices:
+        return jsonify({"status": "Error fetching data"}), 500
+    
+    current_price = prices[-1]
+    sma_fast = calculate_sma(prices, 9)   # Short-term EMA/SMA for 10-20 pips
+    sma_slow = calculate_sma(prices, 21)  # Trend filter
+    
+    # Fast Scalping Logic (10 - 20 Pips Setup)
+    pips_margin = 1.5 if asset == 'GOLD' else 100  # Target ~15 pips approx
+    
+    action = "WAIT / CONSOLIDATION 🟡"
+    confidence = 50
+    tp = 0
+    sl = 0
+    
+    if sma_fast > sma_slow and current_price > sma_fast:
+        action = "BUY NOW 🟢"
+        confidence = 65  # Lowered threshold for daily 10-20 pips signals
+        tp = round(current_price + pips_margin, 2)
+        sl = round(current_price - (pips_margin * 0.8), 2)
+        
+    elif sma_fast < sma_slow and current_price < sma_fast:
+        action = "SELL NOW 🔴"
+        confidence = 65
+        tp = round(current_price - pips_margin, 2)
+        sl = round(current_price + (pips_margin * 0.8), 2)
+        
+    # Trigger Telegram Alert on Scalp Signal
+    if confidence >= 60:
+        alert_msg = (
+            f"🎯 *FAST SCALP SIGNAL ({asset})*\n\n"
+            f"Action: *{action}*\n"
+            f"Current Price: `{current_price}`\n"
+            f"Target (TP ~15 Pips): `{tp}`\n"
+            f"Stop Loss (SL): `{sl}`\n"
+            f"Confidence: `{confidence}%`\n\n"
+            f"⚡ Quick 10-20 pips trade!"
+        )
+        send_telegram_alert(alert_msg)
+        
     return jsonify({
-        "price": price,
-        "action": analysis["action"],
-        "color": analysis["color"],
-        "confidence": analysis["confidence"],
-        "sl": analysis["sl"],
-        "tp": analysis["tp"],
-        "status_note": analysis["status_note"]
+        "asset": asset,
+        "price": current_price,
+        "action": action,
+        "confidence": confidence,
+        "tp": tp,
+        "sl": sl
     })
 
-@app.route('/')
-def home():
-    return "Trading AI Engine is Live & Running 24/7!"
-
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=5000)
