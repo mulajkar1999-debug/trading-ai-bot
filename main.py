@@ -29,14 +29,15 @@ def get_binance_klines(symbol, interval="15m", limit=210):
         if response.status_code == 200:
             data = response.json()
             closes = [float(candle[4]) for candle in data]
-            volumes = [float(candle[5]) for candle in data]
+            opens = [float(candle[1]) for candle in data]
             highs = [float(candle[2]) for candle in data]
             lows = [float(candle[3]) for candle in data]
-            return closes, volumes, highs, lows
-        return [], [], [], []
+            volumes = [float(candle[5]) for candle in data]
+            return closes, opens, highs, lows, volumes
+        return [], [], [], [], []
     except Exception as e:
         print(f"Error fetching data: {e}")
-        return [], [], [], []
+        return [], [], [], [], []
 
 def calculate_ema(prices, period):
     if len(prices) < period:
@@ -64,24 +65,33 @@ def calculate_rsi(prices, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# 📊 Support and Resistance Calculator (Pivot Points)
-def calculate_support_resistance(highs, lows, closes):
-    prev_high = highs[-2]
-    prev_low = lows[-2]
-    prev_close = closes[-2]
+# 🧠 PRICE ACTION FUNCTION 1: Market Structure (BOS - Break of Structure)
+def check_market_structure(highs, lows, closes):
+    recent_high = max(highs[-20:-1])  # Last 20 candles highest peak
+    recent_low = min(lows[-20:-1])    # Last 20 candles lowest trough
+    current_close = closes[-1]
     
-    pivot = (prev_high + prev_low + prev_close) / 3
-    r1 = (2 * pivot) - prev_low
-    s1 = (2 * pivot) - prev_high
-    return s1, r1, pivot
+    bos_bullish = current_close > recent_high  # High broken = Bullish BOS
+    bos_bearish = current_close < recent_low   # Low broken = Bearish BOS
+    return bos_bullish, bos_bearish, recent_high, recent_low
 
-# 🔊 Volume Analysis Check
-def is_volume_strong(volumes, period=20):
-    if len(volumes) < period:
-        return False
-    avg_vol = sum(volumes[-period:]) / period
-    current_vol = volumes[-1]
-    return current_vol > (avg_vol * 1.2)  # 20% higher than average volume
+# 🧠 PRICE ACTION FUNCTION 2: Wick Rejection (Liquidity Rejection Test)
+def check_wick_rejection(opens, closes, highs, lows):
+    curr_open = opens[-1]
+    curr_close = closes[-1]
+    curr_high = highs[-1]
+    curr_low = lows[-1]
+    
+    body_size = abs(curr_close - curr_open)
+    lower_wick = min(curr_open, curr_close) - curr_low
+    upper_wick = curr_high - max(curr_open, curr_close)
+    
+    # Strong rejection from bottom (Bullish)
+    bullish_rejection = lower_wick > (body_size * 1.5)
+    # Strong rejection from top (Bearish)
+    bearish_rejection = upper_wick > (body_size * 1.5)
+    
+    return bullish_rejection, bearish_rejection
 
 @app.route('/api/signal', methods=['GET'])
 def get_signal():
@@ -93,48 +103,50 @@ def get_signal():
     }
     
     symbol = symbol_map.get(asset, 'PAXGUSDT')
-    prices, volumes, highs, lows = get_binance_klines(symbol, interval="15m", limit=210)
+    closes, opens, highs, lows, volumes = get_binance_klines(symbol, interval="15m", limit=210)
     
-    if not prices or len(prices) < 200:
+    if not closes or len(closes) < 200:
         return jsonify({
             "asset": asset,
-            "status": "Scanning Technicals, Volume & Levels...",
+            "status": "Scanning Technicals & Market Structure...",
             "action": "WAIT 🟡",
             "confidence": 50
         }), 200
     
-    current_price = prices[-1]
+    current_price = closes[-1]
     
-    # Indicators & Price Action Data
-    ema_fast = calculate_ema(prices, 9)
-    ema_slow = calculate_ema(prices, 21)
-    ema_trend = calculate_ema(prices, 200)
-    rsi = calculate_rsi(prices, 14)
-    support, resistance, pivot = calculate_support_resistance(highs, lows, prices)
-    has_volume = is_volume_strong(volumes)
+    # Technical Indicators
+    ema_fast = calculate_ema(closes, 9)
+    ema_slow = calculate_ema(closes, 21)
+    ema_trend = calculate_ema(closes, 200)
+    rsi = calculate_rsi(closes, 14)
+    
+    # Price Action Logic Checks
+    bos_bullish, bos_bearish, demand_level, supply_level = check_market_structure(highs, lows, closes)
+    bullish_wick, bearish_wick = check_wick_rejection(opens, closes, highs, lows)
     
     confidence = 50
     action = "WAIT / CONSOLIDATION 🟡"
     
-    # 🎯 ADVANCED CONFLUENCE LOGIC
-    # BUY SETUP: Uptrend + EMA Cross + RSI Zone + Above Support + Strong Volume
+    # 🎯 HYBRID CONFLUENCE LOGIC (Price Action + Indicators)
+    # BUY SETUP
     if current_price > ema_trend and ema_fast > ema_slow:
-        if 48 <= rsi <= 68 and current_price > support:
-            if has_volume:
-                confidence = 88  # Volume confirmed
-                action = "STRONG BUY NOW 🟢"
+        if 48 <= rsi <= 68:
+            if bos_bullish or bullish_wick:  # Price Action Confirmation
+                confidence = 88
+                action = "STRONG BUY (BOS CONFIRMED) 🟢"
             else:
-                confidence = 75  # Low volume buy
+                confidence = 75
                 action = "BUY WATCH 🟢"
                 
-    # SELL SETUP: Downtrend + EMA Cross + RSI Zone + Below Resistance + Strong Volume
+    # SELL SETUP
     elif current_price < ema_trend and ema_fast < ema_slow:
-        if 32 <= rsi <= 52 and current_price < resistance:
-            if has_volume:
-                confidence = 88  # Volume confirmed
-                action = "STRONG SELL NOW 🔴"
+        if 32 <= rsi <= 52:
+            if bos_bearish or bearish_wick:  # Price Action Confirmation
+                confidence = 88
+                action = "STRONG SELL (BOS CONFIRMED) 🔴"
             else:
-                confidence = 75  # Low volume sell
+                confidence = 75
                 action = "SELL WATCH 🔴"
 
     pips_margin = 2.0 if asset == 'GOLD' else 150
@@ -144,26 +156,26 @@ def get_signal():
         sl = round(current_price - (pips_margin * 0.65), 2)
     else:
         tp = round(current_price - pips_margin, 2)
-        sl = round(current_price + (pips_margin * 0.65), 2)
+        sl = round(current_price + pips_margin, 2)
 
     tv_symbol = "PAXGUSDT" if asset == "GOLD" else "BTCUSDT"
     chart_link = f"https://www.tradingview.com/chart/?symbol=BINANCE:{tv_symbol}"
 
-    # Telegram Notification Trigger (High Precision Only)
+    # Telegram Notification Trigger (85%+ High Precision Only)
     if confidence >= 85:
         alert_msg = (
-            f"🔥 *ULTIMATE HIGH PRECISION SIGNAL ({asset})*\n\n"
+            f"🔥 *PRO HYBRID SIGNAL ({asset})*\n\n"
             f"Action: *{action}*\n"
             f"Current Price: `{current_price}`\n"
             f"Target (TP): `{tp}`\n"
             f"Stop Loss (SL): `{sl}`\n\n"
-            f"📊 *Market Analysis Data:*\n"
-            f"• Support Level: `{round(support, 2)}`\n"
-            f"• Resistance Level: `{round(resistance, 2)}`\n"
-            f"• Volume Status: `{'STRONG 🚀' if has_volume else 'NORMAL'}`\n"
-            f"• RSI Momentum: `{round(rsi, 2)}`\n"
+            f"🧠 *Price Action Data:*\n"
+            f"• Demand/Low Level: `{round(supply_level, 2)}`\n"
+            f"• Supply/High Level: `{round(demand_level, 2)}`\n"
+            f"• Structure Break (BOS): `{'YES ⚡' if (bos_bullish or bos_bearish) else 'NO'}`\n"
+            f"• Rejection Wick: `{'DETECTED 🕯️' if (bullish_wick or bearish_wick) else 'NONE'}`\n"
             f"• Confidence: *{confidence}%*\n\n"
-            f"📈 [Live Chart View]({chart_link})"
+            f"📈 [TradingView Chart Link]({chart_link})"
         )
         send_telegram_alert(alert_msg)
 
@@ -173,9 +185,8 @@ def get_signal():
         "action": action,
         "confidence": confidence,
         "rsi": round(rsi, 2),
-        "support": round(support, 2),
-        "resistance": round(resistance, 2),
-        "volume_spike": has_volume,
+        "bos_break": bos_bullish or bos_bearish,
+        "wick_rejection": bullish_wick or bearish_wick,
         "tp": tp if confidence >= 85 else 0,
         "sl": sl if confidence >= 85 else 0
     })
