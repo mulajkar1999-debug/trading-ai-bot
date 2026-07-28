@@ -1,11 +1,10 @@
 from flask import Flask, jsonify, request
 import requests
-import numpy as np
 
 app = Flask(__name__)
 
-# Telegram Configuration
-TELEGRAM_BOT_TOKEN = "7963384242:AAEg3L2d_g8w-vR8fInS4YtS2NqE3Y3L-S8"
+# Telegram Configuration (Updated with New Token)
+TELEGRAM_BOT_TOKEN = "8723192534:AAFqkexJpF-yu38dPI0cEUT6H0nooN_sjdM"
 TELEGRAM_CHAT_ID = "1317739622"
 
 def send_telegram_alert(message):
@@ -40,7 +39,6 @@ def get_binance_klines(symbol, interval="15m", limit=210):
         print(f"Data Fetch Error: {e}")
         return [], [], [], [], []
 
-# Exponential Moving Average
 def calculate_ema(prices, period):
     if len(prices) < period:
         return 0
@@ -50,7 +48,6 @@ def calculate_ema(prices, period):
         ema = (price * k) + (ema * (1 - k))
     return ema
 
-# RSI Momentum Oscillator
 def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
         return 50
@@ -68,7 +65,6 @@ def calculate_rsi(prices, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# Average True Range (Dynamic Risk Adjustment)
 def calculate_atr(highs, lows, closes, period=14):
     if len(closes) < period + 1:
         return 1.0
@@ -78,7 +74,6 @@ def calculate_atr(highs, lows, closes, period=14):
         tr_list.append(tr)
     return sum(tr_list[-period:]) / period
 
-# Smart Money Concepts: Break of Structure (BOS) & Order Blocks
 def analyze_smc_structure(highs, lows, closes):
     recent_high = max(highs[-25:-1])
     recent_low = min(lows[-25:-1])
@@ -88,7 +83,6 @@ def analyze_smc_structure(highs, lows, closes):
     bos_bearish = curr_close < recent_low
     return bos_bullish, bos_bearish, recent_high, recent_low
 
-# Fakeout & Rejection Detection
 def analyze_candle_traps(opens, closes, highs, lows):
     c_open, c_close, c_high, c_low = opens[-1], closes[-1], highs[-1], lows[-1]
     body = abs(c_close - c_open)
@@ -116,14 +110,12 @@ def get_signal():
 
     current_price = closes[-1]
     
-    # Technical Calculations
     ema_fast = calculate_ema(closes, 9)
     ema_slow = calculate_ema(closes, 21)
     ema_trend = calculate_ema(closes, 200)
     rsi = calculate_rsi(closes, 14)
     atr = calculate_atr(highs, lows, closes, 14)
     
-    # SMC & Price Action Engine
     bos_bull, bos_bear, supply_zone, demand_zone = analyze_smc_structure(highs, lows, closes)
     bull_reject, bear_reject = analyze_candle_traps(opens, closes, highs, lows)
     
@@ -133,37 +125,36 @@ def get_signal():
     score = 0
     action = "WAIT / NO CLEAR ENTRY 🟡"
     
-    # 🎯 HIGH PRECISION BUY ALGORITHM (85%+ Target)
-    if current_price > ema_trend: # Major Trend Filter
+    # BUY SETUP
+    if current_price > ema_trend:
         score += 25
-        if ema_fast > ema_slow: # Momentum Alignment
+        if ema_fast > ema_slow:
             score += 20
-        if 48 <= rsi <= 67: # Healthy Zone
+        if 48 <= rsi <= 67:
             score += 20
-        if bos_bull or bull_reject: # Structural Confirmation
+        if bos_bull or bull_reject:
             score += 20
-        if volume_surge: # Institutional Presence
+        if volume_surge:
             score += 10
             
         if score >= 85:
             action = "INSTITUTIONAL BUY 🟢"
 
-    # 🎯 HIGH PRECISION SELL ALGORITHM (85%+ Target)
-    elif current_price < ema_trend: # Major Trend Filter
+    # SELL SETUP
+    elif current_price < ema_trend:
         score += 25
-        if ema_fast < ema_slow: # Momentum Alignment
+        if ema_fast < ema_slow:
             score += 20
-        if 33 <= rsi <= 52: # Healthy Zone
+        if 33 <= rsi <= 52:
             score += 20
-        if bos_bear or bear_reject: # Structural Confirmation
+        if bos_bear or bear_reject:
             score += 20
-        if volume_surge: # Institutional Presence
+        if volume_surge:
             score += 10
             
         if score >= 85:
             action = "INSTITUTIONAL SELL 🔴"
 
-    # Dynamic ATR Risk Allocation
     tp_distance = round(atr * 1.8, 2)
     sl_distance = round(atr * 1.0, 2)
     
@@ -177,7 +168,6 @@ def get_signal():
     chart_symbol = "PAXGUSDT" if asset == "GOLD" else "BTCUSDT"
     chart_link = f"https://www.tradingview.com/chart/?symbol=BINANCE:{chart_symbol}"
 
-    # Auto Telegram Notification (Triggers ONLY when Score >= 85)
     if score >= 85:
         alert_msg = (
             f"🚀 *PRO ALGO SIGNAL ({asset})*\n\n"
