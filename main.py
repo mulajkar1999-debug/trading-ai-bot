@@ -1,11 +1,12 @@
+import os
 from flask import Flask, jsonify, request
 import requests
 
 app = Flask(__name__)
 
-# Telegram Configuration (Updated with New Token)
-TELEGRAM_BOT_TOKEN = "8723192534:AAFqkexJpF-yu38dPI0cEUT6H0nooN_sjdM"
-TELEGRAM_CHAT_ID = "1317739622"
+# Secure Token Reading from Render Environment
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8723192534:AAFqkexJpF-yu38dPI0cEUT6H0nooN_sjdM")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1317739622")
 
 def send_telegram_alert(message):
     try:
