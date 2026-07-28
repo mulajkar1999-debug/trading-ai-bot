@@ -1,26 +1,30 @@
 import os
-from flask import Flask, jsonify, request
 import requests
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-# Secure Token Reading from Render Environment
+# Telegram Configuration (Render Environment Variables with Fallbacks)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8723192534:AAFqkexJpF-yu38dPI0cEUT6H0nooN_sjdM")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1317739622")
 
-def send_telegram_alert(message):
+# --- TELEGRAM HELPER FUNCTIONS ---
+def send_telegram_alert(message, reply_markup=None):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
-            "chat_id": TELEGRAM_CHAT_ID, 
-            "text": message, 
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
             "parse_mode": "Markdown",
             "disable_web_page_preview": False
         }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
         print(f"Telegram Alert Error: {e}")
 
+# --- DATA FETCHING & INDICATORS ---
 def get_binance_klines(symbol, interval="15m", limit=210):
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -29,11 +33,11 @@ def get_binance_klines(symbol, interval="15m", limit=210):
         
         if response.status_code == 200:
             data = response.json()
-            closes = [float(candle[4]) for candle in data]
-            opens = [float(candle[1]) for candle in data]
-            highs = [float(candle[2]) for candle in data]
-            lows = [float(candle[3]) for candle in data]
-            volumes = [float(candle[5]) for candle in data]
+            closes = [float(c[4]) for c in data]
+            opens = [float(c[1]) for c in data]
+            highs = [float(c[2]) for c in data]
+            lows = [float(c[3]) for c in data]
+            volumes = [float(c[5]) for c in data]
             return closes, opens, highs, lows, volumes
         return [], [], [], [], []
     except Exception as e:
@@ -75,66 +79,55 @@ def calculate_atr(highs, lows, closes, period=14):
         tr_list.append(tr)
     return sum(tr_list[-period:]) / period
 
-def analyze_smc_structure(highs, lows, closes):
-    recent_high = max(highs[-25:-1])
-    recent_low = min(lows[-25:-1])
-    curr_close = closes[-1]
+# --- CORE ENGINE ANALYSIS ---
+def analyze_asset(asset_name):
+    symbol = 'PAXGUSDT' if asset_name == 'GOLD' else 'BTCUSDT'
     
-    bos_bullish = curr_close > recent_high
-    bos_bearish = curr_close < recent_low
-    return bos_bullish, bos_bearish, recent_high, recent_low
+    # 15m Timeframe Data
+    closes_15m, opens_15m, highs_15m, lows_15m, volumes_15m = get_binance_klines(symbol, interval="15m", limit=210)
+    # 1h Higher Timeframe Data
+    closes_1h, _, _, _, _ = get_binance_klines(symbol, interval="1h", limit=200)
+    
+    if not closes_15m or len(closes_15m) < 200 or not closes_1h or len(closes_1h) < 200:
+        return None
 
-def analyze_candle_traps(opens, closes, highs, lows):
-    c_open, c_close, c_high, c_low = opens[-1], closes[-1], highs[-1], lows[-1]
-    body = abs(c_close - c_open)
-    upper_wick = c_high - max(c_open, c_close)
-    lower_wick = min(c_open, c_close) - c_low
+    current_price = closes_15m[-1]
     
-    bullish_rejection = lower_wick > (body * 1.8) and lower_wick > upper_wick
-    bearish_rejection = upper_wick > (body * 1.8) and upper_wick > lower_wick
-    return bullish_rejection, bearish_rejection
-
-@app.route('/api/signal', methods=['GET'])
-def get_signal():
-    asset = request.args.get('asset', 'GOLD').upper()
-    symbol = 'PAXGUSDT' if asset == 'GOLD' else 'BTCUSDT'
+    # 15m Technicals
+    ema9 = calculate_ema(closes_15m, 9)
+    ema21 = calculate_ema(closes_15m, 21)
+    ema200_15m = calculate_ema(closes_15m, 200)
+    rsi_15m = calculate_rsi(closes_15m, 14)
+    atr = calculate_atr(highs_15m, lows_15m, closes_15m, 14)
     
-    closes, opens, highs, lows, volumes = get_binance_klines(symbol, interval="15m", limit=210)
+    # 1H Trend Filter
+    ema200_1h = calculate_ema(closes_1h, 200)
+    htf_trend_bullish = current_price > ema200_1h
     
-    if not closes or len(closes) < 200:
-        return jsonify({
-            "asset": asset,
-            "status": "PRO ENGINE SCANNING MARKET...",
-            "action": "WAIT 🟡",
-            "confidence": 50
-        }), 200
-
-    current_price = closes[-1]
+    # Candlestick Wicks & Volatility
+    body = abs(closes_15m[-1] - opens_15m[-1])
+    lower_wick = min(opens_15m[-1], closes_15m[-1]) - lows_15m[-1]
+    upper_wick = highs_15m[-1] - max(opens_15m[-1], closes_15m[-1])
+    bull_rejection = lower_wick > (body * 1.8) and lower_wick > upper_wick
+    bear_rejection = upper_wick > (body * 1.8) and upper_wick > lower_wick
     
-    ema_fast = calculate_ema(closes, 9)
-    ema_slow = calculate_ema(closes, 21)
-    ema_trend = calculate_ema(closes, 200)
-    rsi = calculate_rsi(closes, 14)
-    atr = calculate_atr(highs, lows, closes, 14)
-    
-    bos_bull, bos_bear, supply_zone, demand_zone = analyze_smc_structure(highs, lows, closes)
-    bull_reject, bear_reject = analyze_candle_traps(opens, closes, highs, lows)
-    
-    avg_vol = sum(volumes[-20:]) / 20
-    volume_surge = volumes[-1] > (avg_vol * 1.3)
+    avg_vol = sum(volumes_15m[-20:]) / 20
+    volume_surge = volumes_15m[-1] > (avg_vol * 1.3)
     
     score = 0
     action = "WAIT / NO CLEAR ENTRY 🟡"
     
     # BUY SETUP
-    if current_price > ema_trend:
-        score += 25
-        if ema_fast > ema_slow:
+    if current_price > ema200_15m:
+        score += 20
+        if htf_trend_bullish:  # HTF Alignment (+15%)
+            score += 15
+        if ema9 > ema21:
             score += 20
-        if 48 <= rsi <= 67:
+        if 48 <= rsi_15m <= 67:
             score += 20
-        if bos_bull or bull_reject:
-            score += 20
+        if bull_rejection:
+            score += 15
         if volume_surge:
             score += 10
             
@@ -142,14 +135,16 @@ def get_signal():
             action = "INSTITUTIONAL BUY 🟢"
 
     # SELL SETUP
-    elif current_price < ema_trend:
-        score += 25
-        if ema_fast < ema_slow:
+    elif current_price < ema200_15m:
+        score += 20
+        if not htf_trend_bullish:  # HTF Alignment (+15%)
+            score += 15
+        if ema9 < ema21:
             score += 20
-        if 33 <= rsi <= 52:
+        if 33 <= rsi_15m <= 52:
             score += 20
-        if bos_bear or bear_reject:
-            score += 20
+        if bear_rejection:
+            score += 15
         if volume_surge:
             score += 10
             
@@ -166,34 +161,97 @@ def get_signal():
         tp = round(current_price - tp_distance, 2)
         sl = round(current_price + sl_distance, 2)
 
-    chart_symbol = "PAXGUSDT" if asset == "GOLD" else "BTCUSDT"
-    chart_link = f"https://www.tradingview.com/chart/?symbol=BINANCE:{chart_symbol}"
+    # Risk Management Calculation ($1000 standard balance, 1.5% max risk)
+    risk_amount = 15.0
+    recommended_lot = round(risk_amount / (sl_distance if sl_distance > 0 else 1.0), 2)
+    if asset_name == "GOLD":
+        recommended_lot = max(0.01, min(recommended_lot, 0.10))
+    else:
+        recommended_lot = max(0.001, min(recommended_lot, 0.05))
 
-    if score >= 85:
-        alert_msg = (
-            f"🚀 *PRO ALGO SIGNAL ({asset})*\n\n"
-            f"Action: *{action}*\n"
-            f"Entry Price: `{current_price}`\n"
-            f"Take Profit (TP): `{tp}`\n"
-            f"Stop Loss (SL): `{sl}`\n\n"
-            f"🔬 *Institutional Analysis:* \n"
-            f"• Confluence Score: *{score}%*\n"
-            f"• Structure Break: `{'YES ⚡' if (bos_bull or bos_bear) else 'NORMAL'}`\n"
-            f"• Volume Expansion: `{'STRONG 📊' if volume_surge else 'MODERATE'}`\n"
-            f"• Dynamic Volatility (ATR): `{round(atr, 2)}`\n\n"
-            f"📈 [Open Live Chart]({chart_link})"
-        )
-        send_telegram_alert(alert_msg)
-
-    return jsonify({
-        "asset": asset,
+    return {
+        "asset": asset_name,
         "price": current_price,
         "action": action,
-        "confluence_score": score,
-        "rsi": round(rsi, 2),
-        "tp": tp if score >= 85 else 0,
-        "sl": sl if score >= 85 else 0
-    })
+        "score": score,
+        "rsi": round(rsi_15m, 2),
+        "atr": round(atr, 2),
+        "htf_alignment": "BULLISH 📈" if htf_trend_bullish else "BEARISH 📉",
+        "volume_surge": "STRONG 📊" if volume_surge else "NORMAL",
+        "tp": tp,
+        "sl": sl,
+        "recommended_lot": recommended_lot
+    }
+
+# --- ROUTES ---
+@app.route('/api/signal', methods=['GET'])
+def get_signal():
+    asset = request.args.get('asset', 'GOLD').upper()
+    data = analyze_asset(asset)
+    
+    if not data:
+        return jsonify({"status": "Scanning Error or Insufficient Data"}), 500
+
+    if data["score"] >= 85:
+        chart_symbol = "PAXGUSDT" if asset == "GOLD" else "BTCUSDT"
+        chart_link = f"https://www.tradingview.com/chart/?symbol=BINANCE:{chart_symbol}"
+        
+        reply_markup = {
+            "inline_keyboard": [
+                [{"text": "📈 Open TradingView Chart", "url": chart_link}]
+            ]
+        }
+
+        alert_msg = (
+            f"🚀 *PRO ALGO SIGNAL ({data['asset']})*\n\n"
+            f"Action: *{data['action']}*\n"
+            f"Entry Price: `{data['price']}`\n"
+            f"Take Profit (TP): `{data['tp']}`\n"
+            f"Stop Loss (SL): `{data['sl']}`\n\n"
+            f"🧠 *Smart Analytics:* \n"
+            f"• Confluence Score: *{data['score']}%*\n"
+            f"• 1H Higher Trend: `{data['htf_alignment']}`\n"
+            f"• Volume Expansion: `{data['volume_surge']}`\n"
+            f"• Dynamic Volatility (ATR): `{data['atr']}`\n\n"
+            f"🛡️ *Risk Management:* \n"
+            f"• Risk per Trade: `1.5% ($15 on $1K)`\n"
+            f"• Rec. Lot Size: `{data['recommended_lot']}`"
+        )
+        send_telegram_alert(alert_msg, reply_markup=reply_markup)
+
+    return jsonify(data)
+
+# Telegram Webhook for Interactive Commands (/status, /gold, /btc)
+@app.route('/telegram/webhook', methods=['POST'])
+def telegram_webhook():
+    req_data = request.get_json()
+    if req_data and "message" in req_data:
+        text = req_data["message"].get("text", "").strip().lower()
+        
+        if text in ["/start", "/status"]:
+            gold_data = analyze_asset("GOLD")
+            btc_data = analyze_asset("BTC")
+            msg = (
+                "🤖 *BOT LIVE STATUS REPORT*\n\n"
+                f"🟡 *GOLD (PAXG):* Score {gold_data['score']}% | Trend {gold_data['htf_alignment']}\n"
+                f"🟠 *BTC:* Score {btc_data['score']}% | Trend {btc_data['htf_alignment']}\n\n"
+                "✅ _24/7 Engine Active & Scanning Market_"
+            )
+            send_telegram_alert(msg)
+            
+        elif text in ["/gold", "/btc"]:
+            asset_selected = "GOLD" if "gold" in text else "BTC"
+            res = analyze_asset(asset_selected)
+            msg = (
+                f"📊 *LIVE SNAPSHOT ({res['asset']})*\n\n"
+                f"Price: `{res['price']}`\n"
+                f"Action: *{res['action']}*\n"
+                f"Confluence Score: *{res['score']}%*\n"
+                f"RSI (15m): `{res['rsi']}` | HTF: `{res['htf_alignment']}`"
+            )
+            send_telegram_alert(msg)
+
+    return jsonify({"status": "ok"}), 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
