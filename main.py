@@ -24,26 +24,39 @@ def send_telegram_alert(message, reply_markup=None):
     except Exception as e:
         print(f"Telegram Alert Error: {e}")
 
-# --- DATA FETCHING & INDICATORS ---
+# --- DATA FETCHING WITH FALLBACK ENDPOINTS ---
 def get_binance_klines(symbol, interval="15m", limit=210):
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-        response = requests.get(url, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            data = response.json()
-            closes = [float(c[4]) for c in data]
-            opens = [float(c[1]) for c in data]
-            highs = [float(c[2]) for c in data]
-            lows = [float(c[3]) for c in data]
-            volumes = [float(c[5]) for c in data]
-            return closes, opens, highs, lows, volumes
-        return [], [], [], [], []
-    except Exception as e:
-        print(f"Data Fetch Error: {e}")
-        return [], [], [], [], []
+    # Multiple Binance API endpoints for reliability against IP blocks
+    endpoints = [
+        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
+        f"https://api1.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
+        f"https://api2.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
+        f"https://api3.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    ]
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
 
+    for url in endpoints:
+        try:
+            response = requests.get(url, headers=headers, timeout=8)
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, list) and len(data) >= 14:
+                    closes = [float(c[4]) for c in data]
+                    opens = [float(c[1]) for c in data]
+                    highs = [float(c[2]) for c in data]
+                    lows = [float(c[3]) for c in data]
+                    volumes = [float(c[5]) for c in data]
+                    return closes, opens, highs, lows, volumes
+        except Exception as e:
+            print(f"Endpoint error ({url}): {e}")
+            continue
+
+    return [], [], [], [], []
+
+# --- INDICATOR CALCULATIONS ---
 def calculate_ema(prices, period):
     if len(prices) < period:
         return 0
@@ -83,35 +96,34 @@ def calculate_atr(highs, lows, closes, period=14):
 def analyze_asset(asset_name):
     symbol = 'PAXGUSDT' if asset_name == 'GOLD' else 'BTCUSDT'
     
-    # 15m Timeframe Data
+    # Fetch 15m and 1h Klines
     closes_15m, opens_15m, highs_15m, lows_15m, volumes_15m = get_binance_klines(symbol, interval="15m", limit=210)
-    # 1h Higher Timeframe Data
     closes_1h, _, _, _, _ = get_binance_klines(symbol, interval="1h", limit=200)
     
-    if not closes_15m or len(closes_15m) < 200 or not closes_1h or len(closes_1h) < 200:
+    if not closes_15m or len(closes_15m) < 50:
         return None
 
     current_price = closes_15m[-1]
     
-    # 15m Technicals
+    # 15m Indicators
     ema9 = calculate_ema(closes_15m, 9)
     ema21 = calculate_ema(closes_15m, 21)
-    ema200_15m = calculate_ema(closes_15m, 200)
+    ema200_15m = calculate_ema(closes_15m, 200) if len(closes_15m) >= 200 else calculate_ema(closes_15m, 50)
     rsi_15m = calculate_rsi(closes_15m, 14)
     atr = calculate_atr(highs_15m, lows_15m, closes_15m, 14)
     
-    # 1H Trend Filter
-    ema200_1h = calculate_ema(closes_1h, 200)
+    # 1H HTF Trend
+    ema200_1h = calculate_ema(closes_1h, 200) if len(closes_1h) >= 200 else (closes_1h[0] if closes_1h else current_price)
     htf_trend_bullish = current_price > ema200_1h
     
-    # Candlestick Wicks & Volatility
+    # Price Action Filters
     body = abs(closes_15m[-1] - opens_15m[-1])
     lower_wick = min(opens_15m[-1], closes_15m[-1]) - lows_15m[-1]
     upper_wick = highs_15m[-1] - max(opens_15m[-1], closes_15m[-1])
     bull_rejection = lower_wick > (body * 1.8) and lower_wick > upper_wick
     bear_rejection = upper_wick > (body * 1.8) and upper_wick > lower_wick
     
-    avg_vol = sum(volumes_15m[-20:]) / 20
+    avg_vol = sum(volumes_15m[-20:]) / 20 if len(volumes_15m) >= 20 else 1
     volume_surge = volumes_15m[-1] > (avg_vol * 1.3)
     
     score = 0
@@ -120,7 +132,7 @@ def analyze_asset(asset_name):
     # BUY SETUP
     if current_price > ema200_15m:
         score += 20
-        if htf_trend_bullish:  # HTF Alignment (+15%)
+        if htf_trend_bullish:
             score += 15
         if ema9 > ema21:
             score += 20
@@ -137,7 +149,7 @@ def analyze_asset(asset_name):
     # SELL SETUP
     elif current_price < ema200_15m:
         score += 20
-        if not htf_trend_bullish:  # HTF Alignment (+15%)
+        if not htf_trend_bullish:
             score += 15
         if ema9 < ema21:
             score += 20
@@ -161,7 +173,7 @@ def analyze_asset(asset_name):
         tp = round(current_price - tp_distance, 2)
         sl = round(current_price + sl_distance, 2)
 
-    # Risk Management Calculation ($1000 standard balance, 1.5% max risk)
+    # Risk Management Calculation
     risk_amount = 15.0
     recommended_lot = round(risk_amount / (sl_distance if sl_distance > 0 else 1.0), 2)
     if asset_name == "GOLD":
@@ -184,6 +196,10 @@ def analyze_asset(asset_name):
     }
 
 # --- ROUTES ---
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({"status": "Trading Bot Server Active & Running 🚀"}), 200
+
 @app.route('/api/signal', methods=['GET'])
 def get_signal():
     asset = request.args.get('asset', 'GOLD').upper()
@@ -221,7 +237,7 @@ def get_signal():
 
     return jsonify(data)
 
-# Telegram Webhook for Interactive Commands (/status, /gold, /btc)
+# Telegram Webhook for Commands (/status, /gold, /btc)
 @app.route('/telegram/webhook', methods=['POST'])
 def telegram_webhook():
     req_data = request.get_json()
@@ -231,10 +247,14 @@ def telegram_webhook():
         if text in ["/start", "/status"]:
             gold_data = analyze_asset("GOLD")
             btc_data = analyze_asset("BTC")
+            
+            gold_str = f"Score {gold_data['score']}% | Trend {gold_data['htf_alignment']}" if gold_data else "Fetching Data..."
+            btc_str = f"Score {btc_data['score']}% | Trend {btc_data['htf_alignment']}" if btc_data else "Fetching Data..."
+            
             msg = (
                 "🤖 *BOT LIVE STATUS REPORT*\n\n"
-                f"🟡 *GOLD (PAXG):* Score {gold_data['score']}% | Trend {gold_data['htf_alignment']}\n"
-                f"🟠 *BTC:* Score {btc_data['score']}% | Trend {btc_data['htf_alignment']}\n\n"
+                f"🟡 *GOLD (PAXG):* {gold_str}\n"
+                f"🟠 *BTC:* {btc_str}\n\n"
                 "✅ _24/7 Engine Active & Scanning Market_"
             )
             send_telegram_alert(msg)
@@ -242,13 +262,16 @@ def telegram_webhook():
         elif text in ["/gold", "/btc"]:
             asset_selected = "GOLD" if "gold" in text else "BTC"
             res = analyze_asset(asset_selected)
-            msg = (
-                f"📊 *LIVE SNAPSHOT ({res['asset']})*\n\n"
-                f"Price: `{res['price']}`\n"
-                f"Action: *{res['action']}*\n"
-                f"Confluence Score: *{res['score']}%*\n"
-                f"RSI (15m): `{res['rsi']}` | HTF: `{res['htf_alignment']}`"
-            )
+            if res:
+                msg = (
+                    f"📊 *LIVE SNAPSHOT ({res['asset']})*\n\n"
+                    f"Price: `{res['price']}`\n"
+                    f"Action: *{res['action']}*\n"
+                    f"Confluence Score: *{res['score']}%*\n"
+                    f"RSI (15m): `{res['rsi']}` | HTF: `{res['htf_alignment']}`"
+                )
+            else:
+                msg = f"❌ Couldn't fetch live data for {asset_selected}. Please try again in a few seconds."
             send_telegram_alert(msg)
 
     return jsonify({"status": "ok"}), 200
