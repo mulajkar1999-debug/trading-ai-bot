@@ -23,9 +23,8 @@ def send_telegram_alert(message, reply_markup=None):
     except Exception as e:
         print(f"Telegram Alert Error: {e}")
 
-# Robust Fetch Function with Fallbacks
+# Data Fetching Function with Multi-Endpoint Fallback
 def get_crypto_klines(symbol, interval="15m", limit=210):
-    # Binance US & Standard API Endpoints
     urls = [
         f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
         f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
@@ -33,7 +32,7 @@ def get_crypto_klines(symbol, interval="15m", limit=210):
     ]
     
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
 
     for url in urls:
@@ -173,6 +172,7 @@ def analyze_asset(asset_name):
         print(f"Error in analyze_asset: {e}")
         return None
 
+# --- ROUTES ---
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({"status": "Trading Bot Server Active & Running 🚀"}), 200
@@ -183,7 +183,7 @@ def get_signal():
     data = analyze_asset(asset)
     
     if not data:
-        return jsonify({"status": "Fetching live data, please refresh in 5 seconds..."}), 200
+        return jsonify({"status": "Fetching live data, please refresh in a few seconds..."}), 200
 
     if data["score"] >= 85:
         chart_symbol = "PAXGUSDT" if asset == "GOLD" else "BTCUSDT"
@@ -253,4 +253,6 @@ def telegram_webhook():
     return jsonify({"status": "ok"}), 200
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    # Dynamically bind to PORT assigned by Render environment
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
