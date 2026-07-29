@@ -4,11 +4,10 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-# Telegram Configuration (Render Environment Variables with Fallbacks)
+# Telegram Configuration
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8723192534:AAFqkexJpF-yu38dPI0cEUT6H0nooN_sjdM")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1317739622")
 
-# --- TELEGRAM HELPER FUNCTIONS ---
 def send_telegram_alert(message, reply_markup=None):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -24,25 +23,24 @@ def send_telegram_alert(message, reply_markup=None):
     except Exception as e:
         print(f"Telegram Alert Error: {e}")
 
-# --- DATA FETCHING WITH FALLBACK ENDPOINTS ---
-def get_binance_klines(symbol, interval="15m", limit=210):
-    # Multiple Binance API endpoints for reliability against IP blocks
-    endpoints = [
+# Robust Fetch Function with Fallbacks
+def get_crypto_klines(symbol, interval="15m", limit=210):
+    # Binance US & Standard API Endpoints
+    urls = [
+        f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
         f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
-        f"https://api1.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
-        f"https://api2.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
-        f"https://api3.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+        f"https://api1.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
     ]
     
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
 
-    for url in endpoints:
+    for url in urls:
         try:
-            response = requests.get(url, headers=headers, timeout=8)
-            if response.status_code == 200:
-                data = response.json()
+            res = requests.get(url, headers=headers, timeout=5)
+            if res.status_code == 200:
+                data = res.json()
                 if isinstance(data, list) and len(data) >= 14:
                     closes = [float(c[4]) for c in data]
                     opens = [float(c[1]) for c in data]
@@ -51,15 +49,14 @@ def get_binance_klines(symbol, interval="15m", limit=210):
                     volumes = [float(c[5]) for c in data]
                     return closes, opens, highs, lows, volumes
         except Exception as e:
-            print(f"Endpoint error ({url}): {e}")
+            print(f"Fetch failed for {url}: {e}")
             continue
 
     return [], [], [], [], []
 
-# --- INDICATOR CALCULATIONS ---
 def calculate_ema(prices, period):
     if len(prices) < period:
-        return 0
+        return prices[-1] if prices else 0
     k = 2 / (period + 1)
     ema = prices[0]
     for price in prices[1:]:
@@ -77,11 +74,10 @@ def calculate_rsi(prices, period=14):
     
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
-    
     if avg_loss == 0:
         return 100
     rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    return round(100 - (100 / (1 + rs)), 2)
 
 def calculate_atr(highs, lows, closes, period=14):
     if len(closes) < period + 1:
@@ -90,112 +86,93 @@ def calculate_atr(highs, lows, closes, period=14):
     for i in range(1, len(closes)):
         tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
         tr_list.append(tr)
-    return sum(tr_list[-period:]) / period
+    return round(sum(tr_list[-period:]) / period, 2)
 
-# --- CORE ENGINE ANALYSIS ---
 def analyze_asset(asset_name):
-    symbol = 'PAXGUSDT' if asset_name == 'GOLD' else 'BTCUSDT'
-    
-    # Fetch 15m and 1h Klines
-    closes_15m, opens_15m, highs_15m, lows_15m, volumes_15m = get_binance_klines(symbol, interval="15m", limit=210)
-    closes_1h, _, _, _, _ = get_binance_klines(symbol, interval="1h", limit=200)
-    
-    if not closes_15m or len(closes_15m) < 50:
+    try:
+        symbol = 'PAXGUSDT' if asset_name == 'GOLD' else 'BTCUSDT'
+        
+        closes_15m, opens_15m, highs_15m, lows_15m, volumes_15m = get_crypto_klines(symbol, interval="15m", limit=210)
+        closes_1h, _, _, _, _ = get_crypto_klines(symbol, interval="1h", limit=200)
+        
+        if not closes_15m or len(closes_15m) < 14:
+            return None
+
+        current_price = closes_15m[-1]
+        
+        ema9 = calculate_ema(closes_15m, 9)
+        ema21 = calculate_ema(closes_15m, 21)
+        ema200_15m = calculate_ema(closes_15m, 200) if len(closes_15m) >= 200 else calculate_ema(closes_15m, len(closes_15m))
+        rsi_15m = calculate_rsi(closes_15m, 14)
+        atr = calculate_atr(highs_15m, lows_15m, closes_15m, 14)
+        
+        ema200_1h = calculate_ema(closes_1h, 200) if len(closes_1h) >= 200 else (closes_1h[-1] if closes_1h else current_price)
+        htf_trend_bullish = current_price >= ema200_1h
+        
+        body = abs(closes_15m[-1] - opens_15m[-1])
+        lower_wick = min(opens_15m[-1], closes_15m[-1]) - lows_15m[-1]
+        upper_wick = highs_15m[-1] - max(opens_15m[-1], closes_15m[-1])
+        bull_rejection = lower_wick > (body * 1.8) and lower_wick > upper_wick
+        bear_rejection = upper_wick > (body * 1.8) and upper_wick > lower_wick
+        
+        avg_vol = sum(volumes_15m[-20:]) / 20 if len(volumes_15m) >= 20 else 1
+        volume_surge = volumes_15m[-1] > (avg_vol * 1.3)
+        
+        score = 0
+        action = "WAIT / NO CLEAR ENTRY 🟡"
+        
+        if current_price >= ema200_15m:
+            score += 20
+            if htf_trend_bullish: score += 15
+            if ema9 > ema21: score += 20
+            if 48 <= rsi_15m <= 67: score += 20
+            if bull_rejection: score += 15
+            if volume_surge: score += 10
+            if score >= 85: action = "INSTITUTIONAL BUY 🟢"
+
+        else:
+            score += 20
+            if not htf_trend_bullish: score += 15
+            if ema9 < ema21: score += 20
+            if 33 <= rsi_15m <= 52: score += 20
+            if bear_rejection: score += 15
+            if volume_surge: score += 10
+            if score >= 85: action = "INSTITUTIONAL SELL 🔴"
+
+        tp_distance = round(atr * 1.8, 2)
+        sl_distance = round(atr * 1.0, 2)
+        
+        if "BUY" in action:
+            tp = round(current_price + tp_distance, 2)
+            sl = round(current_price - sl_distance, 2)
+        else:
+            tp = round(current_price - tp_distance, 2)
+            sl = round(current_price + sl_distance, 2)
+
+        risk_amount = 15.0
+        recommended_lot = round(risk_amount / (sl_distance if sl_distance > 0 else 1.0), 2)
+        if asset_name == "GOLD":
+            recommended_lot = max(0.01, min(recommended_lot, 0.10))
+        else:
+            recommended_lot = max(0.001, min(recommended_lot, 0.05))
+
+        return {
+            "asset": asset_name,
+            "price": current_price,
+            "action": action,
+            "score": score,
+            "rsi": rsi_15m,
+            "atr": atr,
+            "htf_alignment": "BULLISH 📈" if htf_trend_bullish else "BEARISH 📉",
+            "volume_surge": "STRONG 📊" if volume_surge else "NORMAL",
+            "tp": tp,
+            "sl": sl,
+            "recommended_lot": recommended_lot
+        }
+    except Exception as e:
+        print(f"Error in analyze_asset: {e}")
         return None
 
-    current_price = closes_15m[-1]
-    
-    # 15m Indicators
-    ema9 = calculate_ema(closes_15m, 9)
-    ema21 = calculate_ema(closes_15m, 21)
-    ema200_15m = calculate_ema(closes_15m, 200) if len(closes_15m) >= 200 else calculate_ema(closes_15m, 50)
-    rsi_15m = calculate_rsi(closes_15m, 14)
-    atr = calculate_atr(highs_15m, lows_15m, closes_15m, 14)
-    
-    # 1H HTF Trend
-    ema200_1h = calculate_ema(closes_1h, 200) if len(closes_1h) >= 200 else (closes_1h[0] if closes_1h else current_price)
-    htf_trend_bullish = current_price > ema200_1h
-    
-    # Price Action Filters
-    body = abs(closes_15m[-1] - opens_15m[-1])
-    lower_wick = min(opens_15m[-1], closes_15m[-1]) - lows_15m[-1]
-    upper_wick = highs_15m[-1] - max(opens_15m[-1], closes_15m[-1])
-    bull_rejection = lower_wick > (body * 1.8) and lower_wick > upper_wick
-    bear_rejection = upper_wick > (body * 1.8) and upper_wick > lower_wick
-    
-    avg_vol = sum(volumes_15m[-20:]) / 20 if len(volumes_15m) >= 20 else 1
-    volume_surge = volumes_15m[-1] > (avg_vol * 1.3)
-    
-    score = 0
-    action = "WAIT / NO CLEAR ENTRY 🟡"
-    
-    # BUY SETUP
-    if current_price > ema200_15m:
-        score += 20
-        if htf_trend_bullish:
-            score += 15
-        if ema9 > ema21:
-            score += 20
-        if 48 <= rsi_15m <= 67:
-            score += 20
-        if bull_rejection:
-            score += 15
-        if volume_surge:
-            score += 10
-            
-        if score >= 85:
-            action = "INSTITUTIONAL BUY 🟢"
-
-    # SELL SETUP
-    elif current_price < ema200_15m:
-        score += 20
-        if not htf_trend_bullish:
-            score += 15
-        if ema9 < ema21:
-            score += 20
-        if 33 <= rsi_15m <= 52:
-            score += 20
-        if bear_rejection:
-            score += 15
-        if volume_surge:
-            score += 10
-            
-        if score >= 85:
-            action = "INSTITUTIONAL SELL 🔴"
-
-    tp_distance = round(atr * 1.8, 2)
-    sl_distance = round(atr * 1.0, 2)
-    
-    if "BUY" in action:
-        tp = round(current_price + tp_distance, 2)
-        sl = round(current_price - sl_distance, 2)
-    else:
-        tp = round(current_price - tp_distance, 2)
-        sl = round(current_price + sl_distance, 2)
-
-    # Risk Management Calculation
-    risk_amount = 15.0
-    recommended_lot = round(risk_amount / (sl_distance if sl_distance > 0 else 1.0), 2)
-    if asset_name == "GOLD":
-        recommended_lot = max(0.01, min(recommended_lot, 0.10))
-    else:
-        recommended_lot = max(0.001, min(recommended_lot, 0.05))
-
-    return {
-        "asset": asset_name,
-        "price": current_price,
-        "action": action,
-        "score": score,
-        "rsi": round(rsi_15m, 2),
-        "atr": round(atr, 2),
-        "htf_alignment": "BULLISH 📈" if htf_trend_bullish else "BEARISH 📉",
-        "volume_surge": "STRONG 📊" if volume_surge else "NORMAL",
-        "tp": tp,
-        "sl": sl,
-        "recommended_lot": recommended_lot
-    }
-
-# --- ROUTES ---
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({"status": "Trading Bot Server Active & Running 🚀"}), 200
@@ -206,7 +183,7 @@ def get_signal():
     data = analyze_asset(asset)
     
     if not data:
-        return jsonify({"status": "Scanning Error or Insufficient Data"}), 500
+        return jsonify({"status": "Fetching live data, please refresh in 5 seconds..."}), 200
 
     if data["score"] >= 85:
         chart_symbol = "PAXGUSDT" if asset == "GOLD" else "BTCUSDT"
@@ -235,9 +212,8 @@ def get_signal():
         )
         send_telegram_alert(alert_msg, reply_markup=reply_markup)
 
-    return jsonify(data)
+    return jsonify(data), 200
 
-# Telegram Webhook for Commands (/status, /gold, /btc)
 @app.route('/telegram/webhook', methods=['POST'])
 def telegram_webhook():
     req_data = request.get_json()
@@ -248,8 +224,8 @@ def telegram_webhook():
             gold_data = analyze_asset("GOLD")
             btc_data = analyze_asset("BTC")
             
-            gold_str = f"Score {gold_data['score']}% | Trend {gold_data['htf_alignment']}" if gold_data else "Fetching Data..."
-            btc_str = f"Score {btc_data['score']}% | Trend {btc_data['htf_alignment']}" if btc_data else "Fetching Data..."
+            gold_str = f"Score {gold_data['score']}% | Trend {gold_data['htf_alignment']}" if gold_data else "Fetching..."
+            btc_str = f"Score {btc_data['score']}% | Trend {btc_data['htf_alignment']}" if btc_data else "Fetching..."
             
             msg = (
                 "🤖 *BOT LIVE STATUS REPORT*\n\n"
@@ -271,7 +247,7 @@ def telegram_webhook():
                     f"RSI (15m): `{res['rsi']}` | HTF: `{res['htf_alignment']}`"
                 )
             else:
-                msg = f"❌ Couldn't fetch live data for {asset_selected}. Please try again in a few seconds."
+                msg = f"⏳ Fetching live data for {asset_selected}... Please send command again."
             send_telegram_alert(msg)
 
     return jsonify({"status": "ok"}), 200
