@@ -23,21 +23,41 @@ def send_telegram_alert(message, reply_markup=None):
     except Exception as e:
         print(f"Telegram Alert Error: {e}")
 
-# Data Fetching Function with Multi-Endpoint Fallback
-def get_crypto_klines(symbol, interval="15m", limit=210):
-    urls = [
-        f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
-        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
-        f"https://api1.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    ]
-    
+# High Precision Data Fetcher for BTCUSD & XAUUSD
+def get_market_klines(asset_name, interval="15m", limit=210):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
 
+    # --- 1. BTCUSD Setup (Coinbase Direct USD) ---
+    if asset_name == "BTC":
+        granularity = 900 if interval == "15m" else 3600
+        url = f"https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity={granularity}"
+        try:
+            res = requests.get(url, headers=headers, timeout=6)
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list) and len(data) >= 14:
+                    data = sorted(data, key=lambda x: x[0])  # Time sorting
+                    closes = [float(c[4]) for c in data[-limit:]]
+                    opens = [float(c[3]) for c in data[-limit:]]
+                    highs = [float(c[2]) for c in data[-limit:]]
+                    lows = [float(c[1]) for c in data[-limit:]]
+                    volumes = [float(c[5]) for c in data[-limit:]]
+                    return closes, opens, highs, lows, volumes
+        except Exception as e:
+            print(f"Coinbase BTCUSD Error: {e}")
+
+    # --- 2. XAUUSD Setup & BTC Fallback ---
+    symbol = "PAXGUSDT" if asset_name == "GOLD" else "BTCUSDT"
+    urls = [
+        f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
+        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    ]
+
     for url in urls:
         try:
-            res = requests.get(url, headers=headers, timeout=5)
+            res = requests.get(url, headers=headers, timeout=6)
             if res.status_code == 200:
                 data = res.json()
                 if isinstance(data, list) and len(data) >= 14:
@@ -48,7 +68,6 @@ def get_crypto_klines(symbol, interval="15m", limit=210):
                     volumes = [float(c[5]) for c in data]
                     return closes, opens, highs, lows, volumes
         except Exception as e:
-            print(f"Fetch failed for {url}: {e}")
             continue
 
     return [], [], [], [], []
@@ -89,10 +108,8 @@ def calculate_atr(highs, lows, closes, period=14):
 
 def analyze_asset(asset_name):
     try:
-        symbol = 'PAXGUSDT' if asset_name == 'GOLD' else 'BTCUSDT'
-        
-        closes_15m, opens_15m, highs_15m, lows_15m, volumes_15m = get_crypto_klines(symbol, interval="15m", limit=210)
-        closes_1h, _, _, _, _ = get_crypto_klines(symbol, interval="1h", limit=200)
+        closes_15m, opens_15m, highs_15m, lows_15m, volumes_15m = get_market_klines(asset_name, interval="15m", limit=210)
+        closes_1h, _, _, _, _ = get_market_klines(asset_name, interval="1h", limit=200)
         
         if not closes_15m or len(closes_15m) < 14:
             return None
@@ -155,8 +172,10 @@ def analyze_asset(asset_name):
         else:
             recommended_lot = max(0.001, min(recommended_lot, 0.05))
 
+        display_pair = "BTCUSD" if asset_name == "BTC" else "XAUUSD"
+
         return {
-            "asset": asset_name,
+            "asset": display_pair,
             "price": current_price,
             "action": action,
             "score": score,
@@ -175,7 +194,7 @@ def analyze_asset(asset_name):
 # --- ROUTES ---
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({"status": "Trading Bot Server Active & Running 🚀"}), 200
+    return jsonify({"status": "Trading Bot Engine Active 🚀"}), 200
 
 @app.route('/api/signal', methods=['GET'])
 def get_signal():
@@ -186,8 +205,8 @@ def get_signal():
         return jsonify({"status": "Fetching live data, please refresh in a few seconds..."}), 200
 
     if data["score"] >= 85:
-        chart_symbol = "PAXGUSDT" if asset == "GOLD" else "BTCUSDT"
-        chart_link = f"https://www.tradingview.com/chart/?symbol=BINANCE:{chart_symbol}"
+        chart_symbol = "COINBASE:BTCUSD" if data['asset'] == "BTCUSD" else "OANDA:XAUUSD"
+        chart_link = f"https://www.tradingview.com/chart/?symbol={chart_symbol}"
         
         reply_markup = {
             "inline_keyboard": [
@@ -201,14 +220,13 @@ def get_signal():
             f"Entry Price: `{data['price']}`\n"
             f"Take Profit (TP): `{data['tp']}`\n"
             f"Stop Loss (SL): `{data['sl']}`\n\n"
-            f"🧠 *Smart Analytics:* \n"
+            f"🧠 *Analytics:* \n"
             f"• Confluence Score: *{data['score']}%*\n"
-            f"• 1H Higher Trend: `{data['htf_alignment']}`\n"
-            f"• Volume Expansion: `{data['volume_surge']}`\n"
+            f"• 1H Trend: `{data['htf_alignment']}`\n"
             f"• Dynamic Volatility (ATR): `{data['atr']}`\n\n"
             f"🛡️ *Risk Management:* \n"
-            f"• Risk per Trade: `1.5% ($15 on $1K)`\n"
-            f"• Rec. Lot Size: `{data['recommended_lot']}`"
+            f"• Risk per Trade: `1.5% ($15)`\n"
+            f"• Recommended Lot: `{data['recommended_lot']}`"
         )
         send_telegram_alert(alert_msg, reply_markup=reply_markup)
 
@@ -224,35 +242,34 @@ def telegram_webhook():
             gold_data = analyze_asset("GOLD")
             btc_data = analyze_asset("BTC")
             
-            gold_str = f"Score {gold_data['score']}% | Trend {gold_data['htf_alignment']}" if gold_data else "Fetching..."
-            btc_str = f"Score {btc_data['score']}% | Trend {btc_data['htf_alignment']}" if btc_data else "Fetching..."
+            gold_str = f"Price: ${gold_data['price']} | Trend: {gold_data['htf_alignment']}" if gold_data else "Fetching..."
+            btc_str = f"Price: ${btc_data['price']} | Trend: {btc_data['htf_alignment']}" if btc_data else "Fetching..."
             
             msg = (
-                "🤖 *BOT LIVE STATUS REPORT*\n\n"
-                f"🟡 *GOLD (PAXG):* {gold_str}\n"
-                f"🟠 *BTC:* {btc_str}\n\n"
+                "🤖 *BOT LIVE SNAPSHOT REPORT*\n\n"
+                f"🟡 *XAUUSD (GOLD):* {gold_str}\n"
+                f"🟠 *BTCUSD:* {btc_str}\n\n"
                 "✅ _24/7 Engine Active & Scanning Market_"
             )
             send_telegram_alert(msg)
             
-        elif text in ["/gold", "/btc"]:
-            asset_selected = "GOLD" if "gold" in text else "BTC"
+        elif text in ["/gold", "/xauusd", "/btc", "/btcusd"]:
+            asset_selected = "GOLD" if any(x in text for x in ["gold", "xauusd"]) else "BTC"
             res = analyze_asset(asset_selected)
             if res:
                 msg = (
                     f"📊 *LIVE SNAPSHOT ({res['asset']})*\n\n"
-                    f"Price: `{res['price']}`\n"
+                    f"Price: `${res['price']}`\n"
                     f"Action: *{res['action']}*\n"
                     f"Confluence Score: *{res['score']}%*\n"
                     f"RSI (15m): `{res['rsi']}` | HTF: `{res['htf_alignment']}`"
                 )
             else:
-                msg = f"⏳ Fetching live data for {asset_selected}... Please send command again."
+                msg = f"⏳ Fetching live data... Please try again."
             send_telegram_alert(msg)
 
     return jsonify({"status": "ok"}), 200
 
 if __name__ == '__main__':
-    # Dynamically bind to PORT assigned by Render environment
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
