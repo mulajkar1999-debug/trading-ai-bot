@@ -22,51 +22,31 @@ def send_telegram_alert(message, reply_markup=None):
     except Exception as e:
         print(f"Telegram Alert Error: {e}")
 
-# Strict Real-Data Fetcher (No Fake Fallbacks)
+# Strict High-Precision Data Fetcher via Coinbase
 def get_market_klines(asset_name, interval="15m", limit=210):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     }
 
-    # --- 1. BTCUSD Data (Coinbase USD) ---
-    if asset_name == "BTC":
-        granularity = 900 if interval == "15m" else 3600
-        url = f"https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity={granularity}"
-        try:
-            res = requests.get(url, headers=headers, timeout=6)
-            if res.status_code == 200:
-                data = res.json()
-                if isinstance(data, list) and len(data) >= 14:
-                    data = sorted(data, key=lambda x: x[0])
-                    closes = [float(c[4]) for c in data[-limit:]]
-                    opens = [float(c[3]) for c in data[-limit:]]
-                    highs = [float(c[2]) for c in data[-limit:]]
-                    lows = [float(c[1]) for c in data[-limit:]]
-                    volumes = [float(c[5]) for c in data[-limit:]]
-                    return closes, opens, highs, lows, volumes
-        except Exception as e:
-            print(f"Coinbase BTC Error: {e}")
+    product_id = "BTC-USD" if asset_name == "BTC" else "PAXG-USD"
+    granularity = 900 if interval == "15m" else 3600
+    url = f"https://api.exchange.coinbase.com/products/{product_id}/candles?granularity={granularity}"
 
-    # --- 2. XAUUSD Data (PAXG / Real Ounce Gold Spot) ---
-    if asset_name == "GOLD":
-        urls = [
-            f"https://api.binance.us/api/v3/klines?symbol=PAXGUSDT&interval={interval}&limit={limit}",
-            f"https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval={interval}&limit={limit}"
-        ]
-        for url in urls:
-            try:
-                res = requests.get(url, headers=headers, timeout=6)
-                if res.status_code == 200:
-                    data = res.json()
-                    if isinstance(data, list) and len(data) >= 14:
-                        closes = [float(c[4]) for c in data]
-                        opens = [float(c[1]) for c in data]
-                        highs = [float(c[2]) for c in data]
-                        lows = [float(c[3]) for c in data]
-                        volumes = [float(c[5]) for c in data]
-                        return closes, opens, highs, lows, volumes
-            except Exception as e:
-                continue
+    try:
+        res = requests.get(url, headers=headers, timeout=6)
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, list) and len(data) >= 14:
+                # Coinbase Candles format: [ time, low, high, open, close, volume ]
+                data = sorted(data, key=lambda x: x[0])  # Oldest to newest
+                closes = [float(c[4]) for c in data[-limit:]]
+                opens = [float(c[3]) for c in data[-limit:]]
+                highs = [float(c[2]) for c in data[-limit:]]
+                lows = [float(c[1]) for c in data[-limit:]]
+                volumes = [float(c[5]) for c in data[-limit:]]
+                return closes, opens, highs, lows, volumes
+    except Exception as e:
+        print(f"Coinbase Fetch Error ({product_id}): {e}")
 
     return [], [], [], [], []
 
@@ -110,7 +90,6 @@ def analyze_asset(asset_name):
         clean_asset = "GOLD" if asset_name in ["GOLD", "XAUUSD"] else "BTC"
         closes_15m, opens_15m, highs_15m, lows_15m, volumes_15m = get_market_klines(clean_asset, interval="15m", limit=210)
         
-        # Guard Clause: Strict check to avoid Fake Data Calculations
         if not closes_15m or len(closes_15m) < 14:
             return None
 
@@ -176,7 +155,7 @@ def get_signal():
     data = analyze_asset(asset)
     
     if not data:
-        return jsonify({"status": "Live data connecting... Please refresh in 5 seconds."}), 200
+        return jsonify({"status": "Connecting Coinbase Live feed... Please refresh."}), 200
 
     if data["score"] >= 85:
         chart_symbol = "OANDA:XAUUSD" if data['asset'] == "XAUUSD" else "COINBASE:BTCUSD"
