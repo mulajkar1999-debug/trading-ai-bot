@@ -23,13 +23,13 @@ def send_telegram_alert(message, reply_markup=None):
     except Exception as e:
         print(f"Telegram Alert Error: {e}")
 
-# High Precision Data Fetcher (BTCUSD & XAUUSD)
+# Precise K-line fetcher for BTCUSD and XAUUSD
 def get_market_klines(asset_name, interval="15m", limit=210):
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     }
 
-    # --- 1. BTCUSD Data (Coinbase Direct USD) ---
+    # --- 1. BTCUSD Data (Coinbase USD) ---
     if asset_name == "BTC":
         granularity = 900 if interval == "15m" else 3600
         url = f"https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity={granularity}"
@@ -38,7 +38,7 @@ def get_market_klines(asset_name, interval="15m", limit=210):
             if res.status_code == 200:
                 data = res.json()
                 if isinstance(data, list) and len(data) >= 14:
-                    data = sorted(data, key=lambda x: x[0])  # Oldest to newest
+                    data = sorted(data, key=lambda x: x[0])
                     closes = [float(c[4]) for c in data[-limit:]]
                     opens = [float(c[3]) for c in data[-limit:]]
                     highs = [float(c[2]) for c in data[-limit:]]
@@ -48,44 +48,27 @@ def get_market_klines(asset_name, interval="15m", limit=210):
         except Exception as e:
             print(f"Coinbase BTCUSD Error: {e}")
 
-    # --- 2. XAUUSD Data (Spot Gold Benchmark via CoinGecko / Binance) ---
+    # --- 2. XAUUSD Data (Real Forex Gold via Yahoo Finance API) ---
     if asset_name == "GOLD":
-        # Primary Source: CoinGecko PAXG Spot Gold
+        yf_interval = "15m" if interval == "15m" else "1h"
+        yf_range = "5d" if interval == "15m" else "1mo"
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval={yf_interval}&range={yf_range}"
         try:
-            url = "https://api.coingecko.com/api/v3/coins/pax-gold/market_chart?vs_currency=usd&days=2"
             res = requests.get(url, headers=headers, timeout=6)
             if res.status_code == 200:
-                prices_data = res.json().get('prices', [])
-                if len(prices_data) >= 20:
-                    closes = [float(p[1]) for p in prices_data[-limit:]]
-                    opens = closes.copy()
-                    highs = [p * 1.0008 for p in closes]
-                    lows = [p * 0.9992 for p in closes]
-                    volumes = [100.0] * len(closes)
-                    return closes, opens, highs, lows, volumes
-        except Exception as e:
-            print(f"CoinGecko Gold Error: {e}")
+                result = res.json().get('chart', {}).get('result', [])
+                if result:
+                    indicators = result[0].get('indicators', {}).get('quote', [{}])[0]
+                    closes = [float(x) for x in indicators.get('close', []) if x is not None]
+                    opens = [float(x) for x in indicators.get('open', []) if x is not None]
+                    highs = [float(x) for x in indicators.get('high', []) if x is not None]
+                    lows = [float(x) for x in indicators.get('low', []) if x is not None]
+                    volumes = [float(x) for x in indicators.get('volume', []) if x is not None]
 
-        # Fallback Source: Binance PAXG/USDT
-        urls = [
-            f"https://api.binance.us/api/v3/klines?symbol=PAXGUSDT&interval={interval}&limit={limit}",
-            f"https://api1.binance.com/api/v3/klines?symbol=PAXGUSDT&interval={interval}&limit={limit}",
-            f"https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval={interval}&limit={limit}"
-        ]
-        for url in urls:
-            try:
-                res = requests.get(url, headers=headers, timeout=6)
-                if res.status_code == 200:
-                    data = res.json()
-                    if isinstance(data, list) and len(data) >= 14:
-                        closes = [float(c[4]) for c in data]
-                        opens = [float(c[1]) for c in data]
-                        highs = [float(c[2]) for c in data]
-                        lows = [float(c[3]) for c in data]
-                        volumes = [float(c[5]) for c in data]
-                        return closes, opens, highs, lows, volumes
-            except Exception as e:
-                continue
+                    if len(closes) >= 14:
+                        return closes[-limit:], opens[-limit:], highs[-limit:], lows[-limit:], volumes[-limit:]
+        except Exception as e:
+            print(f"Yahoo Gold Error: {e}")
 
     return [], [], [], [], []
 
@@ -122,7 +105,7 @@ def calculate_atr(highs, lows, closes, period=14):
         tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
         tr_list.append(tr)
     atr_val = sum(tr_list[-period:]) / period
-    return round(max(atr_val, 0.5), 2)  # Prevent ATR from becoming 0.0
+    return round(max(atr_val, 1.2), 2)
 
 def analyze_asset(asset_name):
     try:
@@ -151,7 +134,7 @@ def analyze_asset(asset_name):
         bull_rejection = lower_wick > (body * 1.8) and lower_wick > upper_wick
         bear_rejection = upper_wick > (body * 1.8) and upper_wick > lower_wick
         
-        avg_vol = sum(volumes_15m[-20:]) / 20 if len(volumes_15m) >= 20 else 1
+        avg_vol = sum(volumes_15m[-20:]) / 20 if len(volumes_15m) >= 20 and sum(volumes_15m[-20:]) > 0 else 1
         volume_surge = volumes_15m[-1] > (avg_vol * 1.3)
         
         score = 0
