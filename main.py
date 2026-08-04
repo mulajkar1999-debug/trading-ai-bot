@@ -23,13 +23,13 @@ def send_telegram_alert(message, reply_markup=None):
     except Exception as e:
         print(f"Telegram Alert Error: {e}")
 
-# High Precision Data Fetcher for BTCUSD & XAUUSD
+# Strict Market Data Fetcher
 def get_market_klines(asset_name, interval="15m", limit=210):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
 
-    # --- 1. BTCUSD Setup (Coinbase Direct USD) ---
+    # --- 1. BTCUSD Data (Coinbase USD) ---
     if asset_name == "BTC":
         granularity = 900 if interval == "15m" else 3600
         url = f"https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity={granularity}"
@@ -38,7 +38,7 @@ def get_market_klines(asset_name, interval="15m", limit=210):
             if res.status_code == 200:
                 data = res.json()
                 if isinstance(data, list) and len(data) >= 14:
-                    data = sorted(data, key=lambda x: x[0])  # Time sorting
+                    data = sorted(data, key=lambda x: x[0])
                     closes = [float(c[4]) for c in data[-limit:]]
                     opens = [float(c[3]) for c in data[-limit:]]
                     highs = [float(c[2]) for c in data[-limit:]]
@@ -46,29 +46,29 @@ def get_market_klines(asset_name, interval="15m", limit=210):
                     volumes = [float(c[5]) for c in data[-limit:]]
                     return closes, opens, highs, lows, volumes
         except Exception as e:
-            print(f"Coinbase BTCUSD Error: {e}")
+            print(f"Coinbase BTCUSD Fetch Error: {e}")
 
-    # --- 2. XAUUSD Setup & BTC Fallback ---
-    symbol = "PAXGUSDT" if asset_name == "GOLD" else "BTCUSDT"
-    urls = [
-        f"https://api.binance.us/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
-        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    ]
-
-    for url in urls:
-        try:
-            res = requests.get(url, headers=headers, timeout=6)
-            if res.status_code == 200:
-                data = res.json()
-                if isinstance(data, list) and len(data) >= 14:
-                    closes = [float(c[4]) for c in data]
-                    opens = [float(c[1]) for c in data]
-                    highs = [float(c[2]) for c in data]
-                    lows = [float(c[3]) for c in data]
-                    volumes = [float(c[5]) for c in data]
-                    return closes, opens, highs, lows, volumes
-        except Exception as e:
-            continue
+    # --- 2. XAUUSD Data (PAXG Ounce Gold Benchmark) ---
+    if asset_name == "GOLD":
+        urls = [
+            f"https://api.binance.us/api/v3/klines?symbol=PAXGUSDT&interval={interval}&limit={limit}",
+            f"https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval={interval}&limit={limit}",
+            f"https://api1.binance.com/api/v3/klines?symbol=PAXGUSDT&interval={interval}&limit={limit}"
+        ]
+        for url in urls:
+            try:
+                res = requests.get(url, headers=headers, timeout=6)
+                if res.status_code == 200:
+                    data = res.json()
+                    if isinstance(data, list) and len(data) >= 14:
+                        closes = [float(c[4]) for c in data]
+                        opens = [float(c[1]) for c in data]
+                        highs = [float(c[2]) for c in data]
+                        lows = [float(c[3]) for c in data]
+                        volumes = [float(c[5]) for c in data]
+                        return closes, opens, highs, lows, volumes
+            except Exception as e:
+                continue
 
     return [], [], [], [], []
 
@@ -108,8 +108,11 @@ def calculate_atr(highs, lows, closes, period=14):
 
 def analyze_asset(asset_name):
     try:
-        closes_15m, opens_15m, highs_15m, lows_15m, volumes_15m = get_market_klines(asset_name, interval="15m", limit=210)
-        closes_1h, _, _, _, _ = get_market_klines(asset_name, interval="1h", limit=200)
+        # Normalize asset identifier
+        clean_asset = "GOLD" if asset_name in ["GOLD", "XAUUSD"] else "BTC"
+        
+        closes_15m, opens_15m, highs_15m, lows_15m, volumes_15m = get_market_klines(clean_asset, interval="15m", limit=210)
+        closes_1h, _, _, _, _ = get_market_klines(clean_asset, interval="1h", limit=200)
         
         if not closes_15m or len(closes_15m) < 14:
             return None
@@ -167,12 +170,12 @@ def analyze_asset(asset_name):
 
         risk_amount = 15.0
         recommended_lot = round(risk_amount / (sl_distance if sl_distance > 0 else 1.0), 2)
-        if asset_name == "GOLD":
+        if clean_asset == "GOLD":
             recommended_lot = max(0.01, min(recommended_lot, 0.10))
         else:
             recommended_lot = max(0.001, min(recommended_lot, 0.05))
 
-        display_pair = "BTCUSD" if asset_name == "BTC" else "XAUUSD"
+        display_pair = "XAUUSD" if clean_asset == "GOLD" else "BTCUSD"
 
         return {
             "asset": display_pair,
@@ -205,7 +208,7 @@ def get_signal():
         return jsonify({"status": "Fetching live data, please refresh in a few seconds..."}), 200
 
     if data["score"] >= 85:
-        chart_symbol = "COINBASE:BTCUSD" if data['asset'] == "BTCUSD" else "OANDA:XAUUSD"
+        chart_symbol = "OANDA:XAUUSD" if data['asset'] == "XAUUSD" else "COINBASE:BTCUSD"
         chart_link = f"https://www.tradingview.com/chart/?symbol={chart_symbol}"
         
         reply_markup = {
