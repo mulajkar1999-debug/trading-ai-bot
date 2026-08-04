@@ -18,20 +18,22 @@ def send_telegram_alert(message, reply_markup=None):
         }
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        requests.post(url, json=payload, timeout=3)
+        requests.post(url, json=payload, timeout=5)
     except Exception as e:
         print(f"Telegram Alert Error: {e}")
 
+# Strict Real-Data Fetcher (No Fake Fallbacks)
 def get_market_klines(asset_name, interval="15m", limit=210):
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     }
 
+    # --- 1. BTCUSD Data (Coinbase USD) ---
     if asset_name == "BTC":
         granularity = 900 if interval == "15m" else 3600
         url = f"https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity={granularity}"
         try:
-            res = requests.get(url, headers=headers, timeout=4)
+            res = requests.get(url, headers=headers, timeout=6)
             if res.status_code == 200:
                 data = res.json()
                 if isinstance(data, list) and len(data) >= 14:
@@ -43,42 +45,28 @@ def get_market_klines(asset_name, interval="15m", limit=210):
                     volumes = [float(c[5]) for c in data[-limit:]]
                     return closes, opens, highs, lows, volumes
         except Exception as e:
-            print(f"BTC Error: {e}")
+            print(f"Coinbase BTC Error: {e}")
 
+    # --- 2. XAUUSD Data (PAXG / Real Ounce Gold Spot) ---
     if asset_name == "GOLD":
-        yf_interval = "15m" if interval == "15m" else "1h"
-        yf_range = "5d" if interval == "15m" else "1mo"
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval={yf_interval}&range={yf_range}"
-        try:
-            res = requests.get(url, headers=headers, timeout=4)
-            if res.status_code == 200:
-                result = res.json().get('chart', {}).get('result', [])
-                if result:
-                    indicators = result[0].get('indicators', {}).get('quote', [{}])[0]
-                    raw_closes = indicators.get('close', [])
-                    raw_opens = indicators.get('open', [])
-                    raw_highs = indicators.get('high', [])
-                    raw_lows = indicators.get('low', [])
-                    raw_vols = indicators.get('volume', [])
-
-                    closes, opens, highs, lows, volumes = [], [], [], [], []
-                    for i in range(len(raw_closes)):
-                        if raw_closes[i] is not None:
-                            closes.append(float(raw_closes[i]))
-                            opens.append(float(raw_opens[i]) if raw_opens[i] is not None else float(raw_closes[i]))
-                            highs.append(float(raw_highs[i]) if raw_highs[i] is not None else float(raw_closes[i]))
-                            lows.append(float(raw_lows[i]) if raw_lows[i] is not None else float(raw_closes[i]))
-                            volumes.append(float(raw_vols[i]) if (raw_vols and raw_vols[i] is not None) else 100.0)
-
-                    if len(closes) >= 14:
-                        return closes[-limit:], opens[-limit:], highs[-limit:], lows[-limit:], volumes[-limit:]
-        except Exception as e:
-            print(f"Yahoo Gold Error: {e}")
-
-        # Fast Instant Fallback
-        base_price = 4050.00
-        closes = [base_price + (i * 0.1) for i in range(30)]
-        return closes, closes, [p + 1.5 for p in closes], [p - 1.5 for p in closes], [100.0] * 30
+        urls = [
+            f"https://api.binance.us/api/v3/klines?symbol=PAXGUSDT&interval={interval}&limit={limit}",
+            f"https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval={interval}&limit={limit}"
+        ]
+        for url in urls:
+            try:
+                res = requests.get(url, headers=headers, timeout=6)
+                if res.status_code == 200:
+                    data = res.json()
+                    if isinstance(data, list) and len(data) >= 14:
+                        closes = [float(c[4]) for c in data]
+                        opens = [float(c[1]) for c in data]
+                        highs = [float(c[2]) for c in data]
+                        lows = [float(c[3]) for c in data]
+                        volumes = [float(c[5]) for c in data]
+                        return closes, opens, highs, lows, volumes
+            except Exception as e:
+                continue
 
     return [], [], [], [], []
 
@@ -109,19 +97,20 @@ def calculate_rsi(prices, period=14):
 
 def calculate_atr(highs, lows, closes, period=14):
     if len(closes) < period + 1:
-        return 5.0
+        return 2.0
     tr_list = []
     for i in range(1, len(closes)):
         tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
         tr_list.append(tr)
     atr_val = sum(tr_list[-period:]) / period
-    return round(max(atr_val, 2.0), 2)
+    return round(max(atr_val, 1.0), 2)
 
 def analyze_asset(asset_name):
     try:
         clean_asset = "GOLD" if asset_name in ["GOLD", "XAUUSD"] else "BTC"
         closes_15m, opens_15m, highs_15m, lows_15m, volumes_15m = get_market_klines(clean_asset, interval="15m", limit=210)
         
+        # Guard Clause: Strict check to avoid Fake Data Calculations
         if not closes_15m or len(closes_15m) < 14:
             return None
 
@@ -134,18 +123,20 @@ def analyze_asset(asset_name):
         
         htf_trend_bullish = current_price >= ema200_15m
         
-        score = 50
+        score = 0
         action = "WAIT / NO CLEAR ENTRY 🟡"
         
         if current_price >= ema200_15m:
-            score += 15
-            if ema9 > ema21: score += 20
-            if 48 <= rsi_15m <= 67: score += 10
+            score += 25
+            if htf_trend_bullish: score += 20
+            if ema9 > ema21: score += 25
+            if 48 <= rsi_15m <= 67: score += 20
             if score >= 85: action = "INSTITUTIONAL BUY 🟢"
         else:
-            score += 15
-            if ema9 < ema21: score += 20
-            if 33 <= rsi_15m <= 52: score += 10
+            score += 25
+            if not htf_trend_bullish: score += 20
+            if ema9 < ema21: score += 25
+            if 33 <= rsi_15m <= 52: score += 20
             if score >= 85: action = "INSTITUTIONAL SELL 🔴"
 
         tp_distance = round(atr * 1.8, 2)
@@ -171,9 +162,10 @@ def analyze_asset(asset_name):
             "recommended_lot": recommended_lot
         }
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error in analyze_asset: {e}")
         return None
 
+# --- ROUTES ---
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({"status": "Trading Bot Engine Active 🚀"}), 200
@@ -184,7 +176,33 @@ def get_signal():
     data = analyze_asset(asset)
     
     if not data:
-        return jsonify({"status": "Error fetching market data. Please try again."}), 500
+        return jsonify({"status": "Live data connecting... Please refresh in 5 seconds."}), 200
+
+    if data["score"] >= 85:
+        chart_symbol = "OANDA:XAUUSD" if data['asset'] == "XAUUSD" else "COINBASE:BTCUSD"
+        chart_link = f"https://www.tradingview.com/chart/?symbol={chart_symbol}"
+        
+        reply_markup = {
+            "inline_keyboard": [
+                [{"text": "📈 Open TradingView Chart", "url": chart_link}]
+            ]
+        }
+
+        alert_msg = (
+            f"🚀 *PRO ALGO SIGNAL ({data['asset']})*\n\n"
+            f"Action: *{data['action']}*\n"
+            f"Entry Price: `{data['price']}`\n"
+            f"Take Profit (TP): `{data['tp']}`\n"
+            f"Stop Loss (SL): `{data['sl']}`\n\n"
+            f"🧠 *Analytics:* \n"
+            f"• Confluence Score: *{data['score']}%*\n"
+            f"• 1H Trend: `{data['htf_alignment']}`\n"
+            f"• Dynamic Volatility (ATR): `{data['atr']}`\n\n"
+            f"🛡️ *Risk Management:* \n"
+            f"• Risk per Trade: `1.5% ($15)`\n"
+            f"• Recommended Lot: `{data['recommended_lot']}`"
+        )
+        send_telegram_alert(alert_msg, reply_markup=reply_markup)
 
     return jsonify(data), 200
 
