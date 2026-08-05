@@ -1,4 +1,6 @@
 import os
+import time
+import threading
 import requests
 from flask import Flask, jsonify, request
 
@@ -6,6 +8,15 @@ app = Flask(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8723192534:AAFqkexJpF-yu38dPI0cEUT6H0nooN_sjdM")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1317739622")
+
+# --- In-Memory Trade Logger & Active Signal Tracker ---
+active_signals = []
+trade_history = {
+    "total_signals": 0,
+    "wins": 0,
+    "losses": 0,
+    "win_rate": 0.0
+}
 
 def send_telegram_alert(message, reply_markup=None):
     try:
@@ -18,16 +29,32 @@ def send_telegram_alert(message, reply_markup=None):
         }
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        requests.post(url, json=payload, timeout=5)
+        res = requests.post(url, json=payload, timeout=5)
+        if res.status_code == 200:
+            return res.json().get("result", {}).get("message_id")
     except Exception as e:
         print(f"Telegram Alert Error: {e}")
+    return None
 
-# Strict High-Precision Data Fetcher via Coinbase
+def edit_telegram_alert(message_id, new_message, reply_markup=None):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "message_id": message_id,
+            "text": new_message,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": False
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        print(f"Telegram Edit Error: {e}")
+
+# High-Precision Data Fetcher via Coinbase
 def get_market_klines(asset_name, interval="15m", limit=210):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
-
+    headers = {'User-Agent': 'Mozilla/5.0'}
     product_id = "BTC-USD" if asset_name == "BTC" else "PAXG-USD"
     granularity = 900 if interval == "15m" else 3600
     url = f"https://api.exchange.coinbase.com/products/{product_id}/candles?granularity={granularity}"
@@ -37,8 +64,7 @@ def get_market_klines(asset_name, interval="15m", limit=210):
         if res.status_code == 200:
             data = res.json()
             if isinstance(data, list) and len(data) >= 14:
-                # Coinbase Candles format: [ time, low, high, open, close, volume ]
-                data = sorted(data, key=lambda x: x[0])  # Oldest to newest
+                data = sorted(data, key=lambda x: x[0])
                 closes = [float(c[4]) for c in data[-limit:]]
                 opens = [float(c[3]) for c in data[-limit:]]
                 highs = [float(c[2]) for c in data[-limit:]]
@@ -85,6 +111,64 @@ def calculate_atr(highs, lows, closes, period=14):
     atr_val = sum(tr_list[-period:]) / period
     return round(max(atr_val, 1.0), 2)
 
+def update_win_rate():
+    total = trade_history["wins"] + trade_history["losses"]
+    trade_history["total_signals"] = total
+    if total > 0:
+        trade_history["win_rate"] = round((trade_history["wins"] / total) * 100, 2)
+
+# --- Background Worker: Auto Monitor Active Signals for TP/SL ---
+def monitor_active_trades():
+    while True:
+        try:
+            for signal in list(active_signals):
+                asset_code = "BTC" if "BTC" in signal["asset"] else "GOLD"
+                closes, _, highs, lows, _ = get_market_klines(asset_code, interval="15m", limit=5)
+                if not closes:
+                    continue
+                
+                curr_high = highs[-1]
+                curr_low = lows[-1]
+                
+                is_buy = "BUY" in signal["action"]
+                tp_hit = curr_high >= signal["tp"] if is_buy else curr_low <= signal["tp"]
+                sl_hit = curr_low <= signal["sl"] if is_buy else curr_high >= signal["sl"]
+
+                if tp_hit or sl_hit:
+                    status_text = "✅ TARGET HIT (WIN) 🎯" if tp_hit else "❌ STOP LOSS HIT (LOSS) 🛑"
+                    
+                    if tp_hit:
+                        trade_history["wins"] += 1
+                    else:
+                        trade_history["losses"] += 1
+                    update_win_rate()
+
+                    chart_symbol = "OANDA:XAUUSD" if signal['asset'] == "XAUUSD" else "COINBASE:BTCUSD"
+                    chart_link = f"https://www.tradingview.com/chart/?symbol={chart_symbol}"
+                    reply_markup = {"inline_keyboard": [[{"text": "📈 TradingView Chart", "url": chart_link}]]}
+
+                    updated_msg = (
+                        f"🚀 *PRO ALGO SIGNAL ({signal['asset']})*\n\n"
+                        f"Status: *{status_text}*\n"
+                        f"Action: *{signal['action']}*\n"
+                        f"Entry Price: `{signal['price']}`\n"
+                        f"Take Profit (TP): `{signal['tp']}`\n"
+                        f"Stop Loss (SL): `{signal['sl']}`\n\n"
+                        f"🧠 *Analytics:* \n"
+                        f"• Confluence Score: *{signal['score']}%*\n"
+                        f"• Win Rate Tracker: *{trade_history['win_rate']}%* ({trade_history['wins']}W / {trade_history['losses']}L)"
+                    )
+
+                    edit_telegram_alert(signal["msg_id"], updated_msg, reply_markup=reply_markup)
+                    active_signals.remove(signal)
+        except Exception as e:
+            print(f"Monitor Loop Error: {e}")
+            
+        time.sleep(15)  # Check prices every 15 seconds
+
+# Start Background Monitoring Thread
+threading.Thread(target=monitor_active_trades, daemon=True).start()
+
 def analyze_asset(asset_name):
     try:
         clean_asset = "GOLD" if asset_name in ["GOLD", "XAUUSD"] else "BTC"
@@ -94,45 +178,70 @@ def analyze_asset(asset_name):
             return None
 
         current_price = closes_15m[-1]
-        ema9 = calculate_ema(closes_15m, 9)
-        ema21 = calculate_ema(closes_15m, 21)
-        ema200_15m = calculate_ema(closes_15m, 200) if len(closes_15m) >= 200 else calculate_ema(closes_15m, len(closes_15m))
-        rsi_15m = calculate_rsi(closes_15m, 14)
-        atr = calculate_atr(highs_15m, lows_15m, closes_15m, 14)
         
-        htf_trend_bullish = current_price >= ema200_15m
-        
-        score = 0
-        action = "WAIT / NO CLEAR ENTRY 🟡"
-        
-        if current_price >= ema200_15m:
-            score += 25
-            if htf_trend_bullish: score += 20
-            if ema9 > ema21: score += 25
-            if 48 <= rsi_15m <= 67: score += 20
-            if score >= 85: action = "INSTITUTIONAL BUY 🟢"
-        else:
-            score += 25
-            if not htf_trend_bullish: score += 20
-            if ema9 < ema21: score += 25
-            if 33 <= rsi_15m <= 52: score += 20
-            if score >= 85: action = "INSTITUTIONAL SELL 🔴"
+        if clean_asset == "BTC":
+            ema_fast = calculate_ema(closes_15m, 12)
+            ema_slow = calculate_ema(closes_15m, 26)
+            ema200 = calculate_ema(closes_15m, 200) if len(closes_15m) >= 200 else calculate_ema(closes_15m, len(closes_15m))
+            rsi = calculate_rsi(closes_15m, 14)
+            atr = calculate_atr(highs_15m, lows_15m, closes_15m, 14)
+            
+            htf_trend_bullish = current_price >= ema200
+            score = 0
+            action = "WAIT / NO CLEAR ENTRY 🟡"
+            
+            if htf_trend_bullish:
+                score += 30
+                if ema_fast > ema_slow: score += 30
+                if 50 <= rsi <= 72: score += 25
+                if score >= 85: action = "INSTITUTIONAL BUY 🟢"
+            else:
+                score += 30
+                if ema_fast < ema_slow: score += 30
+                if 28 <= rsi <= 50: score += 25
+                if score >= 85: action = "INSTITUTIONAL SELL 🔴"
 
-        tp_distance = round(atr * 1.8, 2)
-        sl_distance = round(atr * 1.0, 2)
-        
+            tp_distance = round(atr * 2.2, 2)
+            sl_distance = round(atr * 1.3, 2)
+        else:
+            ema9 = calculate_ema(closes_15m, 9)
+            ema21 = calculate_ema(closes_15m, 21)
+            ema200 = calculate_ema(closes_15m, 200) if len(closes_15m) >= 200 else calculate_ema(closes_15m, len(closes_15m))
+            rsi = calculate_rsi(closes_15m, 14)
+            atr = calculate_atr(highs_15m, lows_15m, closes_15m, 14)
+            
+            htf_trend_bullish = current_price >= ema200
+            score = 0
+            action = "WAIT / NO CLEAR ENTRY 🟡"
+            
+            if htf_trend_bullish:
+                score += 25
+                if current_price >= ema200: score += 20
+                if ema9 > ema21: score += 25
+                if 48 <= rsi <= 67: score += 20
+                if score >= 85: action = "INSTITUTIONAL BUY 🟢"
+            else:
+                score += 25
+                if current_price < ema200: score += 20
+                if ema9 < ema21: score += 25
+                if 33 <= rsi <= 52: score += 20
+                if score >= 85: action = "INSTITUTIONAL SELL 🔴"
+
+            tp_distance = round(atr * 1.8, 2)
+            sl_distance = round(atr * 1.0, 2)
+
         tp = round(current_price + tp_distance if "BUY" in action else current_price - tp_distance, 2)
         sl = round(current_price - sl_distance if "BUY" in action else current_price + sl_distance, 2)
 
-        recommended_lot = 0.05 if clean_asset == "GOLD" else 0.01
-        display_pair = "XAUUSD" if clean_asset == "GOLD" else "BTCUSD"
+        recommended_lot = 0.01 if clean_asset == "BTC" else 0.05
+        display_pair = "BTCUSD" if clean_asset == "BTC" else "XAUUSD"
 
         return {
             "asset": display_pair,
             "price": round(current_price, 2),
             "action": action,
             "score": score,
-            "rsi": rsi_15m,
+            "rsi": rsi,
             "atr": atr,
             "htf_alignment": "BULLISH 📈" if htf_trend_bullish else "BEARISH 📉",
             "volume_surge": "NORMAL",
@@ -148,6 +257,13 @@ def analyze_asset(asset_name):
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({"status": "Trading Bot Engine Active 🚀"}), 200
+
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    return jsonify({
+        "performance": trade_history,
+        "active_signals_count": len(active_signals)
+    }), 200
 
 @app.route('/api/signal', methods=['GET'])
 def get_signal():
@@ -169,6 +285,7 @@ def get_signal():
 
         alert_msg = (
             f"🚀 *PRO ALGO SIGNAL ({data['asset']})*\n\n"
+            f"Status: *ACTIVE ⏳*\n"
             f"Action: *{data['action']}*\n"
             f"Entry Price: `{data['price']}`\n"
             f"Take Profit (TP): `{data['tp']}`\n"
@@ -178,10 +295,21 @@ def get_signal():
             f"• 1H Trend: `{data['htf_alignment']}`\n"
             f"• Dynamic Volatility (ATR): `{data['atr']}`\n\n"
             f"🛡️ *Risk Management:* \n"
-            f"• Risk per Trade: `1.5% ($15)`\n"
             f"• Recommended Lot: `{data['recommended_lot']}`"
         )
-        send_telegram_alert(alert_msg, reply_markup=reply_markup)
+        
+        msg_id = send_telegram_alert(alert_msg, reply_markup=reply_markup)
+        
+        if msg_id:
+            active_signals.append({
+                "msg_id": msg_id,
+                "asset": data['asset'],
+                "action": data['action'],
+                "price": data['price'],
+                "tp": data['tp'],
+                "sl": data['sl'],
+                "score": data['score']
+            })
 
     return jsonify(data), 200
 
