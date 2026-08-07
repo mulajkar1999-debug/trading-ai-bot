@@ -2,7 +2,7 @@ import os
 import time
 import threading
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 from flask import Flask, jsonify, request
 
@@ -53,7 +53,6 @@ def edit_telegram_alert(message_id, new_message, reply_markup=None):
     except Exception as e:
         print(f"Telegram Edit Error: {e}")
 
-# High-Precision Data Fetcher via Coinbase
 def get_market_klines(asset_name, interval="15m", limit=210):
     headers = {'User-Agent': 'Mozilla/5.0'}
     product_id = "BTC-USD" if asset_name == "BTC" else "PAXG-USD"
@@ -73,7 +72,7 @@ def get_market_klines(asset_name, interval="15m", limit=210):
                 volumes = [float(c[5]) for c in data[-limit:]]
                 return closes, opens, highs, lows, volumes
     except Exception as e:
-        print(f"Coinbase Fetch Error ({product_id} - {interval}): {e}")
+        print(f"Coinbase Fetch Error ({product_id}): {e}")
 
     return [], [], [], [], []
 
@@ -112,60 +111,40 @@ def calculate_atr(highs, lows, closes, period=14):
     atr_val = sum(tr_list[-period:]) / period
     return round(max(atr_val, 1.0), 2)
 
-# --- Feature 1: High-Impact News Auto-Pause Filter ---
 def is_high_impact_news_active():
     try:
-        # Check current UTC time for major news windows (e.g. 12:30 UTC / 13:30 UTC / 18:00 UTC)
         now_utc = datetime.now(pytz.utc)
         current_minute = now_utc.hour * 60 + now_utc.minute
+        news_windows = [(740, 820), (800, 880), (1070, 1150)]
         
-        # News Windows (CPI, NFP, FOMC typical times in minutes)
-        news_windows = [
-            (740, 820),   # 12:20 UTC to 13:40 UTC
-            (800, 880),   # 13:20 UTC to 14:40 UTC
-            (1070, 1150)  # 17:50 UTC to 19:10 UTC
-        ]
-        
-        # Avoid major news spikes during weekdays
-        if now_utc.weekday() in [2, 3, 4]:  # Wed, Thu, Fri
+        if now_utc.weekday() in [2, 3, 4]:
             for start, end in news_windows:
                 if start <= current_minute <= end:
-                    return True, "HIGH IMPACT ECONOMIC NEWS IN PROGRESS ⚠️"
+                    return True, "HIGH IMPACT NEWS PAUSE ⚠️"
     except Exception as e:
         print(f"News Filter Error: {e}")
-    return False, "NO NEWS IMPACT 🟢"
+    return False, "NO NEWS 🟢"
 
-# --- Feature 2: SMC Liquidity Grab Detection ---
 def detect_smc_liquidity_grab(highs, lows, closes):
     if len(closes) < 20:
-        return False, "NONE"
-    
+        return False, "BALANCED"
     recent_high = max(highs[-20:-2])
     recent_low = min(lows[-20:-2])
+    current_high, current_low, current_close = highs[-1], lows[-1], closes[-1]
     
-    current_high = highs[-1]
-    current_low = lows[-1]
-    current_close = closes[-1]
-    
-    # Bearish Liquidity Grab (Wick above recent high but closed below)
     if current_high > recent_high and current_close < recent_high:
-        return True, "BUY-SIDE LIQUIDITY SWEEP (BEARISH REVERSAL) 🔴"
-        
-    # Bullish Liquidity Grab (Wick below recent low but closed above)
+        return True, "BEARISH SWEEP 🔴"
     if current_low < recent_low and current_close > recent_low:
-        return True, "SELL-SIDE LIQUIDITY SWEEP (BULLISH REVERSAL) 🟢"
-        
+        return True, "BULLISH SWEEP 🟢"
     return False, "BALANCED"
 
 def get_current_session_info():
     tz_ist = pytz.timezone('Asia/Kolkata')
     now_ist = datetime.now(tz_ist)
     hour = now_ist.hour
-    
     if 13 <= hour or hour < 3:
-        return "LONDON / NEW YORK (HIGH VOLUME) 🔥", 85
-    else:
-        return "ASIAN SESSION (RANGE) 🟡", 90
+        return "LONDON/NY SESSION 🔥", 85
+    return "ASIAN SESSION 🟡", 90
 
 def update_win_rate():
     total = trade_history["wins"] + trade_history["losses"]
@@ -173,7 +152,7 @@ def update_win_rate():
     if total > 0:
         trade_history["win_rate"] = round((trade_history["wins"] / total) * 100, 2)
 
-# --- Feature 3: Auto Monitor Active Signals + Trailing Stop-Loss (Break-Even) ---
+# --- Background Worker: Price Monitor ---
 def monitor_active_trades():
     while True:
         try:
@@ -183,43 +162,36 @@ def monitor_active_trades():
                 if not closes:
                     continue
                 
-                curr_price = closes[-1]
-                curr_high = highs[-1]
-                curr_low = lows[-1]
-                
+                curr_high, curr_low = highs[-1], lows[-1]
                 is_buy = "BUY" in signal["action"]
-                entry_p = signal["price"]
-                tp_p = signal["tp"]
-                sl_p = signal["sl"]
+                entry_p, tp_p, sl_p = signal["price"], signal["tp"], signal["sl"]
                 
                 tp_dist = abs(tp_p - entry_p)
                 half_tp = entry_p + (tp_dist * 0.5) if is_buy else entry_p - (tp_dist * 0.5)
 
-                # Check Break-Even Trigger (Price reached 50% TP distance)
+                # Break-Even Logic
                 if not signal.get("break_even_triggered", False):
                     be_hit = curr_high >= half_tp if is_buy else curr_low <= half_tp
                     if be_hit:
                         signal["break_even_triggered"] = True
-                        signal["sl"] = entry_p  # Shift SL to Entry Price
+                        signal["sl"] = entry_p
                         
                         chart_symbol = "OANDA:XAUUSD" if signal['asset'] == "XAUUSD" else "COINBASE:BTCUSD"
                         chart_link = f"https://www.tradingview.com/chart/?symbol={chart_symbol}"
-                        reply_markup = {"inline_keyboard": [[{"text": "📈 Open TradingView Chart", "url": chart_link}]]}
+                        reply_markup = {"inline_keyboard": [[{"text": "📈 TradingView Chart", "url": chart_link}]]}
 
                         be_msg = (
-                            f"🚀 *PRO ALGO SIGNAL ({signal['asset']})*\n\n"
-                            f"Status: *🛡️ BREAK-EVEN ACTIVATED (50% TP REACHED)*\n"
+                            f"🚀 *ALGO SIGNAL ({signal['asset']})*\n"
+                            f"⏰ Time: `{signal['created_at']}`\n\n"
+                            f"Status: *🛡️ BREAK-EVEN (SL SHIFTED TO ENTRY)*\n"
                             f"Action: *{signal['action']}*\n"
                             f"Entry Price: `{signal['price']}`\n"
-                            f"Take Profit (TP): `{signal['tp']}`\n"
-                            f"Stop Loss (SL): `{entry_p}` *(PROTECTED - RISK 0%)* 🔒\n\n"
-                            f"🧠 *Analytics:* \n"
-                            f"• Confluence Score: *{signal['score']}%*\n"
-                            f"• Win Rate Tracker: *{trade_history['win_rate']}%* ({trade_history['wins']}W / {trade_history['losses']}L)"
+                            f"Take Profit: `{signal['tp']}`\n"
+                            f"Stop Loss: `{entry_p}` *(RISK 0%)* 🔒\n"
                         )
                         edit_telegram_alert(signal["msg_id"], be_msg, reply_markup=reply_markup)
 
-                # Check TP or SL Hit
+                # TP or SL Hit
                 tp_hit = curr_high >= tp_p if is_buy else curr_low <= tp_p
                 sl_hit = curr_low <= signal["sl"] if is_buy else curr_high >= signal["sl"]
 
@@ -241,15 +213,14 @@ def monitor_active_trades():
                     reply_markup = {"inline_keyboard": [[{"text": "📈 TradingView Chart", "url": chart_link}]]}
 
                     updated_msg = (
-                        f"🚀 *PRO ALGO SIGNAL ({signal['asset']})*\n\n"
+                        f"🚀 *ALGO SIGNAL ({signal['asset']})*\n"
+                        f"⏰ Time: `{signal['created_at']}`\n\n"
                         f"Status: *{status_text}*\n"
                         f"Action: *{signal['action']}*\n"
                         f"Entry Price: `{signal['price']}`\n"
-                        f"Take Profit (TP): `{signal['tp']}`\n"
-                        f"Stop Loss (SL): `{signal['sl']}`\n\n"
-                        f"🧠 *Analytics:* \n"
-                        f"• Confluence Score: *{signal['score']}%*\n"
-                        f"• Win Rate Tracker: *{trade_history['win_rate']}%* ({trade_history['wins']}W / {trade_history['losses']}L)"
+                        f"Take Profit: `{signal['tp']}`\n"
+                        f"Stop Loss: `{signal['sl']}`\n\n"
+                        f"📊 Overall Win Rate: *{trade_history['win_rate']}%* ({trade_history['wins']}W / {trade_history['losses']}L)"
                     )
 
                     edit_telegram_alert(signal["msg_id"], updated_msg, reply_markup=reply_markup)
@@ -259,14 +230,12 @@ def monitor_active_trades():
             
         time.sleep(15)
 
-# Start Background Thread
 threading.Thread(target=monitor_active_trades, daemon=True).start()
 
 def analyze_asset(asset_name):
     try:
         clean_asset = "GOLD" if asset_name in ["GOLD", "XAUUSD"] else "BTC"
         
-        # 1. Check News Filter
         is_news, news_reason = is_high_impact_news_active()
         if is_news:
             return {"status": "PAUSED", "reason": news_reason}
@@ -280,11 +249,8 @@ def analyze_asset(asset_name):
         current_price = closes_15m[-1]
         session_name, required_score_threshold = get_current_session_info()
 
-        # 1H Macro Trend Check
         ema200_1h = calculate_ema(closes_1h, 200) if len(closes_1h) >= 200 else calculate_ema(closes_1h, len(closes_1h))
         macro_bullish_1h = current_price >= ema200_1h
-
-        # SMC Liquidity Check
         smc_grab, smc_detail = detect_smc_liquidity_grab(highs_15m, lows_15m, closes_15m)
 
         if clean_asset == "BTC":
@@ -309,7 +275,7 @@ def analyze_asset(asset_name):
                 if smc_grab and "BEARISH" in smc_detail: score += 20
                 if score >= required_score_threshold: action = "INSTITUTIONAL SELL 🔴"
 
-        else:  # GOLD
+        else:
             ema9 = calculate_ema(closes_15m, 9)
             ema21 = calculate_ema(closes_15m, 21)
             rsi = calculate_rsi(closes_15m, 14)
@@ -382,7 +348,15 @@ def get_signal():
     if data.get("status") == "PAUSED":
         return jsonify(data), 200
 
+    # --- FIX 1: DUPLICATE GUARD (Only 1 active trade per asset) ---
+    existing = [s for s in active_signals if s['asset'] == data['asset']]
+    if existing:
+        return jsonify({"status": f"Signal already active for {data['asset']}. Duplicate blocked."}), 200
+
     if data["score"] >= data["required_threshold"]:
+        tz_ist = pytz.timezone('Asia/Kolkata')
+        signal_time = datetime.now(tz_ist).strftime("%I:%M %p | %d %b")
+
         chart_symbol = "OANDA:XAUUSD" if data['asset'] == "XAUUSD" else "COINBASE:BTCUSD"
         chart_link = f"https://www.tradingview.com/chart/?symbol={chart_symbol}"
         
@@ -392,20 +366,17 @@ def get_signal():
             ]
         }
 
+        # --- FIX 2 & 3: CLEAN CARD WITH TIME STAMP ---
         alert_msg = (
-            f"🚀 *PRO ALGO SIGNAL ({data['asset']})*\n\n"
+            f"🚀 *PRO ALGO SIGNAL ({data['asset']})*\n"
+            f"⏰ Time: `{signal_time}`\n\n"
             f"Status: *ACTIVE ⏳*\n"
             f"Action: *{data['action']}*\n"
             f"Entry Price: `{data['price']}`\n"
             f"Take Profit (TP): `{data['tp']}` (R:R 1:2 🎯)\n"
             f"Stop Loss (SL): `{data['sl']}` (Dynamic ATR 🛡️)\n\n"
-            f"🧠 *Analytics:* \n"
-            f"• Confluence Score: *{data['score']}%* (Req: {data['required_threshold']}%)\n"
-            f"• Active Session: `{data['session']}`\n"
-            f"• SMC Liquidity: `{data['smc_liquidity']}`\n"
-            f"• 1H Macro Trend: `{data['htf_alignment']}`\n\n"
-            f"🛡️ *Risk Management:* \n"
-            f"• Recommended Lot: `{data['recommended_lot']}`"
+            f"🧠 *Score:* *{data['score']}%* | Session: `{data['session']}`\n"
+            f"🛡️ *Lot Size:* `{data['recommended_lot']}`"
         )
         
         msg_id = send_telegram_alert(alert_msg, reply_markup=reply_markup)
@@ -419,6 +390,7 @@ def get_signal():
                 "tp": data['tp'],
                 "sl": data['sl'],
                 "score": data['score'],
+                "created_at": signal_time,
                 "break_even_triggered": False
             })
 
