@@ -2,7 +2,7 @@ import os
 import time
 import threading
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from flask import Flask, jsonify, request
 
@@ -11,7 +11,6 @@ app = Flask(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8723192534:AAFqkexJpF-yu38dPI0cEUT6H0nooN_sjdM")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1317739622")
 
-# --- In-Memory Trade Logger & Active Signal Tracker ---
 active_signals = []
 trade_history = {
     "total_signals": 0,
@@ -58,7 +57,7 @@ def edit_telegram_alert(message_id, new_message, reply_markup=None):
 def get_market_klines(asset_name, interval="15m", limit=210):
     headers = {'User-Agent': 'Mozilla/5.0'}
     product_id = "BTC-USD" if asset_name == "BTC" else "PAXG-USD"
-    granularity = 900 if interval == "15m" else 3600  # 900s = 15m, 3600s = 1h
+    granularity = 900 if interval == "15m" else 3600
     url = f"https://api.exchange.coinbase.com/products/{product_id}/candles?granularity={granularity}"
 
     try:
@@ -113,17 +112,59 @@ def calculate_atr(highs, lows, closes, period=14):
     atr_val = sum(tr_list[-period:]) / period
     return round(max(atr_val, 1.0), 2)
 
-# --- Feature 3: Trading Session & Dynamic Threshold Helper ---
+# --- Feature 1: High-Impact News Auto-Pause Filter ---
+def is_high_impact_news_active():
+    try:
+        # Check current UTC time for major news windows (e.g. 12:30 UTC / 13:30 UTC / 18:00 UTC)
+        now_utc = datetime.now(pytz.utc)
+        current_minute = now_utc.hour * 60 + now_utc.minute
+        
+        # News Windows (CPI, NFP, FOMC typical times in minutes)
+        news_windows = [
+            (740, 820),   # 12:20 UTC to 13:40 UTC
+            (800, 880),   # 13:20 UTC to 14:40 UTC
+            (1070, 1150)  # 17:50 UTC to 19:10 UTC
+        ]
+        
+        # Avoid major news spikes during weekdays
+        if now_utc.weekday() in [2, 3, 4]:  # Wed, Thu, Fri
+            for start, end in news_windows:
+                if start <= current_minute <= end:
+                    return True, "HIGH IMPACT ECONOMIC NEWS IN PROGRESS ⚠️"
+    except Exception as e:
+        print(f"News Filter Error: {e}")
+    return False, "NO NEWS IMPACT 🟢"
+
+# --- Feature 2: SMC Liquidity Grab Detection ---
+def detect_smc_liquidity_grab(highs, lows, closes):
+    if len(closes) < 20:
+        return False, "NONE"
+    
+    recent_high = max(highs[-20:-2])
+    recent_low = min(lows[-20:-2])
+    
+    current_high = highs[-1]
+    current_low = lows[-1]
+    current_close = closes[-1]
+    
+    # Bearish Liquidity Grab (Wick above recent high but closed below)
+    if current_high > recent_high and current_close < recent_high:
+        return True, "BUY-SIDE LIQUIDITY SWEEP (BEARISH REVERSAL) 🔴"
+        
+    # Bullish Liquidity Grab (Wick below recent low but closed above)
+    if current_low < recent_low and current_close > recent_low:
+        return True, "SELL-SIDE LIQUIDITY SWEEP (BULLISH REVERSAL) 🟢"
+        
+    return False, "BALANCED"
+
 def get_current_session_info():
     tz_ist = pytz.timezone('Asia/Kolkata')
     now_ist = datetime.now(tz_ist)
     hour = now_ist.hour
     
-    # London / New York High-Volume Sessions (13:00 to 02:30 IST)
     if 13 <= hour or hour < 3:
         return "LONDON / NEW YORK (HIGH VOLUME) 🔥", 85
     else:
-        # Asian Low-Volume Consolidation Session
         return "ASIAN SESSION (RANGE) 🟡", 90
 
 def update_win_rate():
@@ -132,7 +173,7 @@ def update_win_rate():
     if total > 0:
         trade_history["win_rate"] = round((trade_history["wins"] / total) * 100, 2)
 
-# --- Background Worker: Auto Monitor Active Signals for TP/SL ---
+# --- Feature 3: Auto Monitor Active Signals + Trailing Stop-Loss (Break-Even) ---
 def monitor_active_trades():
     while True:
         try:
@@ -142,20 +183,57 @@ def monitor_active_trades():
                 if not closes:
                     continue
                 
+                curr_price = closes[-1]
                 curr_high = highs[-1]
                 curr_low = lows[-1]
                 
                 is_buy = "BUY" in signal["action"]
-                tp_hit = curr_high >= signal["tp"] if is_buy else curr_low <= signal["tp"]
+                entry_p = signal["price"]
+                tp_p = signal["tp"]
+                sl_p = signal["sl"]
+                
+                tp_dist = abs(tp_p - entry_p)
+                half_tp = entry_p + (tp_dist * 0.5) if is_buy else entry_p - (tp_dist * 0.5)
+
+                # Check Break-Even Trigger (Price reached 50% TP distance)
+                if not signal.get("break_even_triggered", False):
+                    be_hit = curr_high >= half_tp if is_buy else curr_low <= half_tp
+                    if be_hit:
+                        signal["break_even_triggered"] = True
+                        signal["sl"] = entry_p  # Shift SL to Entry Price
+                        
+                        chart_symbol = "OANDA:XAUUSD" if signal['asset'] == "XAUUSD" else "COINBASE:BTCUSD"
+                        chart_link = f"https://www.tradingview.com/chart/?symbol={chart_symbol}"
+                        reply_markup = {"inline_keyboard": [[{"text": "📈 Open TradingView Chart", "url": chart_link}]]}
+
+                        be_msg = (
+                            f"🚀 *PRO ALGO SIGNAL ({signal['asset']})*\n\n"
+                            f"Status: *🛡️ BREAK-EVEN ACTIVATED (50% TP REACHED)*\n"
+                            f"Action: *{signal['action']}*\n"
+                            f"Entry Price: `{signal['price']}`\n"
+                            f"Take Profit (TP): `{signal['tp']}`\n"
+                            f"Stop Loss (SL): `{entry_p}` *(PROTECTED - RISK 0%)* 🔒\n\n"
+                            f"🧠 *Analytics:* \n"
+                            f"• Confluence Score: *{signal['score']}%*\n"
+                            f"• Win Rate Tracker: *{trade_history['win_rate']}%* ({trade_history['wins']}W / {trade_history['losses']}L)"
+                        )
+                        edit_telegram_alert(signal["msg_id"], be_msg, reply_markup=reply_markup)
+
+                # Check TP or SL Hit
+                tp_hit = curr_high >= tp_p if is_buy else curr_low <= tp_p
                 sl_hit = curr_low <= signal["sl"] if is_buy else curr_high >= signal["sl"]
 
                 if tp_hit or sl_hit:
-                    status_text = "✅ TARGET HIT (WIN) 🎯" if tp_hit else "❌ STOP LOSS HIT (LOSS) 🛑"
-                    
                     if tp_hit:
+                        status_text = "✅ TARGET HIT (WIN) 🎯"
                         trade_history["wins"] += 1
                     else:
-                        trade_history["losses"] += 1
+                        if signal.get("break_even_triggered", False):
+                            status_text = "🛡️ CLOSED AT BREAK-EVEN (NO LOSS) 🔒"
+                        else:
+                            status_text = "❌ STOP LOSS HIT (LOSS) 🛑"
+                            trade_history["losses"] += 1
+                    
                     update_win_rate()
 
                     chart_symbol = "OANDA:XAUUSD" if signal['asset'] == "XAUUSD" else "COINBASE:BTCUSD"
@@ -167,7 +245,7 @@ def monitor_active_trades():
                         f"Status: *{status_text}*\n"
                         f"Action: *{signal['action']}*\n"
                         f"Entry Price: `{signal['price']}`\n"
-                        f"Take Profit (TP): `{signal['tp']}` (R:R 1:2)\n"
+                        f"Take Profit (TP): `{signal['tp']}`\n"
                         f"Stop Loss (SL): `{signal['sl']}`\n\n"
                         f"🧠 *Analytics:* \n"
                         f"• Confluence Score: *{signal['score']}%*\n"
@@ -188,7 +266,11 @@ def analyze_asset(asset_name):
     try:
         clean_asset = "GOLD" if asset_name in ["GOLD", "XAUUSD"] else "BTC"
         
-        # --- Feature 2: Multi-Timeframe Fetch (1H for Trend, 15m for Entry) ---
+        # 1. Check News Filter
+        is_news, news_reason = is_high_impact_news_active()
+        if is_news:
+            return {"status": "PAUSED", "reason": news_reason}
+
         closes_1h, _, _, _, _ = get_market_klines(clean_asset, interval="1h", limit=210)
         closes_15m, opens_15m, highs_15m, lows_15m, volumes_15m = get_market_klines(clean_asset, interval="15m", limit=210)
         
@@ -198,9 +280,12 @@ def analyze_asset(asset_name):
         current_price = closes_15m[-1]
         session_name, required_score_threshold = get_current_session_info()
 
-        # 1H Macro Trend Check via EMA200
+        # 1H Macro Trend Check
         ema200_1h = calculate_ema(closes_1h, 200) if len(closes_1h) >= 200 else calculate_ema(closes_1h, len(closes_1h))
         macro_bullish_1h = current_price >= ema200_1h
+
+        # SMC Liquidity Check
+        smc_grab, smc_detail = detect_smc_liquidity_grab(highs_15m, lows_15m, closes_15m)
 
         if clean_asset == "BTC":
             ema_fast = calculate_ema(closes_15m, 12)
@@ -211,19 +296,20 @@ def analyze_asset(asset_name):
             score = 0
             action = "WAIT / NO CLEAR ENTRY 🟡"
             
-            # --- MTF Sync: Only score BUY if 1H Macro Trend is Bullish ---
             if macro_bullish_1h:
-                score += 35  # MTF Alignment Bonus
-                if ema_fast > ema_slow: score += 30
-                if 50 <= rsi <= 72: score += 25
+                score += 30
+                if ema_fast > ema_slow: score += 25
+                if 50 <= rsi <= 72: score += 20
+                if smc_grab and "BULLISH" in smc_detail: score += 20
                 if score >= required_score_threshold: action = "INSTITUTIONAL BUY 🟢"
             else:
-                score += 35  # MTF Alignment Bonus for Bearish
-                if ema_fast < ema_slow: score += 30
-                if 28 <= rsi <= 50: score += 25
+                score += 30
+                if ema_fast < ema_slow: score += 25
+                if 28 <= rsi <= 50: score += 20
+                if smc_grab and "BEARISH" in smc_detail: score += 20
                 if score >= required_score_threshold: action = "INSTITUTIONAL SELL 🔴"
 
-        else:  # GOLD (XAUUSD)
+        else:  # GOLD
             ema9 = calculate_ema(closes_15m, 9)
             ema21 = calculate_ema(closes_15m, 21)
             rsi = calculate_rsi(closes_15m, 14)
@@ -232,21 +318,19 @@ def analyze_asset(asset_name):
             score = 0
             action = "WAIT / NO CLEAR ENTRY 🟡"
             
-            # --- MTF Sync: Only score BUY if 1H Macro Trend is Bullish ---
             if macro_bullish_1h:
-                score += 35  # MTF Alignment Bonus
-                if ema9 > ema21: score += 30
-                if 48 <= rsi <= 67: score += 25
+                score += 30
+                if ema9 > ema21: score += 25
+                if 48 <= rsi <= 67: score += 20
+                if smc_grab and "BULLISH" in smc_detail: score += 20
                 if score >= required_score_threshold: action = "INSTITUTIONAL BUY 🟢"
             else:
-                score += 35  # MTF Alignment Bonus for Bearish
-                if ema9 < ema21: score += 30
-                if 33 <= rsi <= 52: score += 25
+                score += 30
+                if ema9 < ema21: score += 25
+                if 33 <= rsi <= 52: score += 20
+                if smc_grab and "BEARISH" in smc_detail: score += 20
                 if score >= required_score_threshold: action = "INSTITUTIONAL SELL 🔴"
 
-        # --- Feature 1: Dynamic Volatility ATR Multiplier (Risk:Reward 1:2) ---
-        # SL = 1.5x ATR (Gives room during spikes/fakeouts)
-        # TP = 3.0x ATR (Ensures Risk-to-Reward Ratio is exactly 1:2)
         sl_distance = round(atr * 1.5, 2)
         tp_distance = round(atr * 3.0, 2)
 
@@ -263,6 +347,7 @@ def analyze_asset(asset_name):
             "score": score,
             "required_threshold": required_score_threshold,
             "session": session_name,
+            "smc_liquidity": smc_detail,
             "rsi": rsi,
             "atr": atr,
             "htf_alignment": "BULLISH (1H) 📈" if macro_bullish_1h else "BEARISH (1H) 📉",
@@ -277,7 +362,7 @@ def analyze_asset(asset_name):
 # --- ROUTES ---
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({"status": "Trading Bot Engine Active 🚀"}), 200
+    return jsonify({"status": "Institutional Trading Engine Active 🚀"}), 200
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
@@ -292,7 +377,10 @@ def get_signal():
     data = analyze_asset(asset)
     
     if not data:
-        return jsonify({"status": "Connecting Coinbase Live feed... Please refresh."}), 200
+        return jsonify({"status": "Connecting Live feed... Please refresh."}), 200
+
+    if data.get("status") == "PAUSED":
+        return jsonify(data), 200
 
     if data["score"] >= data["required_threshold"]:
         chart_symbol = "OANDA:XAUUSD" if data['asset'] == "XAUUSD" else "COINBASE:BTCUSD"
@@ -314,8 +402,8 @@ def get_signal():
             f"🧠 *Analytics:* \n"
             f"• Confluence Score: *{data['score']}%* (Req: {data['required_threshold']}%)\n"
             f"• Active Session: `{data['session']}`\n"
-            f"• 1H Macro Trend: `{data['htf_alignment']}`\n"
-            f"• Dynamic Volatility (ATR): `{data['atr']}`\n\n"
+            f"• SMC Liquidity: `{data['smc_liquidity']}`\n"
+            f"• 1H Macro Trend: `{data['htf_alignment']}`\n\n"
             f"🛡️ *Risk Management:* \n"
             f"• Recommended Lot: `{data['recommended_lot']}`"
         )
@@ -330,7 +418,8 @@ def get_signal():
                 "price": data['price'],
                 "tp": data['tp'],
                 "sl": data['sl'],
-                "score": data['score']
+                "score": data['score'],
+                "break_even_triggered": False
             })
 
     return jsonify(data), 200
