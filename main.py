@@ -10,9 +10,9 @@ app = Flask(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8723192534:AAFqkexJpF-yu38dPI0cEUT6H0nooN_sjdM")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1317739622")
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "154c31601d3b499b847e0dae6efa14fa")
 
 active_signals = []
+latest_signal_data = {}  # For future Auto-Trading webhook/API consumption
 last_signal_time = {"GOLD": None, "BTC": None}
 
 trade_history = {
@@ -56,34 +56,21 @@ def edit_telegram_alert(message_id, new_message, reply_markup=None):
     except Exception as e:
         print(f"Telegram Edit Error: {e}")
 
-def get_market_klines(asset_name, interval="15m", limit=100):
+def get_market_klines(asset_name, interval="1m", limit=50):
     headers = {'User-Agent': 'Mozilla/5.0'}
     
     if asset_name in ["GOLD", "XAUUSD"]:
-        twelve_interval = "1min" if interval == "1m" else ("15min" if interval == "15m" else "1h")
-        url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval={twelve_interval}&outputsize={limit}&apikey={TWELVEDATA_API_KEY}"
-        try:
-            res = requests.get(url, headers=headers, timeout=8)
-            if res.status_code == 200:
-                data = res.json()
-                if "values" in data and len(data["values"]) >= 2:
-                    raw_candles = list(reversed(data["values"]))
-                    closes = [float(c["close"]) for c in raw_candles]
-                    opens = [float(c["open"]) for c in raw_candles]
-                    highs = [float(c["high"]) for c in raw_candles]
-                    lows = [float(c["low"]) for c in raw_candles]
-                    volumes = [float(c.get("volume", 0)) for c in raw_candles]
-                    return closes, opens, highs, lows, volumes
-        except Exception as e:
-            print(f"TwelveData Gold Fetch Error: {e}")
+        product_id = "PAXG-USD"
+    elif asset_name in ["BTC", "BTCUSD"]:
+        product_id = "BTC-USD"
+    else:
+        return [], [], [], [], []
 
-    # Coinbase Fetch for BTC
-    product_id = "BTC-USD"
     granularity = 60 if interval == "1m" else (900 if interval == "15m" else 3600)
     url = f"https://api.exchange.coinbase.com/products/{product_id}/candles?granularity={granularity}"
 
     try:
-        res = requests.get(url, headers=headers, timeout=6)
+        res = requests.get(url, headers=headers, timeout=5)
         if res.status_code == 200:
             data = res.json()
             if isinstance(data, list) and len(data) >= 2:
@@ -108,7 +95,7 @@ def calculate_ema(prices, period):
         ema = (price * k) + (ema * (1 - k))
     return ema
 
-def calculate_rsi(prices, period=14):
+def calculate_rsi(prices, period=7): # Fast Scalping RSI (7 period)
     if len(prices) < period + 1:
         return 50
     gains, losses = [], []
@@ -124,26 +111,84 @@ def calculate_rsi(prices, period=14):
     rs = avg_gain / avg_loss
     return round(100 - (100 / (1 + rs)), 2)
 
-def calculate_atr(highs, lows, closes, period=14):
-    if len(closes) < period + 1:
-        return 2.0
-    tr_list = []
-    for i in range(1, len(closes)):
-        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-        tr_list.append(tr)
-    atr_val = sum(tr_list[-period:]) / period
-    return round(max(atr_val, 0.5), 2)
-
 def update_win_rate():
     total = trade_history["wins"] + trade_history["losses"]
     trade_history["total_signals"] = total
     if total > 0:
         trade_history["win_rate"] = round((trade_history["wins"] / total) * 100, 2)
 
+def analyze_asset(asset_name):
+    global latest_signal_data
+    try:
+        clean_asset = "GOLD" if asset_name in ["GOLD", "XAUUSD"] else "BTC"
+
+        # Fetch 1-Minute Candles for Scalping
+        closes_1m, opens_1m, highs_1m, lows_1m, volumes_1m = get_market_klines(clean_asset, interval="1m", limit=50)
+        
+        if not closes_1m or len(closes_1m) < 15:
+            return None
+
+        current_price = closes_1m[-1]
+        ema3 = calculate_ema(closes_1m, 3)
+        ema8 = calculate_ema(closes_1m, 8)
+        rsi = calculate_rsi(closes_1m, period=7)
+
+        score = 0
+        action = "WAIT / NO CLEAR ENTRY 🟡"
+
+        # Fast Scalping Bullish Cross
+        if ema3 > ema8 and closes_1m[-1] > opens_1m[-1]:
+            score += 40
+            if rsi > 50: score += 30
+            if closes_1m[-1] > closes_1m[-2]: score += 30
+            if score >= 70: action = "SCALPING BUY 🟢"
+
+        # Fast Scalping Bearish Cross
+        elif ema3 < ema8 and closes_1m[-1] < opens_1m[-1]:
+            score += 40
+            if rsi < 50: score += 30
+            if closes_1m[-1] < closes_1m[-2]: score += 30
+            if score >= 70: action = "SCALPING SELL 🔴"
+
+        # Micro Take Profit / Stop Loss (1-3 Pips)
+        if clean_asset == "GOLD":
+            tp_dist = 0.30  # 3 Pips Gold
+            sl_dist = 0.35  # 3.5 Pips Gold
+            recommended_lot = 0.05
+            display_pair = "XAUUSD"
+        else: # BTC
+            tp_dist = 25.0  # ~$25 BTC Micro Move
+            sl_dist = 30.0  # ~$30 BTC Micro Stop
+            recommended_lot = 0.01
+            display_pair = "BTCUSD"
+
+        tp = round(current_price + tp_dist if "BUY" in action else current_price - tp_dist, 2)
+        sl = round(current_price - sl_dist if "BUY" in action else current_price + sl_dist, 2)
+
+        signal_obj = {
+            "asset": display_pair,
+            "price": round(current_price, 2),
+            "action": action,
+            "score": score,
+            "rsi": rsi,
+            "tp": tp,
+            "sl": sl,
+            "recommended_lot": recommended_lot
+        }
+
+        if score >= 70:
+            latest_signal_data = signal_obj  # Ready for Auto-Trading API
+
+        return signal_obj
+
+    except Exception as e:
+        print(f"Error in analyze_asset: {e}")
+        return None
+
 def analyze_and_trigger(asset_key):
-    # Cooldown Check (Must wait 15 min between trades)
+    # Reduced Cooldown for Scalping (2 min delay per asset)
     now = datetime.now()
-    if last_signal_time[asset_key] and (now - last_signal_time[asset_key]) < timedelta(minutes=15):
+    if last_signal_time[asset_key] and (now - last_signal_time[asset_key]) < timedelta(minutes=2):
         return
 
     data = analyze_asset(asset_key)
@@ -154,11 +199,11 @@ def analyze_and_trigger(asset_key):
     if existing:
         return
 
-    if data["score"] >= 80:
+    if data["score"] >= 70:
         tz_ist = pytz.timezone('Asia/Kolkata')
         signal_time = datetime.now(tz_ist).strftime("%I:%M %p | %d %b")
 
-        chart_symbol = "OANDA:XAUUSD" if data['asset'] == "XAUUSD" else "COINBASE:BTCUSD"
+        chart_symbol = "PAXGUSD" if data['asset'] == "XAUUSD" else "COINBASE:BTCUSD"
         chart_link = f"https://www.tradingview.com/chart/?symbol={chart_symbol}"
         
         reply_markup = {
@@ -166,12 +211,12 @@ def analyze_and_trigger(asset_key):
         }
 
         alert_msg = (
-            f"🚀 *PRO ALGO SIGNAL ({data['asset']})*\n"
+            f"⚡ *1M ULTRA SCALPING SIGNAL ({data['asset']})*\n"
             f"⏰ Time: `{signal_time}`\n\n"
             f"Status: *ACTIVE ⏳*\n"
             f"Action: *{data['action']}*\n"
             f"Entry Price: `{data['price']}`\n"
-            f"Take Profit (TP): `{data['tp']}`\n"
+            f"Take Profit (TP): `{data['tp']}` *(Micro Target)*\n"
             f"Stop Loss (SL): `{data['sl']}`\n\n"
             f"🧠 *Score:* *{data['score']}%*\n"
             f"🛡️ *Lot Size:* `{data['recommended_lot']}`"
@@ -198,10 +243,11 @@ def continuous_auto_scanner():
         try:
             for asset in ["GOLD", "BTC"]:
                 analyze_and_trigger(asset)
-                time.sleep(5)
+                time.sleep(2)
         except Exception as e:
             print(f"Auto Scanner Error: {e}")
-        time.sleep(60)
+        # Continuous Fast Scan every 15 seconds
+        time.sleep(15)
 
 threading.Thread(target=continuous_auto_scanner, daemon=True).start()
 
@@ -210,7 +256,6 @@ def monitor_active_trades():
         try:
             for signal in list(active_signals):
                 asset_code = "BTC" if "BTC" in signal["asset"] else "GOLD"
-                # Use 1-minute candle for real-time monitoring!
                 closes, _, highs, lows, _ = get_market_klines(asset_code, interval="1m", limit=3)
                 if not closes:
                     continue
@@ -218,53 +263,26 @@ def monitor_active_trades():
                 curr_high, curr_low = highs[-1], lows[-1]
                 is_buy = "BUY" in signal["action"]
                 entry_p, tp_p, sl_p = signal["price"], signal["tp"], signal["sl"]
-                
-                tp_dist = abs(tp_p - entry_p)
-                half_tp = entry_p + (tp_dist * 0.5) if is_buy else entry_p - (tp_dist * 0.5)
-
-                if not signal.get("break_even_triggered", False):
-                    be_hit = curr_high >= half_tp if is_buy else curr_low <= half_tp
-                    if be_hit:
-                        signal["break_even_triggered"] = True
-                        signal["sl"] = entry_p
-                        
-                        chart_symbol = "OANDA:XAUUSD" if signal['asset'] == "XAUUSD" else "COINBASE:BTCUSD"
-                        chart_link = f"https://www.tradingview.com/chart/?symbol={chart_symbol}"
-                        reply_markup = {"inline_keyboard": [[{"text": "📈 TradingView Chart", "url": chart_link}]]}
-
-                        be_msg = (
-                            f"🚀 *ALGO SIGNAL ({signal['asset']})*\n"
-                            f"⏰ Time: `{signal['created_at']}`\n\n"
-                            f"Status: *🛡️ BREAK-EVEN (SL SHIFTED TO ENTRY)*\n"
-                            f"Action: *{signal['action']}*\n"
-                            f"Entry Price: `{signal['price']}`\n"
-                            f"Take Profit: `{signal['tp']}`\n"
-                            f"Stop Loss: `{entry_p}` *(RISK 0%)* 🔒\n"
-                        )
-                        edit_telegram_alert(signal["msg_id"], be_msg, reply_markup=reply_markup)
 
                 tp_hit = curr_high >= tp_p if is_buy else curr_low <= tp_p
                 sl_hit = curr_low <= signal["sl"] if is_buy else curr_high >= signal["sl"]
 
                 if tp_hit or sl_hit:
                     if tp_hit:
-                        status_text = "✅ TARGET HIT (WIN) 🎯"
+                        status_text = "✅ MICRO TARGET HIT (WIN) 🎯"
                         trade_history["wins"] += 1
                     else:
-                        if signal.get("break_even_triggered", False):
-                            status_text = "🛡️ CLOSED AT BREAK-EVEN (NO LOSS) 🔒"
-                        else:
-                            status_text = "❌ STOP LOSS HIT (LOSS) 🛑"
-                            trade_history["losses"] += 1
+                        status_text = "❌ STOP LOSS HIT (LOSS) 🛑"
+                        trade_history["losses"] += 1
                     
                     update_win_rate()
 
-                    chart_symbol = "OANDA:XAUUSD" if signal['asset'] == "XAUUSD" else "COINBASE:BTCUSD"
+                    chart_symbol = "PAXGUSD" if signal['asset'] == "XAUUSD" else "COINBASE:BTCUSD"
                     chart_link = f"https://www.tradingview.com/chart/?symbol={chart_symbol}"
                     reply_markup = {"inline_keyboard": [[{"text": "📈 TradingView Chart", "url": chart_link}]]}
 
                     updated_msg = (
-                        f"🚀 *ALGO SIGNAL ({signal['asset']})*\n"
+                        f"⚡ *1M SCALPING SIGNAL ({signal['asset']})*\n"
                         f"⏰ Time: `{signal['created_at']}`\n\n"
                         f"Status: *{status_text}*\n"
                         f"Action: *{signal['action']}*\n"
@@ -279,71 +297,14 @@ def monitor_active_trades():
         except Exception as e:
             print(f"Monitor Loop Error: {e}")
             
-        time.sleep(10)
+        time.sleep(5)  # Fast 5-sec trade check for scalping
 
 threading.Thread(target=monitor_active_trades, daemon=True).start()
-
-def analyze_asset(asset_name):
-    try:
-        clean_asset = "GOLD" if asset_name in ["GOLD", "XAUUSD"] else "BTC"
-
-        closes_15m, opens_15m, highs_15m, lows_15m, volumes_15m = get_market_klines(clean_asset, interval="15m", limit=100)
-        
-        if not closes_15m or len(closes_15m) < 25:
-            return None
-
-        current_price = closes_15m[-1]
-        ema9 = calculate_ema(closes_15m, 9)
-        ema21 = calculate_ema(closes_15m, 21)
-        ema50 = calculate_ema(closes_15m, 50)
-        rsi = calculate_rsi(closes_15m, 14)
-        atr = calculate_atr(highs_15m, lows_15m, closes_15m, 14)
-
-        score = 0
-        action = "WAIT / NO CLEAR ENTRY 🟡"
-
-        # Bullish
-        if current_price > ema50:
-            score += 35
-            if ema9 > ema21: score += 30
-            if 48 <= rsi <= 68: score += 25
-            if score >= 80: action = "INSTITUTIONAL BUY 🟢"
-
-        # Bearish
-        elif current_price < ema50:
-            score += 35
-            if ema9 < ema21: score += 30
-            if 32 <= rsi <= 52: score += 25
-            if score >= 80: action = "INSTITUTIONAL SELL 🔴"
-
-        sl_distance = round(atr * 2.0, 2)
-        tp_distance = round(atr * 3.0, 2)
-
-        tp = round(current_price + tp_distance if "BUY" in action else current_price - tp_distance, 2)
-        sl = round(current_price - sl_distance if "BUY" in action else current_price + sl_distance, 2)
-
-        recommended_lot = 0.01 if clean_asset == "BTC" else 0.05
-        display_pair = "BTCUSD" if clean_asset == "BTC" else "XAUUSD"
-
-        return {
-            "asset": display_pair,
-            "price": round(current_price, 2),
-            "action": action,
-            "score": score,
-            "rsi": rsi,
-            "atr": atr,
-            "tp": tp,
-            "sl": sl,
-            "recommended_lot": recommended_lot
-        }
-    except Exception as e:
-        print(f"Error in analyze_asset: {e}")
-        return None
 
 # --- ROUTES ---
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({"status": "Auto-Scanner Active 🚀"}), 200
+    return jsonify({"status": "1M Ultra Scalping Auto-Scanner Active 🚀"}), 200
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
@@ -352,9 +313,14 @@ def get_stats():
         "active_signals_count": len(active_signals)
     }), 200
 
-@app.route('/api/signal', methods=['GET'])
-def get_signal():
-    return jsonify({"status": "Auto-Scanner running continuously in background"}), 200
+@app.route('/api/latest_signal', methods=['GET'])
+def get_latest_signal():
+    # Dedicated endpoint for future MT4/MT5 / Python Auto-Trading bot integration
+    return jsonify({
+        "status": "success",
+        "latest_signal": latest_signal_data,
+        "active_signals": active_signals
+    }), 200
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
