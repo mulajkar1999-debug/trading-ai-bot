@@ -12,7 +12,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8723192534:AAFqkexJpF-yu38
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1317739622")
 
 active_signals = []
-latest_signal_data = {}  # For future Auto-Trading webhook/API consumption
+latest_signal_data = {}
 last_signal_time = {"GOLD": None, "BTC": None}
 
 trade_history = {
@@ -56,7 +56,7 @@ def edit_telegram_alert(message_id, new_message, reply_markup=None):
     except Exception as e:
         print(f"Telegram Edit Error: {e}")
 
-def get_market_klines(asset_name, interval="1m", limit=50):
+def get_market_klines(asset_name, interval="1m", limit=60):
     headers = {'User-Agent': 'Mozilla/5.0'}
     
     if asset_name in ["GOLD", "XAUUSD"]:
@@ -70,7 +70,7 @@ def get_market_klines(asset_name, interval="1m", limit=50):
     url = f"https://api.exchange.coinbase.com/products/{product_id}/candles?granularity={granularity}"
 
     try:
-        res = requests.get(url, headers=headers, timeout=5)
+        res = requests.get(url, headers=headers, timeout=6)
         if res.status_code == 200:
             data = res.json()
             if isinstance(data, list) and len(data) >= 2:
@@ -95,7 +95,7 @@ def calculate_ema(prices, period):
         ema = (price * k) + (ema * (1 - k))
     return ema
 
-def calculate_rsi(prices, period=7): # Fast Scalping RSI (7 period)
+def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
         return 50
     gains, losses = [], []
@@ -122,43 +122,54 @@ def analyze_asset(asset_name):
     try:
         clean_asset = "GOLD" if asset_name in ["GOLD", "XAUUSD"] else "BTC"
 
-        # Fetch 1-Minute Candles for Scalping
-        closes_1m, opens_1m, highs_1m, lows_1m, volumes_1m = get_market_klines(clean_asset, interval="1m", limit=50)
+        # 1. Higher Timeframe Filter (15m Trend Check)
+        closes_15m, _, _, _, _ = get_market_klines(clean_asset, interval="15m", limit=50)
+        if not closes_15m or len(closes_15m) < 20:
+            return None
+            
+        ema_15m_50 = calculate_ema(closes_15m, 50)
+        current_15m_price = closes_15m[-1]
         
+        # Determine 15M Macro Trend
+        macro_trend = "BULLISH" if current_15m_price >= ema_15m_50 else "BEARISH"
+
+        # 2. Lower Timeframe Scalping Entry (1m Execution)
+        closes_1m, opens_1m, highs_1m, lows_1m, volumes_1m = get_market_klines(clean_asset, interval="1m", limit=50)
         if not closes_1m or len(closes_1m) < 15:
             return None
 
         current_price = closes_1m[-1]
-        ema3 = calculate_ema(closes_1m, 3)
-        ema8 = calculate_ema(closes_1m, 8)
-        rsi = calculate_rsi(closes_1m, period=7)
+        ema5 = calculate_ema(closes_1m, 5)
+        ema13 = calculate_ema(closes_1m, 13)
+        rsi = calculate_rsi(closes_1m, period=14)
 
         score = 0
         action = "WAIT / NO CLEAR ENTRY 🟡"
 
-        # Fast Scalping Bullish Cross
-        if ema3 > ema8 and closes_1m[-1] > opens_1m[-1]:
-            score += 40
-            if rsi > 50: score += 30
-            if closes_1m[-1] > closes_1m[-2]: score += 30
-            if score >= 70: action = "SCALPING BUY 🟢"
+        # BULLISH FILTER (Only when 15M Trend is BULLISH)
+        if macro_trend == "BULLISH" and ema5 > ema13 and closes_1m[-1] > opens_1m[-1]:
+            if 52 <= rsi <= 68: # Healthy Scalping Momentum Zone
+                score = 85
+                action = "PRO SCALPING BUY 🟢"
 
-        # Fast Scalping Bearish Cross
-        elif ema3 < ema8 and closes_1m[-1] < opens_1m[-1]:
-            score += 40
-            if rsi < 50: score += 30
-            if closes_1m[-1] < closes_1m[-2]: score += 30
-            if score >= 70: action = "SCALPING SELL 🔴"
+        # BEARISH FILTER (Only when 15M Trend is BEARISH)
+        elif macro_trend == "BEARISH" and ema5 < ema13 and closes_1m[-1] < opens_1m[-1]:
+            if 32 <= rsi <= 48: # Healthy Scalping Momentum Zone
+                score = 85
+                action = "PRO SCALPING SELL 🔴"
 
-        # Micro Take Profit / Stop Loss (1-3 Pips)
+        if score < 85:
+            return None
+
+        # Improved Risk-to-Reward (1:1.5 Ratio)
         if clean_asset == "GOLD":
-            tp_dist = 0.30  # 3 Pips Gold
-            sl_dist = 0.35  # 3.5 Pips Gold
+            tp_dist = 0.50  # 5 Pips Target
+            sl_dist = 0.35  # 3.5 Pips SL
             recommended_lot = 0.05
             display_pair = "XAUUSD"
         else: # BTC
-            tp_dist = 25.0  # ~$25 BTC Micro Move
-            sl_dist = 30.0  # ~$30 BTC Micro Stop
+            tp_dist = 45.0  # $45 Target
+            sl_dist = 30.0  # $30 SL
             recommended_lot = 0.01
             display_pair = "BTCUSD"
 
@@ -176,9 +187,7 @@ def analyze_asset(asset_name):
             "recommended_lot": recommended_lot
         }
 
-        if score >= 70:
-            latest_signal_data = signal_obj  # Ready for Auto-Trading API
-
+        latest_signal_data = signal_obj
         return signal_obj
 
     except Exception as e:
@@ -186,9 +195,8 @@ def analyze_asset(asset_name):
         return None
 
 def analyze_and_trigger(asset_key):
-    # Reduced Cooldown for Scalping (2 min delay per asset)
     now = datetime.now()
-    if last_signal_time[asset_key] and (now - last_signal_time[asset_key]) < timedelta(minutes=2):
+    if last_signal_time[asset_key] and (now - last_signal_time[asset_key]) < timedelta(minutes=5):
         return
 
     data = analyze_asset(asset_key)
@@ -199,44 +207,43 @@ def analyze_and_trigger(asset_key):
     if existing:
         return
 
-    if data["score"] >= 70:
-        tz_ist = pytz.timezone('Asia/Kolkata')
-        signal_time = datetime.now(tz_ist).strftime("%I:%M %p | %d %b")
+    tz_ist = pytz.timezone('Asia/Kolkata')
+    signal_time = datetime.now(tz_ist).strftime("%I:%M %p | %d %b")
 
-        chart_symbol = "PAXGUSD" if data['asset'] == "XAUUSD" else "COINBASE:BTCUSD"
-        chart_link = f"https://www.tradingview.com/chart/?symbol={chart_symbol}"
-        
-        reply_markup = {
-            "inline_keyboard": [[{"text": "📈 TradingView Chart", "url": chart_link}]]
-        }
+    chart_symbol = "PAXGUSD" if data['asset'] == "XAUUSD" else "COINBASE:BTCUSD"
+    chart_link = f"https://www.tradingview.com/chart/?symbol={chart_symbol}"
+    
+    reply_markup = {
+        "inline_keyboard": [[{"text": "📈 TradingView Chart", "url": chart_link}]]
+    }
 
-        alert_msg = (
-            f"⚡ *1M ULTRA SCALPING SIGNAL ({data['asset']})*\n"
-            f"⏰ Time: `{signal_time}`\n\n"
-            f"Status: *ACTIVE ⏳*\n"
-            f"Action: *{data['action']}*\n"
-            f"Entry Price: `{data['price']}`\n"
-            f"Take Profit (TP): `{data['tp']}` *(Micro Target)*\n"
-            f"Stop Loss (SL): `{data['sl']}`\n\n"
-            f"🧠 *Score:* *{data['score']}%*\n"
-            f"🛡️ *Lot Size:* `{data['recommended_lot']}`"
-        )
-        
-        msg_id = send_telegram_alert(alert_msg, reply_markup=reply_markup)
-        
-        if msg_id:
-            last_signal_time[asset_key] = now
-            active_signals.append({
-                "msg_id": msg_id,
-                "asset": data['asset'],
-                "action": data['action'],
-                "price": data['price'],
-                "tp": data['tp'],
-                "sl": data['sl'],
-                "score": data['score'],
-                "created_at": signal_time,
-                "break_even_triggered": False
-            })
+    alert_msg = (
+        f"🎯 *PRO FILTERED SCALPING ({data['asset']})*\n"
+        f"⏰ Time: `{signal_time}`\n\n"
+        f"Status: *ACTIVE ⏳*\n"
+        f"Action: *{data['action']}*\n"
+        f"Entry Price: `{data['price']}`\n"
+        f"Take Profit (TP): `{data['tp']}` *(1:1.5 R:R)*\n"
+        f"Stop Loss (SL): `{data['sl']}`\n\n"
+        f"🧠 *Quality Score:* *{data['score']}%*\n"
+        f"🛡️ *Lot Size:* `{data['recommended_lot']}`"
+    )
+    
+    msg_id = send_telegram_alert(alert_msg, reply_markup=reply_markup)
+    
+    if msg_id:
+        last_signal_time[asset_key] = now
+        active_signals.append({
+            "msg_id": msg_id,
+            "asset": data['asset'],
+            "action": data['action'],
+            "price": data['price'],
+            "tp": data['tp'],
+            "sl": data['sl'],
+            "score": data['score'],
+            "created_at": signal_time,
+            "break_even_triggered": False
+        })
 
 def continuous_auto_scanner():
     while True:
@@ -246,8 +253,7 @@ def continuous_auto_scanner():
                 time.sleep(2)
         except Exception as e:
             print(f"Auto Scanner Error: {e}")
-        # Continuous Fast Scan every 15 seconds
-        time.sleep(15)
+        time.sleep(20)
 
 threading.Thread(target=continuous_auto_scanner, daemon=True).start()
 
@@ -269,7 +275,7 @@ def monitor_active_trades():
 
                 if tp_hit or sl_hit:
                     if tp_hit:
-                        status_text = "✅ MICRO TARGET HIT (WIN) 🎯"
+                        status_text = "✅ SCALPING TARGET HIT (WIN) 🎯"
                         trade_history["wins"] += 1
                     else:
                         status_text = "❌ STOP LOSS HIT (LOSS) 🛑"
@@ -282,7 +288,7 @@ def monitor_active_trades():
                     reply_markup = {"inline_keyboard": [[{"text": "📈 TradingView Chart", "url": chart_link}]]}
 
                     updated_msg = (
-                        f"⚡ *1M SCALPING SIGNAL ({signal['asset']})*\n"
+                        f"🎯 *PRO SCALPING SIGNAL ({signal['asset']})*\n"
                         f"⏰ Time: `{signal['created_at']}`\n\n"
                         f"Status: *{status_text}*\n"
                         f"Action: *{signal['action']}*\n"
@@ -297,14 +303,14 @@ def monitor_active_trades():
         except Exception as e:
             print(f"Monitor Loop Error: {e}")
             
-        time.sleep(5)  # Fast 5-sec trade check for scalping
+        time.sleep(5)
 
 threading.Thread(target=monitor_active_trades, daemon=True).start()
 
 # --- ROUTES ---
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({"status": "1M Ultra Scalping Auto-Scanner Active 🚀"}), 200
+    return jsonify({"status": "Pro Scalping Auto-Scanner Active 🚀"}), 200
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
@@ -315,7 +321,6 @@ def get_stats():
 
 @app.route('/api/latest_signal', methods=['GET'])
 def get_latest_signal():
-    # Dedicated endpoint for future MT4/MT5 / Python Auto-Trading bot integration
     return jsonify({
         "status": "success",
         "latest_signal": latest_signal_data,
