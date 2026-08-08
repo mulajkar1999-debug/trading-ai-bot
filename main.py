@@ -2,7 +2,7 @@ import os
 import time
 import threading
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from flask import Flask, jsonify, request
 
@@ -13,6 +13,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1317739622")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "154c31601d3b499b847e0dae6efa14fa")
 
 active_signals = []
+last_signal_time = {"GOLD": None, "BTC": None}
+
 trade_history = {
     "total_signals": 0,
     "wins": 0,
@@ -58,13 +60,13 @@ def get_market_klines(asset_name, interval="15m", limit=100):
     headers = {'User-Agent': 'Mozilla/5.0'}
     
     if asset_name in ["GOLD", "XAUUSD"]:
-        twelve_interval = "15min" if interval == "15m" else "1h"
+        twelve_interval = "1min" if interval == "1m" else ("15min" if interval == "15m" else "1h")
         url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval={twelve_interval}&outputsize={limit}&apikey={TWELVEDATA_API_KEY}"
         try:
             res = requests.get(url, headers=headers, timeout=8)
             if res.status_code == 200:
                 data = res.json()
-                if "values" in data and len(data["values"]) >= 14:
+                if "values" in data and len(data["values"]) >= 2:
                     raw_candles = list(reversed(data["values"]))
                     closes = [float(c["close"]) for c in raw_candles]
                     opens = [float(c["open"]) for c in raw_candles]
@@ -75,16 +77,16 @@ def get_market_klines(asset_name, interval="15m", limit=100):
         except Exception as e:
             print(f"TwelveData Gold Fetch Error: {e}")
 
-    # Fetch BTC-USD via Coinbase
+    # Coinbase Fetch for BTC
     product_id = "BTC-USD"
-    granularity = 900 if interval == "15m" else 3600
+    granularity = 60 if interval == "1m" else (900 if interval == "15m" else 3600)
     url = f"https://api.exchange.coinbase.com/products/{product_id}/candles?granularity={granularity}"
 
     try:
         res = requests.get(url, headers=headers, timeout=6)
         if res.status_code == 200:
             data = res.json()
-            if isinstance(data, list) and len(data) >= 14:
+            if isinstance(data, list) and len(data) >= 2:
                 data = sorted(data, key=lambda x: x[0])
                 closes = [float(c[4]) for c in data[-limit:]]
                 opens = [float(c[3]) for c in data[-limit:]]
@@ -139,6 +141,11 @@ def update_win_rate():
         trade_history["win_rate"] = round((trade_history["wins"] / total) * 100, 2)
 
 def analyze_and_trigger(asset_key):
+    # Cooldown Check (Must wait 15 min between trades)
+    now = datetime.now()
+    if last_signal_time[asset_key] and (now - last_signal_time[asset_key]) < timedelta(minutes=15):
+        return
+
     data = analyze_asset(asset_key)
     if not data:
         return
@@ -147,7 +154,7 @@ def analyze_and_trigger(asset_key):
     if existing:
         return
 
-    if data["score"] >= 75:  # Dynamic threshold
+    if data["score"] >= 80:
         tz_ist = pytz.timezone('Asia/Kolkata')
         signal_time = datetime.now(tz_ist).strftime("%I:%M %p | %d %b")
 
@@ -164,8 +171,8 @@ def analyze_and_trigger(asset_key):
             f"Status: *ACTIVE ⏳*\n"
             f"Action: *{data['action']}*\n"
             f"Entry Price: `{data['price']}`\n"
-            f"Take Profit (TP): `{data['tp']}` (R:R 1:1.5 🎯)\n"
-            f"Stop Loss (SL): `{data['sl']}` (Wide ATR 🛡️)\n\n"
+            f"Take Profit (TP): `{data['tp']}`\n"
+            f"Stop Loss (SL): `{data['sl']}`\n\n"
             f"🧠 *Score:* *{data['score']}%*\n"
             f"🛡️ *Lot Size:* `{data['recommended_lot']}`"
         )
@@ -173,6 +180,7 @@ def analyze_and_trigger(asset_key):
         msg_id = send_telegram_alert(alert_msg, reply_markup=reply_markup)
         
         if msg_id:
+            last_signal_time[asset_key] = now
             active_signals.append({
                 "msg_id": msg_id,
                 "asset": data['asset'],
@@ -186,7 +194,6 @@ def analyze_and_trigger(asset_key):
             })
 
 def continuous_auto_scanner():
-    """Background loop that automatically scans both assets every 60s"""
     while True:
         try:
             for asset in ["GOLD", "BTC"]:
@@ -203,7 +210,8 @@ def monitor_active_trades():
         try:
             for signal in list(active_signals):
                 asset_code = "BTC" if "BTC" in signal["asset"] else "GOLD"
-                closes, _, highs, lows, _ = get_market_klines(asset_code, interval="15m", limit=5)
+                # Use 1-minute candle for real-time monitoring!
+                closes, _, highs, lows, _ = get_market_klines(asset_code, interval="1m", limit=3)
                 if not closes:
                     continue
                 
@@ -212,7 +220,7 @@ def monitor_active_trades():
                 entry_p, tp_p, sl_p = signal["price"], signal["tp"], signal["sl"]
                 
                 tp_dist = abs(tp_p - entry_p)
-                half_tp = entry_p + (tp_dist * 0.6) if is_buy else entry_p - (tp_dist * 0.6)
+                half_tp = entry_p + (tp_dist * 0.5) if is_buy else entry_p - (tp_dist * 0.5)
 
                 if not signal.get("break_even_triggered", False):
                     be_hit = curr_high >= half_tp if is_buy else curr_low <= half_tp
@@ -271,7 +279,7 @@ def monitor_active_trades():
         except Exception as e:
             print(f"Monitor Loop Error: {e}")
             
-        time.sleep(15)
+        time.sleep(10)
 
 threading.Thread(target=monitor_active_trades, daemon=True).start()
 
@@ -294,23 +302,20 @@ def analyze_asset(asset_name):
         score = 0
         action = "WAIT / NO CLEAR ENTRY 🟡"
 
-        # Bullish Conditions
+        # Bullish
         if current_price > ema50:
-            score += 30
+            score += 35
             if ema9 > ema21: score += 30
-            if 45 <= rsi <= 68: score += 20
-            if closes_15m[-1] > opens_15m[-1]: score += 10
-            if score >= 75: action = "INSTITUTIONAL BUY 🟢"
+            if 48 <= rsi <= 68: score += 25
+            if score >= 80: action = "INSTITUTIONAL BUY 🟢"
 
-        # Bearish Conditions
+        # Bearish
         elif current_price < ema50:
-            score += 30
+            score += 35
             if ema9 < ema21: score += 30
-            if 32 <= rsi <= 55: score += 20
-            if closes_15m[-1] < opens_15m[-1]: score += 10
-            if score >= 75: action = "INSTITUTIONAL SELL 🔴"
+            if 32 <= rsi <= 52: score += 25
+            if score >= 80: action = "INSTITUTIONAL SELL 🔴"
 
-        # Adjusted Risk-Reward for Wicks
         sl_distance = round(atr * 2.0, 2)
         tp_distance = round(atr * 3.0, 2)
 
