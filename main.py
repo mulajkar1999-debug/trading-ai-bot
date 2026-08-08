@@ -95,36 +95,37 @@ def analyze_asset(asset_name):
             return None
 
         current_price = closes[-1]
-        prev_high = max(highs[-6:-1])
-        prev_low = min(lows[-6:-1])
+        prev_high = max(highs[-5:-1])
+        prev_low = min(lows[-5:-1])
         
-        avg_volume = sum(volumes[-6:-1]) / 5
+        avg_volume = sum(volumes[-5:-1]) / 4
         curr_volume = volumes[-1]
 
         action = "NONE"
         score = 0
 
-        # Bullish High Breakout + Volume Confirmation
-        if current_price > prev_high and closes[-1] > opens[-1] and curr_volume > avg_volume * 0.8:
-            action = "HIGH WIN SCALPING BUY 🟢"
+        # Bullish Breakout
+        if current_price > prev_high and closes[-1] > opens[-1] and curr_volume > avg_volume * 0.7:
+            action = "QUICK SCALPING BUY 🟢"
             score = 85
 
-        # Bearish Low Breakdown + Volume Confirmation
-        elif current_price < prev_low and closes[-1] < opens[-1] and curr_volume > avg_volume * 0.8:
-            action = "HIGH WIN SCALPING SELL 🔴"
+        # Bearish Breakdown
+        elif current_price < prev_low and closes[-1] < opens[-1] and curr_volume > avg_volume * 0.7:
+            action = "QUICK SCALPING SELL 🔴"
             score = 85
 
         if score < 85:
             return None
 
+        # TIGHT / QUICK SCALPING TARGETS
         if clean_asset == "GOLD":
-            tp_dist = 1.20  # Fast $1.20 Target
-            sl_dist = 1.00  # $1.00 Tight SL
+            tp_dist = 0.60  # Fast $0.60 (6 Pips) Target
+            sl_dist = 0.50  # Tight $0.50 SL
             recommended_lot = 0.05
             display_pair = "XAUUSD"
         else:
-            tp_dist = 100.0 # Fast $100 BTC Target
-            sl_dist = 80.0   # $80 SL
+            tp_dist = 40.0  # Fast $40 BTC Target
+            sl_dist = 35.0  # $35 SL
             recommended_lot = 0.01
             display_pair = "BTCUSD"
 
@@ -150,7 +151,7 @@ def analyze_asset(asset_name):
 
 def analyze_and_trigger(asset_key):
     now = datetime.now()
-    if last_signal_time[asset_key] and (now - last_signal_time[asset_key]) < timedelta(minutes=5):
+    if last_signal_time[asset_key] and (now - last_signal_time[asset_key]) < timedelta(minutes=4):
         return
 
     data = analyze_asset(asset_key)
@@ -170,12 +171,12 @@ def analyze_and_trigger(asset_key):
     reply_markup = {"inline_keyboard": [[{"text": "📈 TradingView Chart", "url": chart_link}]]}
 
     alert_msg = (
-        f"🎯 *5M BREAKOUT SCALPING ({data['asset']})*\n"
+        f"🎯 *QUICK 5M SCALPING ({data['asset']})*\n"
         f"⏰ Time: `{signal_time}`\n\n"
         f"Status: *ACTIVE ⏳*\n"
         f"Action: *{data['action']}*\n"
         f"Entry Price: `{data['price']}`\n"
-        f"Take Profit (TP): `{data['tp']}`\n"
+        f"Take Profit (TP): `{data['tp']}` *(Quick Target)*\n"
         f"Stop Loss (SL): `{data['sl']}`\n\n"
         f"🧠 *Confidence:* *{data['score']}%*\n"
         f"🛡️ *Lot Size:* `{data['recommended_lot']}`"
@@ -204,7 +205,7 @@ def continuous_auto_scanner():
                 time.sleep(2)
         except Exception as e:
             print(f"Auto Scanner Error: {e}")
-        time.sleep(15) # Fast 15-second scanning
+        time.sleep(10)
 
 threading.Thread(target=continuous_auto_scanner, daemon=True).start()
 
@@ -226,7 +227,7 @@ def monitor_active_trades():
 
                 if tp_hit or sl_hit:
                     if tp_hit:
-                        status_text = "✅ TARGET HIT (WIN) 🎯"
+                        status_text = "✅ QUICK TARGET HIT (WIN) 🎯"
                         trade_history["wins"] += 1
                     else:
                         status_text = "❌ STOP LOSS HIT (LOSS) 🛑"
@@ -239,7 +240,7 @@ def monitor_active_trades():
                     reply_markup = {"inline_keyboard": [[{"text": "📈 TradingView Chart", "url": chart_link}]]}
 
                     updated_msg = (
-                        f"🎯 *5M SCALPING RESULT ({signal['asset']})*\n"
+                        f"🎯 *QUICK 5M RESULT ({signal['asset']})*\n"
                         f"⏰ Time: `{signal['created_at']}`\n\n"
                         f"Status: *{status_text}*\n"
                         f"Action: *{signal['action']}*\n"
@@ -254,14 +255,14 @@ def monitor_active_trades():
         except Exception as e:
             print(f"Monitor Loop Error: {e}")
             
-        time.sleep(5)
+        time.sleep(3)
 
 threading.Thread(target=monitor_active_trades, daemon=True).start()
 
 # --- ROUTES ---
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({"status": "High Win-Rate 5M Scalper Active 🚀"}), 200
+    return jsonify({"status": "Quick Scalper Active 🚀"}), 200
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
