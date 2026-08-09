@@ -21,13 +21,10 @@ IST = pytz.timezone("Asia/Kolkata")
 # TELEGRAM
 # ============================================================
 
-# IMPORTANT:
-# Put your Telegram token in Render Environment Variables:
+# Render Environment Variables:
 #
-# TELEGRAM_BOT_TOKEN = your_bot_token
+# TELEGRAM_BOT_TOKEN = <your Telegram bot token>
 # TELEGRAM_CHAT_ID   = 1317739622
-#
-# Do NOT put the token directly inside this file.
 
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN",
@@ -41,29 +38,28 @@ TELEGRAM_CHAT_ID = os.getenv(
 
 
 # ============================================================
-# GENERAL SETTINGS
+# SETTINGS
 # ============================================================
 
 TIMEFRAME = "5M"
 GRANULARITY = 300
 
-# Quality-first strategy.
-# Higher = fewer but stricter signals.
+# Strict quality filter.
 MIN_SIGNAL_SCORE = 85
 
-# Difference required between BUY and SELL score.
+# Required difference between BUY and SELL score.
 MIN_DIRECTION_EDGE = 10
 
-# Scanner interval.
+# Scan every 30 seconds.
 SCAN_INTERVAL = 30
 
-# Market-data cache.
+# Coinbase data cache.
 MARKET_CACHE_SECONDS = 20
 
-# Same asset signal cooldown.
+# Same asset cooldown.
 SIGNAL_COOLDOWN_MINUTES = 5
 
-# One active signal per asset.
+# Only one active trade per asset.
 ONE_TRADE_PER_ASSET = True
 
 
@@ -71,22 +67,19 @@ ONE_TRADE_PER_ASSET = True
 # RISK MANAGEMENT
 # ============================================================
 
-# ATR based stop loss.
 ATR_SL_MULTIPLIER = 0.95
 
-# Minimum reward/risk.
 BASE_RR = 1.40
 
-# Move SL to break-even after this R.
+# Move SL to BE after +0.65R.
 BREAK_EVEN_TRIGGER_R = 0.65
 
-# Small buffer above/below entry.
+# Small positive buffer around entry.
 BREAK_EVEN_BUFFER_R = 0.03
 
-# Start trailing after 1R.
+# Start trailing after +1R.
 TRAIL_TRIGGER_R = 1.0
 
-# ATR trailing distance.
 TRAIL_ATR_MULTIPLIER = 0.75
 
 
@@ -100,8 +93,6 @@ ASSETS = {
         "product": "PAXG-USD",
         "display": "PAXGUSD",
         "lot": 0.03,
-
-        # Minimum SL in dollars.
         "minimum_sl": 0.40
     },
 
@@ -109,15 +100,13 @@ ASSETS = {
         "product": "BTC-USD",
         "display": "BTCUSD",
         "lot": 0.01,
-
-        # Minimum SL in dollars.
         "minimum_sl": 50.0
     }
 }
 
 
 # ============================================================
-# GLOBAL STATE
+# STATE
 # ============================================================
 
 active_signals = []
@@ -162,7 +151,8 @@ def send_telegram_alert(
     if not TELEGRAM_BOT_TOKEN:
 
         print(
-            "Telegram token missing."
+            "Telegram token missing. "
+            "Set TELEGRAM_BOT_TOKEN in Render."
         )
 
         return None
@@ -176,17 +166,13 @@ def send_telegram_alert(
 
         payload = {
 
-            "chat_id":
-                TELEGRAM_CHAT_ID,
+            "chat_id": TELEGRAM_CHAT_ID,
 
-            "text":
-                message,
+            "text": message,
 
-            "parse_mode":
-                "Markdown",
+            "parse_mode": "Markdown",
 
-            "disable_web_page_preview":
-                True
+            "disable_web_page_preview": True
         }
 
         if reply_markup:
@@ -249,20 +235,15 @@ def edit_telegram_alert(
 
         payload = {
 
-            "chat_id":
-                TELEGRAM_CHAT_ID,
+            "chat_id": TELEGRAM_CHAT_ID,
 
-            "message_id":
-                message_id,
+            "message_id": message_id,
 
-            "text":
-                message,
+            "text": message,
 
-            "parse_mode":
-                "Markdown",
+            "parse_mode": "Markdown",
 
-            "disable_web_page_preview":
-                True
+            "disable_web_page_preview": True
         }
 
         if reply_markup:
@@ -293,7 +274,7 @@ def edit_telegram_alert(
 
 
 # ============================================================
-# COINBASE DATA
+# COINBASE CANDLES
 # ============================================================
 
 def fetch_coinbase_candles(
@@ -321,7 +302,7 @@ def fetch_coinbase_candles(
 
     retry_delay = 2
 
-    for attempt in range(4):
+    for _ in range(4):
 
         try:
 
@@ -331,7 +312,6 @@ def fetch_coinbase_candles(
                 timeout=10
             )
 
-            # Coinbase rate-limit protection.
             if response.status_code == 429:
 
                 print(
@@ -350,8 +330,7 @@ def fetch_coinbase_candles(
             if response.status_code != 200:
 
                 print(
-                    f"Coinbase error "
-                    f"{asset}: "
+                    f"Coinbase error {asset}: "
                     f"{response.status_code}"
                 )
 
@@ -371,7 +350,7 @@ def fetch_coinbase_candles(
                 key=lambda x: x[0]
             )
 
-            # Do not use the currently-forming candle.
+            # Ignore currently forming candle.
             now_ts = int(
                 time.time()
             )
@@ -470,10 +449,12 @@ def get_market_data(
         if (
             cached
             and not force_refresh
-            and (
+            and
+            (
                 now
                 - cached["time"]
-                < MARKET_CACHE_SECONDS
+                <
+                MARKET_CACHE_SECONDS
             )
         ):
 
@@ -517,12 +498,14 @@ def ema(
 
     multiplier = (
         2
-        / (period + 1)
+        /
+        (period + 1)
     )
 
     current = (
         sum(values[:period])
-        / period
+        /
+        period
     )
 
     result = [
@@ -536,8 +519,10 @@ def ema(
                 value
                 - current
             )
-            * multiplier
-            + current
+            *
+            multiplier
+            +
+            current
         )
 
         result.append(
@@ -570,7 +555,8 @@ def rsi(
 
         change = (
             values[i]
-            - values[i - 1]
+            -
+            values[i - 1]
         )
 
         gains.append(
@@ -583,12 +569,14 @@ def rsi(
 
     avg_gain = (
         sum(gains[:period])
-        / period
+        /
+        period
     )
 
     avg_loss = (
         sum(losses[:period])
-        / period
+        /
+        period
     )
 
     result = []
@@ -601,14 +589,17 @@ def rsi(
 
         rs = (
             avg_gain
-            / avg_loss
+            /
+            avg_loss
         )
 
         return (
             100
-            - (
+            -
+            (
                 100
-                / (1 + rs)
+                /
+                (1 + rs)
             )
         )
 
@@ -624,17 +615,21 @@ def rsi(
         avg_gain = (
             (
                 avg_gain
-                * (period - 1)
+                *
+                (period - 1)
             )
-            + gains[i]
+            +
+            gains[i]
         ) / period
 
         avg_loss = (
             (
                 avg_loss
-                * (period - 1)
+                *
+                (period - 1)
             )
-            + losses[i]
+            +
+            losses[i]
         ) / period
 
         result.append(
@@ -669,16 +664,19 @@ def atr(
         tr = max(
 
             highs[i]
-            - lows[i],
+            -
+            lows[i],
 
             abs(
                 highs[i]
-                - closes[i - 1]
+                -
+                closes[i - 1]
             ),
 
             abs(
                 lows[i]
-                - closes[i - 1]
+                -
+                closes[i - 1]
             )
         )
 
@@ -694,7 +692,8 @@ def atr(
         sum(
             true_ranges[:period]
         )
-        / period
+        /
+        period
     )
 
     result = [
@@ -706,9 +705,11 @@ def atr(
         current = (
             (
                 current
-                * (period - 1)
+                *
+                (period - 1)
             )
-            + tr
+            +
+            tr
         ) / period
 
         result.append(
@@ -719,7 +720,7 @@ def atr(
 
 
 # ============================================================
-# SWING HIGH
+# SWING HIGHS
 # ============================================================
 
 def find_swing_highs(
@@ -760,7 +761,7 @@ def find_swing_highs(
 
 
 # ============================================================
-# SWING LOW
+# SWING LOWS
 # ============================================================
 
 def find_swing_lows(
@@ -820,13 +821,9 @@ def detect_patterns(
         lows
     )
 
-    recent_highs = (
-        swing_highs[-5:]
-    )
+    recent_highs = swing_highs[-5:]
+    recent_lows = swing_lows[-5:]
 
-    recent_lows = (
-        swing_lows[-5:]
-    )
 
     # --------------------------------------------------------
     # DOUBLE TOP
@@ -845,7 +842,8 @@ def detect_patterns(
         if (
             abs(h1 - h2)
             <= tolerance
-            and closes[-1] < h2
+            and
+            closes[-1] < h2
         ):
 
             patterns.append(
@@ -855,6 +853,7 @@ def detect_patterns(
                     16
                 )
             )
+
 
     # --------------------------------------------------------
     # DOUBLE BOTTOM
@@ -873,7 +872,8 @@ def detect_patterns(
         if (
             abs(l1 - l2)
             <= tolerance
-            and closes[-1] > l2
+            and
+            closes[-1] > l2
         ):
 
             patterns.append(
@@ -883,6 +883,7 @@ def detect_patterns(
                     16
                 )
             )
+
 
     # --------------------------------------------------------
     # TRIPLE TOP
@@ -902,9 +903,12 @@ def detect_patterns(
 
         if (
             max(values)
-            - min(values)
-            <= average * 0.003
-            and closes[-1] < average
+            -
+            min(values)
+            <=
+            average * 0.003
+            and
+            closes[-1] < average
         ):
 
             patterns.append(
@@ -914,6 +918,7 @@ def detect_patterns(
                     20
                 )
             )
+
 
     # --------------------------------------------------------
     # TRIPLE BOTTOM
@@ -933,9 +938,12 @@ def detect_patterns(
 
         if (
             max(values)
-            - min(values)
-            <= average * 0.003
-            and closes[-1] > average
+            -
+            min(values)
+            <=
+            average * 0.003
+            and
+            closes[-1] > average
         ):
 
             patterns.append(
@@ -946,8 +954,9 @@ def detect_patterns(
                 )
             )
 
+
     # --------------------------------------------------------
-    # HEAD & SHOULDERS
+    # HEAD AND SHOULDERS
     # --------------------------------------------------------
 
     if len(recent_highs) >= 3:
@@ -981,8 +990,9 @@ def detect_patterns(
                 )
             )
 
+
     # --------------------------------------------------------
-    # INVERSE HEAD & SHOULDERS
+    # INVERSE HEAD AND SHOULDERS
     # --------------------------------------------------------
 
     if len(recent_lows) >= 3:
@@ -1016,8 +1026,9 @@ def detect_patterns(
                 )
             )
 
+
     # --------------------------------------------------------
-    # RISING / FALLING STRUCTURE
+    # TREND STRUCTURE
     # --------------------------------------------------------
 
     if (
@@ -1037,19 +1048,35 @@ def detect_patterns(
         ]
 
         higher_highs = (
-            h[0] < h[1] < h[2]
+            h[0]
+            <
+            h[1]
+            <
+            h[2]
         )
 
         higher_lows = (
-            l[0] < l[1] < l[2]
+            l[0]
+            <
+            l[1]
+            <
+            l[2]
         )
 
         lower_highs = (
-            h[0] > h[1] > h[2]
+            h[0]
+            >
+            h[1]
+            >
+            h[2]
         )
 
         lower_lows = (
-            l[0] > l[1] > l[2]
+            l[0]
+            >
+            l[1]
+            >
+            l[2]
         )
 
         if (
@@ -1079,6 +1106,7 @@ def detect_patterns(
                     10
                 )
             )
+
 
     return patterns
 
@@ -1118,7 +1146,8 @@ def market_regime(
 
     if (
         separation
-        < minimum_separation
+        <
+        minimum_separation
     ):
 
         return "CHOPPY"
@@ -1170,7 +1199,8 @@ def breakout_confirmation(
 
     average_volume = (
         sum(volumes[-8:-1])
-        / 7
+        /
+        7
     )
 
     if average_volume <= 0:
@@ -1179,17 +1209,20 @@ def breakout_confirmation(
 
     volume_ratio = (
         volumes[-1]
-        / average_volume
+        /
+        average_volume
     )
 
     candle_body = abs(
         closes[-1]
-        - opens[-1]
+        -
+        opens[-1]
     )
 
     candle_range = (
         highs[-1]
-        - lows[-1]
+        -
+        lows[-1]
     )
 
     if candle_range <= 0:
@@ -1198,10 +1231,10 @@ def breakout_confirmation(
 
     body_ratio = (
         candle_body
-        / candle_range
+        /
+        candle_range
     )
 
-    # BUY
     if direction == "BUY":
 
         breakout = (
@@ -1232,7 +1265,6 @@ def breakout_confirmation(
             strong_volume
         )
 
-    # SELL
     if direction == "SELL":
 
         breakout = (
@@ -1285,25 +1317,11 @@ def analyze_asset(
 
         return None
 
-    opens = market[
-        "opens"
-    ]
-
-    highs = market[
-        "highs"
-    ]
-
-    lows = market[
-        "lows"
-    ]
-
-    closes = market[
-        "closes"
-    ]
-
-    volumes = market[
-        "volumes"
-    ]
+    opens = market["opens"]
+    highs = market["highs"]
+    lows = market["lows"]
+    closes = market["closes"]
+    volumes = market["volumes"]
 
     if len(closes) < 60:
 
@@ -1345,21 +1363,10 @@ def analyze_asset(
 
     price = closes[-1]
 
-    ema9_now = (
-        ema9_values[-1]
-    )
-
-    ema21_now = (
-        ema21_values[-1]
-    )
-
-    rsi_now = (
-        rsi_values[-1]
-    )
-
-    atr_now = (
-        atr_values[-1]
-    )
+    ema9_now = ema9_values[-1]
+    ema21_now = ema21_values[-1]
+    rsi_now = rsi_values[-1]
+    atr_now = atr_values[-1]
 
     if atr_now <= 0:
 
@@ -1372,7 +1379,7 @@ def analyze_asset(
         atr_now
     )
 
-    # Avoid sideways/choppy conditions.
+    # Avoid sideways market.
     if regime in (
         "CHOPPY",
         "UNKNOWN",
@@ -1389,12 +1396,14 @@ def analyze_asset(
 
     volume_average = (
         sum(volumes[-8:-1])
-        / 7
+        /
+        7
     )
 
     volume_ratio = (
         volumes[-1]
-        / volume_average
+        /
+        volume_average
         if volume_average > 0
         else 0
     )
@@ -1410,10 +1419,6 @@ def analyze_asset(
         <
         opens[-1]
     )
-
-    # ========================================================
-    # SCORE
-    # ========================================================
 
     buy_score = 0
     sell_score = 0
@@ -1472,9 +1477,7 @@ def analyze_asset(
         )
 
     # RSI
-    if (
-        52 <= rsi_now <= 67
-    ):
+    if 52 <= rsi_now <= 67:
 
         buy_score += 15
 
@@ -1482,9 +1485,7 @@ def analyze_asset(
             "RSI bullish"
         )
 
-    if (
-        33 <= rsi_now <= 48
-    ):
+    if 33 <= rsi_now <= 48:
 
         sell_score += 15
 
@@ -1586,7 +1587,6 @@ def analyze_asset(
                     pattern_name
                 )
 
-    # Confirmation required.
     buy_confirmation = (
         buy_breakout
         or
@@ -1611,8 +1611,7 @@ def analyze_asset(
 
     # BUY
     if (
-        buy_score
-        >= MIN_SIGNAL_SCORE
+        buy_score >= MIN_SIGNAL_SCORE
         and
         buy_confirmation
         and
@@ -1624,15 +1623,12 @@ def analyze_asset(
     ):
 
         action = "BUY"
-
         score = buy_score
-
         reasons = buy_reasons
 
     # SELL
     elif (
-        sell_score
-        >= MIN_SIGNAL_SCORE
+        sell_score >= MIN_SIGNAL_SCORE
         and
         sell_confirmation
         and
@@ -1644,9 +1640,7 @@ def analyze_asset(
     ):
 
         action = "SELL"
-
         score = sell_score
-
         reasons = sell_reasons
 
     if not action:
@@ -1712,9 +1706,7 @@ def analyze_asset(
             asset,
 
         "asset":
-            config[
-                "display"
-            ],
+            config["display"],
 
         "action":
             action,
@@ -1797,9 +1789,7 @@ def analyze_asset(
             reasons[:8],
 
         "recommended_lot":
-            config[
-                "lot"
-            ]
+            config["lot"]
     }
 
     latest_signal_data = signal
@@ -1808,7 +1798,7 @@ def analyze_asset(
 
 
 # ============================================================
-# ACTIVE SIGNAL CHECK
+# SIGNAL CONTROL
 # ============================================================
 
 def has_active_signal(
@@ -1817,19 +1807,10 @@ def has_active_signal(
 
     with state_lock:
 
-        for signal in active_signals:
-
-            if (
-                signal[
-                    "asset_key"
-                ]
-                ==
-                asset
-            ):
-
-                return True
-
-    return False
+        return any(
+            signal["asset_key"] == asset
+            for signal in active_signals
+        )
 
 
 def cooldown_active(
@@ -1857,7 +1838,7 @@ def cooldown_active(
 
 
 # ============================================================
-# SEND SIGNAL
+# CREATE SIGNAL
 # ============================================================
 
 def analyze_and_trigger(
@@ -1894,21 +1875,13 @@ def analyze_and_trigger(
         "%I:%M:%S %p | %d %b"
     )
 
-    if (
-        signal["asset"]
-        ==
-        "PAXGUSD"
-    ):
+    if signal["asset"] == "PAXGUSD":
 
-        chart_symbol = (
-            "PAXGUSD"
-        )
+        chart_symbol = "PAXGUSD"
 
     else:
 
-        chart_symbol = (
-            "COINBASE:BTCUSD"
-        )
+        chart_symbol = "COINBASE:BTCUSD"
 
     chart_link = (
         "https://www.tradingview.com/"
@@ -1935,20 +1908,15 @@ def analyze_and_trigger(
         ]
     }
 
-    emoji = (
+    direction_emoji = (
         "🟢"
-        if
-        signal["action"]
-        ==
-        "BUY"
+        if signal["action"] == "BUY"
         else
         "🔴"
     )
 
     reasons = ", ".join(
-        signal[
-            "reasons"
-        ]
+        signal["reasons"]
     )
 
     message = (
@@ -1959,7 +1927,7 @@ def analyze_and_trigger(
         f"💹 *{signal['asset']}*\n"
         f"⏰ `{signal_time}`\n\n"
 
-        f"{emoji} Action: "
+        f"{direction_emoji} Action: "
         f"*{signal['action']}*\n"
 
         f"💰 Entry: "
@@ -2028,49 +1996,31 @@ def analyze_and_trigger(
             asset,
 
         "asset":
-            signal[
-                "asset"
-            ],
+            signal["asset"],
 
         "action":
-            signal[
-                "action"
-            ],
+            signal["action"],
 
         "price":
-            signal[
-                "price"
-            ],
+            signal["price"],
 
         "tp":
-            signal[
-                "tp"
-            ],
+            signal["tp"],
 
         "sl":
-            signal[
-                "sl"
-            ],
+            signal["sl"],
 
         "initial_sl":
-            signal[
-                "initial_sl"
-            ],
+            signal["initial_sl"],
 
         "risk_distance":
-            signal[
-                "risk_distance"
-            ],
+            signal["risk_distance"],
 
         "score":
-            signal[
-                "score"
-            ],
+            signal["score"],
 
         "pattern":
-            signal[
-                "pattern"
-            ],
+            signal["pattern"],
 
         "created_at":
             signal_time,
@@ -2079,9 +2029,7 @@ def analyze_and_trigger(
             now.isoformat(),
 
         "best_price":
-            signal[
-                "price"
-            ],
+            signal["price"],
 
         "breakeven_done":
             False,
@@ -2111,22 +2059,15 @@ def update_trade_management(
     current_atr
 ):
 
-    entry = signal[
-        "price"
-    ]
-
-    risk = signal[
-        "risk_distance"
-    ]
+    entry = signal["price"]
+    risk = signal["risk_distance"]
 
     if risk <= 0:
 
         return
 
     is_buy = (
-        signal[
-            "action"
-        ]
+        signal["action"]
         ==
         "BUY"
     )
@@ -2153,26 +2094,17 @@ def update_trade_management(
         risk
     )
 
-    # Best price.
     if is_buy:
 
-        signal[
-            "best_price"
-        ] = max(
-            signal[
-                "best_price"
-            ],
+        signal["best_price"] = max(
+            signal["best_price"],
             current_price
         )
 
     else:
 
-        signal[
-            "best_price"
-        ] = min(
-            signal[
-                "best_price"
-            ],
+        signal["best_price"] = min(
+            signal["best_price"],
             current_price
         )
 
@@ -2181,9 +2113,7 @@ def update_trade_management(
     # ========================================================
 
     if (
-        not signal[
-            "breakeven_done"
-        ]
+        not signal["breakeven_done"]
         and
         current_r
         >=
@@ -2204,17 +2134,9 @@ def update_trade_management(
                 buffer
             )
 
-            if (
-                new_sl
-                >
-                signal[
-                    "sl"
-                ]
-            ):
+            if new_sl > signal["sl"]:
 
-                signal[
-                    "sl"
-                ] = round(
+                signal["sl"] = round(
                     new_sl,
                     2
                 )
@@ -2227,17 +2149,9 @@ def update_trade_management(
                 buffer
             )
 
-            if (
-                new_sl
-                <
-                signal[
-                    "sl"
-                ]
-            ):
+            if new_sl < signal["sl"]:
 
-                signal[
-                    "sl"
-                ] = round(
+                signal["sl"] = round(
                     new_sl,
                     2
                 )
@@ -2251,9 +2165,7 @@ def update_trade_management(
     # ========================================================
 
     if (
-        signal[
-            "breakeven_done"
-        ]
+        signal["breakeven_done"]
         and
         current_r
         >=
@@ -2269,24 +2181,14 @@ def update_trade_management(
         if is_buy:
 
             new_sl = (
-                signal[
-                    "best_price"
-                ]
+                signal["best_price"]
                 -
                 trail_distance
             )
 
-            if (
-                new_sl
-                >
-                signal[
-                    "sl"
-                ]
-            ):
+            if new_sl > signal["sl"]:
 
-                signal[
-                    "sl"
-                ] = round(
+                signal["sl"] = round(
                     new_sl,
                     2
                 )
@@ -2298,24 +2200,14 @@ def update_trade_management(
         else:
 
             new_sl = (
-                signal[
-                    "best_price"
-                ]
+                signal["best_price"]
                 +
                 trail_distance
             )
 
-            if (
-                new_sl
-                <
-                signal[
-                    "sl"
-                ]
-            ):
+            if new_sl < signal["sl"]:
 
-                signal[
-                    "sl"
-                ] = round(
+                signal["sl"] = round(
                     new_sl,
                     2
                 )
@@ -2334,25 +2226,14 @@ def result_r(
     exit_price
 ):
 
-    entry = signal[
-        "price"
-    ]
-
-    risk = signal[
-        "risk_distance"
-    ]
+    entry = signal["price"]
+    risk = signal["risk_distance"]
 
     if risk <= 0:
 
         return 0
 
-    if (
-        signal[
-            "action"
-        ]
-        ==
-        "BUY"
-    ):
+    if signal["action"] == "BUY":
 
         return (
             exit_price
@@ -2368,7 +2249,7 @@ def result_r(
 
 
 # ============================================================
-# UPDATE PERFORMANCE
+# PERFORMANCE
 # ============================================================
 
 def update_history(
@@ -2413,17 +2294,11 @@ def update_history(
             ] += 1
 
         total = (
-            trade_history[
-                "wins"
-            ]
+            trade_history["wins"]
             +
-            trade_history[
-                "losses"
-            ]
+            trade_history["losses"]
             +
-            trade_history[
-                "breakeven"
-            ]
+            trade_history["breakeven"]
         )
 
         trade_history[
@@ -2431,13 +2306,9 @@ def update_history(
         ] = total
 
         decisive = (
-            trade_history[
-                "wins"
-            ]
+            trade_history["wins"]
             +
-            trade_history[
-                "losses"
-            ]
+            trade_history["losses"]
         )
 
         if decisive > 0:
@@ -2447,9 +2318,7 @@ def update_history(
             ] = round(
 
                 (
-                    trade_history[
-                        "wins"
-                    ]
+                    trade_history["wins"]
                     /
                     decisive
                 )
@@ -2484,7 +2353,7 @@ def update_history(
 
 
 # ============================================================
-# MONITOR ACTIVE TRADES
+# MONITOR TRADES
 # ============================================================
 
 def monitor_active_trades():
@@ -2510,33 +2379,17 @@ def monitor_active_trades():
 
                     continue
 
-                highs = market[
-                    "highs"
-                ]
-
-                lows = market[
-                    "lows"
-                ]
-
-                closes = market[
-                    "closes"
-                ]
+                highs = market["highs"]
+                lows = market["lows"]
+                closes = market["closes"]
 
                 if not closes:
 
                     continue
 
-                current_price = (
-                    closes[-1]
-                )
-
-                current_high = (
-                    highs[-1]
-                )
-
-                current_low = (
-                    lows[-1]
-                )
+                current_price = closes[-1]
+                current_high = highs[-1]
+                current_low = lows[-1]
 
                 atr_values = atr(
                     highs,
@@ -2559,7 +2412,6 @@ def monitor_active_trades():
                         ]
                     )
 
-                # Update BE/trailing.
                 update_trade_management(
                     signal,
                     current_price,
@@ -2567,9 +2419,7 @@ def monitor_active_trades():
                 )
 
                 is_buy = (
-                    signal[
-                        "action"
-                    ]
+                    signal["action"]
                     ==
                     "BUY"
                 )
@@ -2579,17 +2429,13 @@ def monitor_active_trades():
                     tp_hit = (
                         current_high
                         >=
-                        signal[
-                            "tp"
-                        ]
+                        signal["tp"]
                     )
 
                     sl_hit = (
                         current_low
                         <=
-                        signal[
-                            "sl"
-                        ]
+                        signal["sl"]
                     )
 
                 else:
@@ -2597,17 +2443,13 @@ def monitor_active_trades():
                     tp_hit = (
                         current_low
                         <=
-                        signal[
-                            "tp"
-                        ]
+                        signal["tp"]
                     )
 
                     sl_hit = (
                         current_high
                         >=
-                        signal[
-                            "sl"
-                        ]
+                        signal["sl"]
                     )
 
                 if not (
@@ -2618,20 +2460,16 @@ def monitor_active_trades():
 
                     continue
 
-                # If both TP and SL are touched
-                # inside the same 5M candle,
-                # count conservatively as LOSS.
+                # Conservative handling:
+                # if both TP and SL are touched
+                # in same candle, count as LOSS.
                 if (
                     tp_hit
                     and
                     sl_hit
                 ):
 
-                    exit_price = (
-                        signal[
-                            "sl"
-                        ]
-                    )
+                    exit_price = signal["sl"]
 
                     result = "LOSS"
 
@@ -2642,11 +2480,7 @@ def monitor_active_trades():
 
                 elif tp_hit:
 
-                    exit_price = (
-                        signal[
-                            "tp"
-                        ]
-                    )
+                    exit_price = signal["tp"]
 
                     result = "WIN"
 
@@ -2656,11 +2490,7 @@ def monitor_active_trades():
 
                 else:
 
-                    exit_price = (
-                        signal[
-                            "sl"
-                        ]
-                    )
+                    exit_price = signal["sl"]
 
                     r_value = result_r(
                         signal,
@@ -2672,14 +2502,10 @@ def monitor_active_trades():
                             "breakeven_done"
                         ]
                         and
-                        r_value
-                        >=
-                        -0.10
+                        r_value >= -0.10
                     ):
 
-                        result = (
-                            "BREAKEVEN"
-                        )
+                        result = "BREAKEVEN"
 
                         status = (
                             "🛡️ RISK-FREE "
@@ -2704,21 +2530,9 @@ def monitor_active_trades():
                     r_value
                 )
 
-                # =================================================
-                # TELEGRAM RESULT
-                # =================================================
+                if signal["asset"] == "PAXGUSD":
 
-                if (
-                    signal[
-                        "asset"
-                    ]
-                    ==
-                    "PAXGUSD"
-                ):
-
-                    chart_symbol = (
-                        "PAXGUSD"
-                    )
+                    chart_symbol = "PAXGUSD"
 
                 else:
 
@@ -2751,22 +2565,6 @@ def monitor_active_trades():
                     ]
                 }
 
-                emoji = {
-
-                    "WIN":
-                        "✅",
-
-                    "LOSS":
-                        "❌",
-
-                    "BREAKEVEN":
-                        "🛡️"
-
-                }.get(
-                    result,
-                    "📊"
-                )
-
                 message = (
 
                     "🎯 *5M TRADE RESULT*\n"
@@ -2778,7 +2576,7 @@ def monitor_active_trades():
                     f"📊 Pattern: "
                     f"`{signal['pattern']}`\n\n"
 
-                    f"{emoji} *{status}*\n\n"
+                    f"{status}\n\n"
 
                     f"Action: "
                     f"*{signal['action']}*\n"
@@ -2826,20 +2624,14 @@ def monitor_active_trades():
                 )
 
                 edit_telegram_alert(
-                    signal[
-                        "msg_id"
-                    ],
+                    signal["msg_id"],
                     message,
                     reply_markup
                 )
 
                 with state_lock:
 
-                    if (
-                        signal
-                        in
-                        active_signals
-                    ):
+                    if signal in active_signals:
 
                         active_signals.remove(
                             signal
@@ -2917,29 +2709,22 @@ def home():
         "features": [
 
             "EMA 9/21",
-
             "RSI",
-
             "ATR",
-
             "Volume",
-
             "Breakout",
-
-            "Swing Patterns",
-
+            "Double Top",
+            "Double Bottom",
+            "Triple Top",
+            "Triple Bottom",
+            "Head & Shoulders",
+            "Inverse Head & Shoulders",
+            "Trend Structure",
             "Market Regime",
-
-            "Quality Score",
-
             "Break Even",
-
             "Trailing Stop",
-
             "Coinbase Cache",
-
             "429 Protection",
-
             "Telegram Alerts"
         ]
     })
@@ -2959,9 +2744,7 @@ def get_stats():
                 trade_history,
 
             "active_signals_count":
-                len(
-                    active_signals
-                )
+                len(active_signals)
         })
 
 
@@ -3003,9 +2786,7 @@ def health():
             ),
 
         "active_signals":
-            len(
-                active_signals
-            ),
+            len(active_signals),
 
         "assets": [
             "PAXGUSD",
@@ -3018,7 +2799,7 @@ def health():
 
 
 # ============================================================
-# START BACKGROUND THREADS
+# BACKGROUND THREADS
 # ============================================================
 
 scanner_thread = threading.Thread(
