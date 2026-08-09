@@ -21,11 +21,6 @@ IST = pytz.timezone("Asia/Kolkata")
 # TELEGRAM
 # ============================================================
 
-# Render Environment Variables:
-#
-# TELEGRAM_BOT_TOKEN = <your Telegram bot token>
-# TELEGRAM_CHAT_ID   = 1317739622
-
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN",
     ""
@@ -44,43 +39,30 @@ TELEGRAM_CHAT_ID = os.getenv(
 TIMEFRAME = "5M"
 GRANULARITY = 300
 
-# Strict quality filter.
-MIN_SIGNAL_SCORE = 85
-
-# Required difference between BUY and SELL score.
-MIN_DIRECTION_EDGE = 10
-
-# Scan every 30 seconds.
 SCAN_INTERVAL = 30
-
-# Coinbase data cache.
 MARKET_CACHE_SECONDS = 20
 
-# Same asset cooldown.
 SIGNAL_COOLDOWN_MINUTES = 5
 
-# Only one active trade per asset.
-ONE_TRADE_PER_ASSET = True
+# High-quality filter.
+MIN_SIGNAL_SCORE = 80
 
+# Direction must clearly beat opposite direction.
+MIN_DIRECTION_EDGE = 12
 
-# ============================================================
-# RISK MANAGEMENT
-# ============================================================
-
-ATR_SL_MULTIPLIER = 0.95
-
+# Risk/reward.
 BASE_RR = 1.40
 
-# Move SL to BE after +0.65R.
-BREAK_EVEN_TRIGGER_R = 0.65
-
-# Small positive buffer around entry.
+# Break-even.
+BREAK_EVEN_TRIGGER_R = 0.70
 BREAK_EVEN_BUFFER_R = 0.03
 
-# Start trailing after +1R.
-TRAIL_TRIGGER_R = 1.0
-
+# Trailing.
+TRAIL_TRIGGER_R = 1.10
 TRAIL_ATR_MULTIPLIER = 0.75
+
+# ATR SL.
+ATR_SL_MULTIPLIER = 1.00
 
 
 # ============================================================
@@ -93,14 +75,14 @@ ASSETS = {
         "product": "PAXG-USD",
         "display": "PAXGUSD",
         "lot": 0.03,
-        "minimum_sl": 0.40
+        "minimum_sl": 0.80
     },
 
     "BTC": {
         "product": "BTC-USD",
         "display": "BTCUSD",
         "lot": 0.01,
-        "minimum_sl": 50.0
+        "minimum_sl": 70.0
     }
 }
 
@@ -119,16 +101,12 @@ last_signal_time = {
 }
 
 trade_history = {
-
     "total_signals": 0,
     "wins": 0,
     "losses": 0,
     "breakeven": 0,
-
     "win_rate": 0.0,
-
     "profit_factor": 0.0,
-
     "gross_profit_r": 0.0,
     "gross_loss_r": 0.0
 }
@@ -140,21 +118,16 @@ cache_lock = threading.Lock()
 
 
 # ============================================================
-# TELEGRAM SEND
+# TELEGRAM
 # ============================================================
 
-def send_telegram_alert(
-    message,
-    reply_markup=None
-):
+def send_telegram_alert(message, reply_markup=None):
 
     if not TELEGRAM_BOT_TOKEN:
-
         print(
             "Telegram token missing. "
             "Set TELEGRAM_BOT_TOKEN in Render."
         )
-
         return None
 
     try:
@@ -165,21 +138,14 @@ def send_telegram_alert(
         )
 
         payload = {
-
             "chat_id": TELEGRAM_CHAT_ID,
-
             "text": message,
-
             "parse_mode": "Markdown",
-
             "disable_web_page_preview": True
         }
 
         if reply_markup:
-
-            payload[
-                "reply_markup"
-            ] = reply_markup
+            payload["reply_markup"] = reply_markup
 
         response = requests.post(
             url,
@@ -188,7 +154,6 @@ def send_telegram_alert(
         )
 
         if response.status_code == 200:
-
             return (
                 response
                 .json()
@@ -203,18 +168,10 @@ def send_telegram_alert(
         )
 
     except Exception as e:
-
-        print(
-            "Telegram send error:",
-            e
-        )
+        print("Telegram send error:", e)
 
     return None
 
-
-# ============================================================
-# TELEGRAM EDIT
-# ============================================================
 
 def edit_telegram_alert(
     message_id,
@@ -234,23 +191,15 @@ def edit_telegram_alert(
         )
 
         payload = {
-
             "chat_id": TELEGRAM_CHAT_ID,
-
             "message_id": message_id,
-
             "text": message,
-
             "parse_mode": "Markdown",
-
             "disable_web_page_preview": True
         }
 
         if reply_markup:
-
-            payload[
-                "reply_markup"
-            ] = reply_markup
+            payload["reply_markup"] = reply_markup
 
         response = requests.post(
             url,
@@ -259,35 +208,25 @@ def edit_telegram_alert(
         )
 
         if response.status_code != 200:
-
             print(
                 "Telegram edit error:",
                 response.text
             )
 
     except Exception as e:
-
-        print(
-            "Telegram edit exception:",
-            e
-        )
+        print("Telegram edit error:", e)
 
 
 # ============================================================
-# COINBASE CANDLES
+# COINBASE DATA
 # ============================================================
 
-def fetch_coinbase_candles(
-    asset,
-    limit=100
-):
+def fetch_coinbase_candles(asset, limit=120):
 
     if asset not in ASSETS:
         return None
 
-    product_id = ASSETS[
-        asset
-    ]["product"]
+    product_id = ASSETS[asset]["product"]
 
     url = (
         "https://api.exchange.coinbase.com/"
@@ -296,13 +235,12 @@ def fetch_coinbase_candles(
     )
 
     headers = {
-        "User-Agent":
-            "Quality5MScalper/1.0"
+        "User-Agent": "5M-Scalping-Bot/1.0"
     }
 
-    retry_delay = 2
+    delay = 2
 
-    for _ in range(4):
+    for attempt in range(4):
 
         try:
 
@@ -315,16 +253,12 @@ def fetch_coinbase_candles(
             if response.status_code == 429:
 
                 print(
-                    f"Coinbase 429 for {asset}. "
-                    f"Waiting {retry_delay}s."
+                    f"Coinbase rate limit for {asset}. "
+                    f"Retrying in {delay}s."
                 )
 
-                time.sleep(
-                    retry_delay
-                )
-
-                retry_delay *= 2
-
+                time.sleep(delay)
+                delay *= 2
                 continue
 
             if response.status_code != 200:
@@ -338,11 +272,7 @@ def fetch_coinbase_candles(
 
             raw = response.json()
 
-            if not isinstance(
-                raw,
-                list
-            ):
-
+            if not isinstance(raw, list):
                 return None
 
             raw = sorted(
@@ -350,17 +280,12 @@ def fetch_coinbase_candles(
                 key=lambda x: x[0]
             )
 
-            # Ignore currently forming candle.
-            now_ts = int(
-                time.time()
-            )
+            # Only COMPLETED candles.
+            now_ts = int(time.time())
 
             completed = [
-
                 candle
-
                 for candle in raw
-
                 if (
                     int(candle[0])
                     + GRANULARITY
@@ -369,38 +294,31 @@ def fetch_coinbase_candles(
             ]
 
             if len(completed) < 60:
-
                 return None
 
             completed = completed[-limit:]
 
             return {
-
                 "opens": [
                     float(x[3])
                     for x in completed
                 ],
-
                 "highs": [
                     float(x[2])
                     for x in completed
                 ],
-
                 "lows": [
                     float(x[1])
                     for x in completed
                 ],
-
                 "closes": [
                     float(x[4])
                     for x in completed
                 ],
-
                 "volumes": [
                     float(x[5])
                     for x in completed
                 ],
-
                 "timestamps": [
                     int(x[0])
                     for x in completed
@@ -414,16 +332,13 @@ def fetch_coinbase_candles(
                 f"{asset}: {e}"
             )
 
-            time.sleep(
-                retry_delay
-            )
-
-            retry_delay *= 2
+            time.sleep(delay)
+            delay *= 2
 
         except Exception as e:
 
             print(
-                f"Coinbase data error "
+                f"Coinbase parsing error "
                 f"{asset}: {e}"
             )
 
@@ -434,7 +349,7 @@ def fetch_coinbase_candles(
 
 def get_market_data(
     asset,
-    limit=100,
+    limit=120,
     force_refresh=False
 ):
 
@@ -442,22 +357,18 @@ def get_market_data(
 
     with cache_lock:
 
-        cached = market_cache.get(
-            asset
-        )
+        cached = market_cache.get(asset)
 
         if (
             cached
             and not force_refresh
             and
             (
-                now
-                - cached["time"]
+                now - cached["time"]
                 <
                 MARKET_CACHE_SECONDS
             )
         ):
-
             return cached["data"]
 
     data = fetch_coinbase_candles(
@@ -469,15 +380,9 @@ def get_market_data(
 
         with cache_lock:
 
-            market_cache[
-                asset
-            ] = {
-
-                "time":
-                    time.time(),
-
-                "data":
-                    data
+            market_cache[asset] = {
+                "time": time.time(),
+                "data": data
             }
 
     return data
@@ -487,47 +392,31 @@ def get_market_data(
 # EMA
 # ============================================================
 
-def ema(
-    values,
-    period
-):
+def calculate_ema(values, period):
 
     if len(values) < period:
-
         return []
 
-    multiplier = (
-        2
-        /
-        (period + 1)
-    )
+    multiplier = 2 / (period + 1)
 
     current = (
         sum(values[:period])
-        /
-        period
+        / period
     )
 
-    result = [
-        current
-    ]
+    result = [current]
 
     for value in values[period:]:
 
         current = (
             (
-                value
-                - current
+                value - current
             )
-            *
-            multiplier
-            +
-            current
+            * multiplier
+            + current
         )
 
-        result.append(
-            current
-        )
+        result.append(current)
 
     return result
 
@@ -536,22 +425,15 @@ def ema(
 # RSI
 # ============================================================
 
-def rsi(
-    values,
-    period=14
-):
+def calculate_rsi(values, period=14):
 
     if len(values) <= period:
-
         return []
 
     gains = []
     losses = []
 
-    for i in range(
-        1,
-        len(values)
-    ):
+    for i in range(1, len(values)):
 
         change = (
             values[i]
@@ -581,60 +463,52 @@ def rsi(
 
     result = []
 
-    def current_rsi():
-
-        if avg_loss == 0:
-
-            return 100.0
-
-        rs = (
-            avg_gain
-            /
-            avg_loss
-        )
-
-        return (
-            100
-            -
-            (
-                100
-                /
-                (1 + rs)
-            )
-        )
-
-    result.append(
-        current_rsi()
-    )
-
     for i in range(
-        period,
+        period - 1,
         len(gains)
     ):
 
-        avg_gain = (
-            (
+        if i >= period:
+
+            avg_gain = (
+                (
+                    avg_gain
+                    * (period - 1)
+                )
+                +
+                gains[i]
+            ) / period
+
+            avg_loss = (
+                (
+                    avg_loss
+                    * (period - 1)
+                )
+                +
+                losses[i]
+            ) / period
+
+        if avg_loss == 0:
+            value = 100.0
+        else:
+
+            rs = (
                 avg_gain
-                *
-                (period - 1)
-            )
-            +
-            gains[i]
-        ) / period
-
-        avg_loss = (
-            (
+                /
                 avg_loss
-                *
-                (period - 1)
             )
-            +
-            losses[i]
-        ) / period
 
-        result.append(
-            current_rsi()
-        )
+            value = (
+                100
+                -
+                (
+                    100
+                    /
+                    (1 + rs)
+                )
+            )
+
+        result.append(value)
 
     return result
 
@@ -643,7 +517,7 @@ def rsi(
 # ATR
 # ============================================================
 
-def atr(
+def calculate_atr(
     highs,
     lows,
     closes,
@@ -651,21 +525,15 @@ def atr(
 ):
 
     if len(closes) <= period:
-
         return []
 
     true_ranges = []
 
-    for i in range(
-        1,
-        len(closes)
-    ):
+    for i in range(1, len(closes)):
 
         tr = max(
 
-            highs[i]
-            -
-            lows[i],
+            highs[i] - lows[i],
 
             abs(
                 highs[i]
@@ -680,12 +548,9 @@ def atr(
             )
         )
 
-        true_ranges.append(
-            tr
-        )
+        true_ranges.append(tr)
 
     if len(true_ranges) < period:
-
         return []
 
     current = (
@@ -696,31 +561,217 @@ def atr(
         period
     )
 
-    result = [
-        current
-    ]
+    result = [current]
 
     for tr in true_ranges[period:]:
 
         current = (
             (
                 current
-                *
-                (period - 1)
+                * (period - 1)
             )
             +
             tr
         ) / period
 
-        result.append(
-            current
-        )
+        result.append(current)
 
     return result
 
 
 # ============================================================
-# SWING HIGHS
+# ADX
+# ============================================================
+
+def calculate_adx(
+    highs,
+    lows,
+    closes,
+    period=14
+):
+
+    if len(closes) < period * 2 + 5:
+        return []
+
+    tr_list = []
+    plus_dm = []
+    minus_dm = []
+
+    for i in range(1, len(closes)):
+
+        high_diff = (
+            highs[i]
+            -
+            highs[i - 1]
+        )
+
+        low_diff = (
+            lows[i - 1]
+            -
+            lows[i]
+        )
+
+        tr = max(
+            highs[i] - lows[i],
+            abs(
+                highs[i]
+                -
+                closes[i - 1]
+            ),
+            abs(
+                lows[i]
+                -
+                closes[i - 1]
+            )
+        )
+
+        tr_list.append(tr)
+
+        plus_dm.append(
+            high_diff
+            if (
+                high_diff > low_diff
+                and high_diff > 0
+            )
+            else 0
+        )
+
+        minus_dm.append(
+            low_diff
+            if (
+                low_diff > high_diff
+                and low_diff > 0
+            )
+            else 0
+        )
+
+    if len(tr_list) < period:
+        return []
+
+    atr_value = (
+        sum(tr_list[:period])
+        /
+        period
+    )
+
+    plus_value = (
+        sum(plus_dm[:period])
+        /
+        period
+    )
+
+    minus_value = (
+        sum(minus_dm[:period])
+        /
+        period
+    )
+
+    dx_values = []
+
+    for i in range(
+        period,
+        len(tr_list)
+    ):
+
+        atr_value = (
+            (
+                atr_value
+                * (period - 1)
+            )
+            +
+            tr_list[i]
+        ) / period
+
+        plus_value = (
+            (
+                plus_value
+                * (period - 1)
+            )
+            +
+            plus_dm[i]
+        ) / period
+
+        minus_value = (
+            (
+                minus_value
+                * (period - 1)
+            )
+            +
+            minus_dm[i]
+        ) / period
+
+        if atr_value == 0:
+            continue
+
+        plus_di = (
+            100
+            *
+            plus_value
+            /
+            atr_value
+        )
+
+        minus_di = (
+            100
+            *
+            minus_value
+            /
+            atr_value
+        )
+
+        denominator = (
+            plus_di
+            +
+            minus_di
+        )
+
+        if denominator == 0:
+            dx = 0
+        else:
+
+            dx = (
+                100
+                *
+                abs(
+                    plus_di
+                    -
+                    minus_di
+                )
+                /
+                denominator
+            )
+
+        dx_values.append(dx)
+
+    if len(dx_values) < period:
+        return []
+
+    adx = (
+        sum(dx_values[:period])
+        /
+        period
+    )
+
+    result = [adx]
+
+    for dx in dx_values[period:]:
+
+        adx = (
+            (
+                adx
+                * (period - 1)
+            )
+            +
+            dx
+        ) / period
+
+        result.append(adx)
+
+    return result
+
+
+# ============================================================
+# SWING POINTS
 # ============================================================
 
 def find_swing_highs(
@@ -735,34 +786,31 @@ def find_swing_highs(
         len(highs) - lookback
     ):
 
-        left = highs[
-            i - lookback:i
-        ]
-
-        right = highs[
-            i + 1:
-            i + lookback + 1
-        ]
-
         if (
-            highs[i] > max(left)
+            highs[i]
+            >
+            max(
+                highs[
+                    i - lookback:i
+                ]
+            )
             and
-            highs[i] >= max(right)
+            highs[i]
+            >=
+            max(
+                highs[
+                    i + 1:
+                    i + lookback + 1
+                ]
+            )
         ):
 
             points.append(
-                (
-                    i,
-                    highs[i]
-                )
+                (i, highs[i])
             )
 
     return points
 
-
-# ============================================================
-# SWING LOWS
-# ============================================================
 
 def find_swing_lows(
     lows,
@@ -776,33 +824,34 @@ def find_swing_lows(
         len(lows) - lookback
     ):
 
-        left = lows[
-            i - lookback:i
-        ]
-
-        right = lows[
-            i + 1:
-            i + lookback + 1
-        ]
-
         if (
-            lows[i] < min(left)
+            lows[i]
+            <
+            min(
+                lows[
+                    i - lookback:i
+                ]
+            )
             and
-            lows[i] <= min(right)
+            lows[i]
+            <=
+            min(
+                lows[
+                    i + 1:
+                    i + lookback + 1
+                ]
+            )
         ):
 
             points.append(
-                (
-                    i,
-                    lows[i]
-                )
+                (i, lows[i])
             )
 
     return points
 
 
 # ============================================================
-# PATTERN DETECTION
+# CHART PATTERNS
 # ============================================================
 
 def detect_patterns(
@@ -813,17 +862,11 @@ def detect_patterns(
 
     patterns = []
 
-    swing_highs = find_swing_highs(
-        highs
-    )
-
-    swing_lows = find_swing_lows(
-        lows
-    )
+    swing_highs = find_swing_highs(highs)
+    swing_lows = find_swing_lows(lows)
 
     recent_highs = swing_highs[-5:]
     recent_lows = swing_lows[-5:]
-
 
     # --------------------------------------------------------
     # DOUBLE TOP
@@ -834,26 +877,21 @@ def detect_patterns(
         h1 = recent_highs[-2][1]
         h2 = recent_highs[-1][1]
 
-        tolerance = (
-            abs(h1)
-            * 0.0025
-        )
+        tolerance = abs(h1) * 0.003
 
         if (
             abs(h1 - h2)
             <= tolerance
-            and
-            closes[-1] < h2
+            and closes[-1] < h2
         ):
 
             patterns.append(
                 (
                     "DOUBLE_TOP",
                     "SELL",
-                    16
+                    12
                 )
             )
-
 
     # --------------------------------------------------------
     # DOUBLE BOTTOM
@@ -864,26 +902,21 @@ def detect_patterns(
         l1 = recent_lows[-2][1]
         l2 = recent_lows[-1][1]
 
-        tolerance = (
-            abs(l1)
-            * 0.0025
-        )
+        tolerance = abs(l1) * 0.003
 
         if (
             abs(l1 - l2)
             <= tolerance
-            and
-            closes[-1] > l2
+            and closes[-1] > l2
         ):
 
             patterns.append(
                 (
                     "DOUBLE_BOTTOM",
                     "BUY",
-                    16
+                    12
                 )
             )
-
 
     # --------------------------------------------------------
     # TRIPLE TOP
@@ -906,7 +939,7 @@ def detect_patterns(
             -
             min(values)
             <=
-            average * 0.003
+            average * 0.004
             and
             closes[-1] < average
         ):
@@ -915,10 +948,9 @@ def detect_patterns(
                 (
                     "TRIPLE_TOP",
                     "SELL",
-                    20
+                    15
                 )
             )
-
 
     # --------------------------------------------------------
     # TRIPLE BOTTOM
@@ -941,7 +973,7 @@ def detect_patterns(
             -
             min(values)
             <=
-            average * 0.003
+            average * 0.004
             and
             closes[-1] > average
         ):
@@ -950,10 +982,9 @@ def detect_patterns(
                 (
                     "TRIPLE_BOTTOM",
                     "BUY",
-                    20
+                    15
                 )
             )
-
 
     # --------------------------------------------------------
     # HEAD AND SHOULDERS
@@ -966,9 +997,8 @@ def detect_patterns(
             for x in recent_highs[-3:]
         ]
 
-        tolerance = (
-            abs(left)
-            * 0.008
+        shoulder_tolerance = (
+            abs(left) * 0.01
         )
 
         if (
@@ -977,7 +1007,8 @@ def detect_patterns(
             head > right
             and
             abs(left - right)
-            <= tolerance
+            <=
+            shoulder_tolerance
             and
             closes[-1] < right
         ):
@@ -986,10 +1017,9 @@ def detect_patterns(
                 (
                     "HEAD_SHOULDERS",
                     "SELL",
-                    22
+                    16
                 )
             )
-
 
     # --------------------------------------------------------
     # INVERSE HEAD AND SHOULDERS
@@ -1002,9 +1032,8 @@ def detect_patterns(
             for x in recent_lows[-3:]
         ]
 
-        tolerance = (
-            abs(left)
-            * 0.008
+        shoulder_tolerance = (
+            abs(left) * 0.01
         )
 
         if (
@@ -1013,7 +1042,8 @@ def detect_patterns(
             head < right
             and
             abs(left - right)
-            <= tolerance
+            <=
+            shoulder_tolerance
             and
             closes[-1] > right
         ):
@@ -1022,202 +1052,24 @@ def detect_patterns(
                 (
                     "INVERSE_HEAD_SHOULDERS",
                     "BUY",
-                    22
+                    16
                 )
             )
-
-
-    # --------------------------------------------------------
-    # TREND STRUCTURE
-    # --------------------------------------------------------
-
-    if (
-        len(recent_highs) >= 3
-        and
-        len(recent_lows) >= 3
-    ):
-
-        h = [
-            x[1]
-            for x in recent_highs[-3:]
-        ]
-
-        l = [
-            x[1]
-            for x in recent_lows[-3:]
-        ]
-
-        higher_highs = (
-            h[0]
-            <
-            h[1]
-            <
-            h[2]
-        )
-
-        higher_lows = (
-            l[0]
-            <
-            l[1]
-            <
-            l[2]
-        )
-
-        lower_highs = (
-            h[0]
-            >
-            h[1]
-            >
-            h[2]
-        )
-
-        lower_lows = (
-            l[0]
-            >
-            l[1]
-            >
-            l[2]
-        )
-
-        if (
-            higher_highs
-            and
-            higher_lows
-        ):
-
-            patterns.append(
-                (
-                    "RISING_STRUCTURE",
-                    "BUY",
-                    10
-                )
-            )
-
-        if (
-            lower_highs
-            and
-            lower_lows
-        ):
-
-            patterns.append(
-                (
-                    "FALLING_STRUCTURE",
-                    "SELL",
-                    10
-                )
-            )
-
 
     return patterns
 
 
 # ============================================================
-# MARKET REGIME
+# CANDLE CONFIRMATION
 # ============================================================
 
-def market_regime(
-    closes,
-    ema9_values,
-    ema21_values,
-    atr_value
-):
-
-    if (
-        not ema9_values
-        or
-        not ema21_values
-    ):
-
-        return "UNKNOWN"
-
-    e9 = ema9_values[-1]
-    e21 = ema21_values[-1]
-
-    price = closes[-1]
-
-    separation = abs(
-        e9 - e21
-    )
-
-    minimum_separation = (
-        atr_value
-        * 0.10
-    )
-
-    if (
-        separation
-        <
-        minimum_separation
-    ):
-
-        return "CHOPPY"
-
-    if (
-        e9 > e21
-        and
-        price > e9
-    ):
-
-        return "BULLISH"
-
-    if (
-        e9 < e21
-        and
-        price < e9
-    ):
-
-        return "BEARISH"
-
-    return "TRANSITION"
-
-
-# ============================================================
-# BREAKOUT CONFIRMATION
-# ============================================================
-
-def breakout_confirmation(
+def candle_confirmation(
+    opens,
     highs,
     lows,
     closes,
-    opens,
-    volumes,
-    direction,
-    atr_value
+    direction
 ):
-
-    if len(closes) < 10:
-
-        return False
-
-    previous_high = max(
-        highs[-8:-1]
-    )
-
-    previous_low = min(
-        lows[-8:-1]
-    )
-
-    average_volume = (
-        sum(volumes[-8:-1])
-        /
-        7
-    )
-
-    if average_volume <= 0:
-
-        return False
-
-    volume_ratio = (
-        volumes[-1]
-        /
-        average_volume
-    )
-
-    candle_body = abs(
-        closes[-1]
-        -
-        opens[-1]
-    )
 
     candle_range = (
         highs[-1]
@@ -1226,95 +1078,253 @@ def breakout_confirmation(
     )
 
     if candle_range <= 0:
-
         return False
 
+    body = abs(
+        closes[-1]
+        -
+        opens[-1]
+    )
+
     body_ratio = (
-        candle_body
+        body
         /
         candle_range
     )
 
+    upper_wick = (
+        highs[-1]
+        -
+        max(
+            opens[-1],
+            closes[-1]
+        )
+    )
+
+    lower_wick = (
+        min(
+            opens[-1],
+            closes[-1]
+        )
+        -
+        lows[-1]
+    )
+
     if direction == "BUY":
 
-        breakout = (
-            closes[-1]
-            >
-            previous_high
-            +
-            atr_value * 0.08
-        )
-
-        strong_candle = (
+        return (
             closes[-1]
             >
             opens[-1]
             and
             body_ratio >= 0.50
-        )
-
-        strong_volume = (
-            volume_ratio >= 1.20
-        )
-
-        return (
-            breakout
             and
-            strong_candle
-            and
-            strong_volume
+            upper_wick
+            <
+            body * 0.75
         )
 
     if direction == "SELL":
 
-        breakout = (
-            closes[-1]
-            <
-            previous_low
-            -
-            atr_value * 0.08
-        )
-
-        strong_candle = (
+        return (
             closes[-1]
             <
             opens[-1]
             and
             body_ratio >= 0.50
-        )
-
-        strong_volume = (
-            volume_ratio >= 1.20
-        )
-
-        return (
-            breakout
             and
-            strong_candle
-            and
-            strong_volume
+            lower_wick
+            <
+            body * 0.75
         )
 
     return False
 
 
 # ============================================================
-# ANALYSIS
+# BREAKOUT
 # ============================================================
 
-def analyze_asset(
-    asset
+def breakout_confirmation(
+    highs,
+    lows,
+    closes,
+    volumes,
+    atr_value,
+    direction
 ):
+
+    if len(closes) < 10:
+        return False
+
+    resistance = max(
+        highs[-9:-1]
+    )
+
+    support = min(
+        lows[-9:-1]
+    )
+
+    avg_volume = (
+        sum(volumes[-9:-1])
+        /
+        8
+    )
+
+    if avg_volume <= 0:
+        return False
+
+    volume_ratio = (
+        volumes[-1]
+        /
+        avg_volume
+    )
+
+    if direction == "BUY":
+
+        return (
+            closes[-1]
+            >
+            resistance
+            +
+            atr_value * 0.08
+            and
+            volume_ratio >= 1.20
+        )
+
+    if direction == "SELL":
+
+        return (
+            closes[-1]
+            <
+            support
+            -
+            atr_value * 0.08
+            and
+            volume_ratio >= 1.20
+        )
+
+    return False
+
+
+# ============================================================
+# RETEST CONFIRMATION
+# ============================================================
+
+def retest_confirmation(
+    highs,
+    lows,
+    closes,
+    direction
+):
+
+    if len(closes) < 8:
+        return False
+
+    level_high = max(
+        highs[-8:-2]
+    )
+
+    level_low = min(
+        lows[-8:-2]
+    )
+
+    if direction == "BUY":
+
+        previous_breakout = (
+            closes[-2]
+            >
+            level_high
+        )
+
+        current_holds_level = (
+            lows[-1]
+            >=
+            level_high * 0.999
+        )
+
+        return (
+            previous_breakout
+            and
+            current_holds_level
+            and
+            closes[-1]
+            >
+            closes[-2]
+        )
+
+    if direction == "SELL":
+
+        previous_breakout = (
+            closes[-2]
+            <
+            level_low
+        )
+
+        current_holds_level = (
+            highs[-1]
+            <=
+            level_low * 1.001
+        )
+
+        return (
+            previous_breakout
+            and
+            current_holds_level
+            and
+            closes[-1]
+            <
+            closes[-2]
+        )
+
+    return False
+
+
+# ============================================================
+# MARKET REGIME
+# ============================================================
+
+def get_market_regime(
+    price,
+    ema9,
+    ema21,
+    adx
+):
+
+    if adx < 18:
+        return "CHOPPY"
+
+    if (
+        ema9 > ema21
+        and
+        price > ema9
+    ):
+        return "BULLISH"
+
+    if (
+        ema9 < ema21
+        and
+        price < ema9
+    ):
+        return "BEARISH"
+
+    return "TRANSITION"
+
+
+# ============================================================
+# ANALYZE ASSET
+# ============================================================
+
+def analyze_asset(asset):
 
     global latest_signal_data
 
     market = get_market_data(
         asset,
-        100
+        120
     )
 
     if not market:
-
         return None
 
     opens = market["opens"]
@@ -1323,101 +1333,91 @@ def analyze_asset(
     closes = market["closes"]
     volumes = market["volumes"]
 
-    if len(closes) < 60:
-
+    if len(closes) < 70:
         return None
 
-    ema9_values = ema(
+    ema9_values = calculate_ema(
         closes,
         9
     )
 
-    ema21_values = ema(
+    ema21_values = calculate_ema(
         closes,
         21
     )
 
-    rsi_values = rsi(
+    rsi_values = calculate_rsi(
         closes,
         14
     )
 
-    atr_values = atr(
+    atr_values = calculate_atr(
         highs,
         lows,
         closes,
         14
     )
 
-    if not (
-        ema9_values
-        and
-        ema21_values
-        and
-        rsi_values
-        and
-        atr_values
-    ):
+    adx_values = calculate_adx(
+        highs,
+        lows,
+        closes,
+        14
+    )
 
+    if not all([
+        ema9_values,
+        ema21_values,
+        rsi_values,
+        atr_values,
+        adx_values
+    ]):
         return None
 
     price = closes[-1]
 
-    ema9_now = ema9_values[-1]
-    ema21_now = ema21_values[-1]
-    rsi_now = rsi_values[-1]
-    atr_now = atr_values[-1]
+    ema9 = ema9_values[-1]
+    ema21 = ema21_values[-1]
+    rsi = rsi_values[-1]
+    atr = atr_values[-1]
+    adx = adx_values[-1]
 
-    if atr_now <= 0:
-
+    if atr <= 0:
         return None
 
-    regime = market_regime(
-        closes,
-        ema9_values,
-        ema21_values,
-        atr_now
+    regime = get_market_regime(
+        price,
+        ema9,
+        ema21,
+        adx
     )
 
-    # Avoid sideways market.
+    # No trade in sideways/transition market.
     if regime in (
         "CHOPPY",
-        "UNKNOWN",
         "TRANSITION"
     ):
-
         return None
+
+    avg_volume = (
+        sum(volumes[-9:-1])
+        /
+        8
+    )
+
+    if avg_volume <= 0:
+        return None
+
+    volume_ratio = (
+        volumes[-1]
+        /
+        avg_volume
+    )
 
     patterns = detect_patterns(
         highs,
         lows,
         closes
-    )
-
-    volume_average = (
-        sum(volumes[-8:-1])
-        /
-        7
-    )
-
-    volume_ratio = (
-        volumes[-1]
-        /
-        volume_average
-        if volume_average > 0
-        else 0
-    )
-
-    bullish_candle = (
-        closes[-1]
-        >
-        opens[-1]
-    )
-
-    bearish_candle = (
-        closes[-1]
-        <
-        opens[-1]
     )
 
     buy_score = 0
@@ -1426,169 +1426,292 @@ def analyze_asset(
     buy_reasons = []
     sell_reasons = []
 
-    # EMA TREND
+    # --------------------------------------------------------
+    # EMA
+    # --------------------------------------------------------
+
     if (
-        ema9_now > ema21_now
+        ema9 > ema21
         and
         regime == "BULLISH"
     ):
 
         buy_score += 20
-
         buy_reasons.append(
             "EMA9>EMA21"
         )
 
     if (
-        ema9_now < ema21_now
+        ema9 < ema21
         and
         regime == "BEARISH"
     ):
 
         sell_score += 20
-
         sell_reasons.append(
             "EMA9<EMA21"
         )
 
-    # PRICE LOCATION
+    # --------------------------------------------------------
+    # PRICE
+    # --------------------------------------------------------
+
     if (
-        price > ema9_now
+        price > ema9
         and
-        buy_score > 0
+        regime == "BULLISH"
     ):
 
         buy_score += 10
-
         buy_reasons.append(
-            "Price>EMA9"
+            "Price above EMA9"
         )
 
     if (
-        price < ema9_now
+        price < ema9
         and
-        sell_score > 0
+        regime == "BEARISH"
     ):
 
         sell_score += 10
-
         sell_reasons.append(
-            "Price<EMA9"
+            "Price below EMA9"
         )
 
+    # --------------------------------------------------------
     # RSI
-    if 52 <= rsi_now <= 67:
+    # --------------------------------------------------------
 
-        buy_score += 15
+    # Avoid buying extreme RSI.
+    if (
+        52 <= rsi <= 68
+        and
+        regime == "BULLISH"
+    ):
 
+        buy_score += 12
         buy_reasons.append(
-            "RSI bullish"
+            "RSI momentum"
         )
 
-    if 33 <= rsi_now <= 48:
+    # Avoid selling extreme RSI.
+    if (
+        32 <= rsi <= 48
+        and
+        regime == "BEARISH"
+    ):
 
-        sell_score += 15
-
+        sell_score += 12
         sell_reasons.append(
-            "RSI bearish"
+            "RSI momentum"
         )
 
+    # --------------------------------------------------------
+    # ADX
+    # --------------------------------------------------------
+
+    if adx >= 20:
+
+        if regime == "BULLISH":
+
+            buy_score += 12
+            buy_reasons.append(
+                "ADX trend"
+            )
+
+        elif regime == "BEARISH":
+
+            sell_score += 12
+            sell_reasons.append(
+                "ADX trend"
+            )
+
+    if adx >= 25:
+
+        if regime == "BULLISH":
+
+            buy_score += 5
+
+        elif regime == "BEARISH":
+
+            sell_score += 5
+
+    # --------------------------------------------------------
     # VOLUME
+    # --------------------------------------------------------
+
     if volume_ratio >= 1.20:
 
-        buy_score += 10
-        sell_score += 10
+        if regime == "BULLISH":
+
+            buy_score += 10
+            buy_reasons.append(
+                f"Volume {volume_ratio:.2f}x"
+            )
+
+        elif regime == "BEARISH":
+
+            sell_score += 10
+            sell_reasons.append(
+                f"Volume {volume_ratio:.2f}x"
+            )
 
     if volume_ratio >= 1.50:
 
-        buy_score += 5
-        sell_score += 5
+        if regime == "BULLISH":
+            buy_score += 5
 
+        elif regime == "BEARISH":
+            sell_score += 5
+
+    # --------------------------------------------------------
     # CANDLE
-    if bullish_candle:
+    # --------------------------------------------------------
 
-        buy_score += 5
+    buy_candle = candle_confirmation(
+        opens,
+        highs,
+        lows,
+        closes,
+        "BUY"
+    )
 
-    if bearish_candle:
+    sell_candle = candle_confirmation(
+        opens,
+        highs,
+        lows,
+        closes,
+        "SELL"
+    )
 
-        sell_score += 5
+    if buy_candle:
 
+        buy_score += 8
+        buy_reasons.append(
+            "Strong candle"
+        )
+
+    if sell_candle:
+
+        sell_score += 8
+        sell_reasons.append(
+            "Strong candle"
+        )
+
+    # --------------------------------------------------------
     # BREAKOUT
+    # --------------------------------------------------------
+
     buy_breakout = breakout_confirmation(
         highs,
         lows,
         closes,
-        opens,
         volumes,
-        "BUY",
-        atr_now
+        atr,
+        "BUY"
     )
 
     sell_breakout = breakout_confirmation(
         highs,
         lows,
         closes,
-        opens,
         volumes,
-        "SELL",
-        atr_now
+        atr,
+        "SELL"
     )
 
     if buy_breakout:
 
         buy_score += 15
-
         buy_reasons.append(
-            "Volume breakout"
+            "Breakout"
         )
 
     if sell_breakout:
 
         sell_score += 15
-
         sell_reasons.append(
-            "Volume breakdown"
+            "Breakdown"
         )
 
+    # --------------------------------------------------------
+    # RETEST
+    # --------------------------------------------------------
+
+    buy_retest = retest_confirmation(
+        highs,
+        lows,
+        closes,
+        "BUY"
+    )
+
+    sell_retest = retest_confirmation(
+        highs,
+        lows,
+        closes,
+        "SELL"
+    )
+
+    if buy_retest:
+
+        buy_score += 12
+        buy_reasons.append(
+            "Retest confirmed"
+        )
+
+    if sell_retest:
+
+        sell_score += 12
+        sell_reasons.append(
+            "Retest confirmed"
+        )
+
+    # --------------------------------------------------------
     # PATTERNS
+    # --------------------------------------------------------
+
     detected_pattern = None
 
     for (
-        pattern_name,
+        pattern,
         direction,
-        pattern_score
+        points
     ) in patterns:
 
         if direction == "BUY":
 
-            buy_score += pattern_score
+            buy_score += points
 
             buy_reasons.append(
-                pattern_name
+                pattern
             )
 
-            if not detected_pattern:
-
-                detected_pattern = (
-                    pattern_name
-                )
+            if detected_pattern is None:
+                detected_pattern = pattern
 
         elif direction == "SELL":
 
-            sell_score += pattern_score
+            sell_score += points
 
             sell_reasons.append(
-                pattern_name
+                pattern
             )
 
-            if not detected_pattern:
+            if detected_pattern is None:
+                detected_pattern = pattern
 
-                detected_pattern = (
-                    pattern_name
-                )
+    # --------------------------------------------------------
+    # MANDATORY CONFIRMATION
+    # --------------------------------------------------------
 
     buy_confirmation = (
-        buy_breakout
+        (
+            buy_breakout
+            and
+            buy_candle
+        )
+        or
+        buy_retest
         or
         any(
             p[1] == "BUY"
@@ -1597,7 +1720,13 @@ def analyze_asset(
     )
 
     sell_confirmation = (
-        sell_breakout
+        (
+            sell_breakout
+            and
+            sell_candle
+        )
+        or
+        sell_retest
         or
         any(
             p[1] == "SELL"
@@ -1609,7 +1738,10 @@ def analyze_asset(
     score = 0
     reasons = []
 
+    # --------------------------------------------------------
     # BUY
+    # --------------------------------------------------------
+
     if (
         buy_score >= MIN_SIGNAL_SCORE
         and
@@ -1626,7 +1758,10 @@ def analyze_asset(
         score = buy_score
         reasons = buy_reasons
 
+    # --------------------------------------------------------
     # SELL
+    # --------------------------------------------------------
+
     elif (
         sell_score >= MIN_SIGNAL_SCORE
         and
@@ -1644,25 +1779,18 @@ def analyze_asset(
         reasons = sell_reasons
 
     if not action:
-
         return None
 
-    # ========================================================
-    # TP / SL
-    # ========================================================
+    # --------------------------------------------------------
+    # SL / TP
+    # --------------------------------------------------------
 
-    config = ASSETS[
+    minimum_sl = ASSETS[
         asset
-    ]
-
-    minimum_sl = config[
-        "minimum_sl"
-    ]
+    ]["minimum_sl"]
 
     sl_distance = max(
-        atr_now
-        *
-        ATR_SL_MULTIPLIER,
+        atr * ATR_SL_MULTIPLIER,
         minimum_sl
     )
 
@@ -1674,122 +1802,70 @@ def analyze_asset(
 
     if action == "BUY":
 
-        tp = (
-            price
-            +
-            tp_distance
-        )
-
-        sl = (
-            price
-            -
-            sl_distance
-        )
+        sl = price - sl_distance
+        tp = price + tp_distance
 
     else:
 
-        tp = (
-            price
-            -
-            tp_distance
-        )
-
-        sl = (
-            price
-            +
-            sl_distance
-        )
+        sl = price + sl_distance
+        tp = price - tp_distance
 
     signal = {
 
-        "asset_key":
-            asset,
+        "asset_key": asset,
 
         "asset":
-            config["display"],
+            ASSETS[asset]["display"],
 
-        "action":
-            action,
+        "action": action,
 
         "price":
-            round(
-                price,
-                2
-            ),
+            round(price, 2),
 
         "tp":
-            round(
-                tp,
-                2
-            ),
+            round(tp, 2),
 
         "sl":
-            round(
-                sl,
-                2
-            ),
+            round(sl, 2),
 
         "initial_sl":
-            round(
-                sl,
-                2
-            ),
+            round(sl, 2),
 
         "risk_distance":
-            round(
-                sl_distance,
-                4
-            ),
+            round(sl_distance, 4),
 
         "score":
-            min(
-                score,
-                100
-            ),
+            min(score, 100),
 
         "ema9":
-            round(
-                ema9_now,
-                2
-            ),
+            round(ema9, 2),
 
         "ema21":
-            round(
-                ema21_now,
-                2
-            ),
+            round(ema21, 2),
 
         "rsi":
-            round(
-                rsi_now,
-                2
-            ),
+            round(rsi, 2),
 
         "atr":
-            round(
-                atr_now,
-                4
-            ),
+            round(atr, 4),
+
+        "adx":
+            round(adx, 2),
 
         "volume_ratio":
-            round(
-                volume_ratio,
-                2
-            ),
+            round(volume_ratio, 2),
 
         "regime":
             regime,
 
         "pattern":
-            detected_pattern
-            or
-            "BREAKOUT",
+            detected_pattern or "BREAKOUT",
 
         "reasons":
-            reasons[:8],
+            reasons[:10],
 
         "recommended_lot":
-            config["lot"]
+            ASSETS[asset]["lot"]
     }
 
     latest_signal_data = signal
@@ -1801,72 +1877,47 @@ def analyze_asset(
 # SIGNAL CONTROL
 # ============================================================
 
-def has_active_signal(
-    asset
-):
+def has_active_signal(asset):
 
     with state_lock:
 
         return any(
-            signal["asset_key"] == asset
-            for signal in active_signals
+            s["asset_key"] == asset
+            for s in active_signals
         )
 
 
-def cooldown_active(
-    asset
-):
+def cooldown_active(asset):
 
-    last_time = (
-        last_signal_time[
-            asset
-        ]
-    )
+    last = last_signal_time.get(asset)
 
-    if not last_time:
-
+    if not last:
         return False
 
     return (
         datetime.now()
         -
-        last_time
+        last
     ) < timedelta(
-        minutes=
-        SIGNAL_COOLDOWN_MINUTES
+        minutes=SIGNAL_COOLDOWN_MINUTES
     )
 
 
 # ============================================================
-# CREATE SIGNAL
+# SEND NEW SIGNAL
 # ============================================================
 
-def analyze_and_trigger(
-    asset
-):
+def analyze_and_trigger(asset):
 
-    if cooldown_active(
-        asset
-    ):
-
+    if cooldown_active(asset):
         return
 
-    if (
-        ONE_TRADE_PER_ASSET
-        and
-        has_active_signal(
-            asset
-        )
-    ):
-
+    if has_active_signal(asset):
         return
 
-    signal = analyze_asset(
-        asset
-    )
+    signal = analyze_asset(asset)
 
     if not signal:
-
         return
 
     signal_time = datetime.now(
@@ -1891,24 +1942,19 @@ def analyze_and_trigger(
     )
 
     reply_markup = {
-
         "inline_keyboard": [
-
             [
-
                 {
                     "text":
                         "📈 TradingView Chart",
-
                     "url":
                         chart_link
                 }
-
             ]
         ]
     }
 
-    direction_emoji = (
+    emoji = (
         "🟢"
         if signal["action"] == "BUY"
         else
@@ -1921,13 +1967,13 @@ def analyze_and_trigger(
 
     message = (
 
-        "🎯 *HIGH QUALITY 5M SIGNAL*\n"
+        "🎯 *5M SCALPING SIGNAL*\n"
         "━━━━━━━━━━━━━━━━━━\n"
 
         f"💹 *{signal['asset']}*\n"
         f"⏰ `{signal_time}`\n\n"
 
-        f"{direction_emoji} Action: "
+        f"{emoji} Action: "
         f"*{signal['action']}*\n"
 
         f"💰 Entry: "
@@ -1936,10 +1982,10 @@ def analyze_and_trigger(
         f"🎯 TP: "
         f"`{signal['tp']}`\n"
 
-        f"🛑 Initial SL: "
+        f"🛑 SL: "
         f"`{signal['sl']}`\n\n"
 
-        f"⭐ Quality Score: "
+        f"⭐ Score: "
         f"*{signal['score']}/100*\n"
 
         f"📊 Pattern: "
@@ -1951,38 +1997,42 @@ def analyze_and_trigger(
         f"📉 EMA21: "
         f"`{signal['ema21']}`\n"
 
-        f"📊 RSI: "
+        f"RSI: "
         f"`{signal['rsi']}`\n"
 
-        f"🔊 Volume: "
-        f"`{signal['volume_ratio']}x`\n"
+        f"ADX: "
+        f"`{signal['adx']}`\n"
 
-        f"〽️ ATR: "
+        f"ATR: "
         f"`{signal['atr']}`\n"
 
-        f"🌐 Regime: "
+        f"Volume: "
+        f"`{signal['volume_ratio']}x`\n"
+
+        f"Regime: "
         f"`{signal['regime']}`\n\n"
 
-        f"🧠 Confirmation:\n"
+        f"🧠 *Confirmation:*\n"
         f"`{reasons}`\n\n"
 
-        f"📦 Suggested Lot: "
+        f"📦 Lot: "
         f"`{signal['recommended_lot']}`\n\n"
 
-        "🛡️ Management:\n"
-        f"BE at `+{BREAK_EVEN_TRIGGER_R}R`\n"
-        f"Trailing from `+{TRAIL_TRIGGER_R}R`\n\n"
+        "🛡️ BE: "
+        f"`+{BREAK_EVEN_TRIGGER_R}R`\n"
+
+        "📈 Trail: "
+        f"`+{TRAIL_TRIGGER_R}R`\n\n"
 
         "Status: *ACTIVE ⏳*"
     )
 
-    message_id = send_telegram_alert(
+    msg_id = send_telegram_alert(
         message,
         reply_markup
     )
 
-    if not message_id:
-
+    if not msg_id:
         return
 
     now = datetime.now()
@@ -1990,7 +2040,7 @@ def analyze_and_trigger(
     trade = {
 
         "msg_id":
-            message_id,
+            msg_id,
 
         "asset_key":
             asset,
@@ -2040,17 +2090,13 @@ def analyze_and_trigger(
 
     with state_lock:
 
-        active_signals.append(
-            trade
-        )
+        active_signals.append(trade)
 
-        last_signal_time[
-            asset
-        ] = now
+        last_signal_time[asset] = now
 
 
 # ============================================================
-# TRADE MANAGEMENT
+# BREAK-EVEN + TRAILING
 # ============================================================
 
 def update_trade_management(
@@ -2063,13 +2109,10 @@ def update_trade_management(
     risk = signal["risk_distance"]
 
     if risk <= 0:
-
         return
 
     is_buy = (
-        signal["action"]
-        ==
-        "BUY"
+        signal["action"] == "BUY"
     )
 
     if is_buy:
@@ -2108,9 +2151,9 @@ def update_trade_management(
             current_price
         )
 
-    # ========================================================
+    # --------------------------------------------------------
     # BREAK EVEN
-    # ========================================================
+    # --------------------------------------------------------
 
     if (
         not signal["breakeven_done"]
@@ -2156,13 +2199,11 @@ def update_trade_management(
                     2
                 )
 
-        signal[
-            "breakeven_done"
-        ] = True
+        signal["breakeven_done"] = True
 
-    # ========================================================
-    # TRAILING STOP
-    # ========================================================
+    # --------------------------------------------------------
+    # TRAILING
+    # --------------------------------------------------------
 
     if (
         signal["breakeven_done"]
@@ -2221,35 +2262,33 @@ def update_trade_management(
 # RESULT R
 # ============================================================
 
-def result_r(
+def calculate_result_r(
     signal,
     exit_price
 ):
 
-    entry = signal["price"]
     risk = signal["risk_distance"]
 
     if risk <= 0:
-
-        return 0
+        return 0.0
 
     if signal["action"] == "BUY":
 
         return (
             exit_price
             -
-            entry
+            signal["price"]
         ) / risk
 
     return (
-        entry
+        signal["price"]
         -
         exit_price
     ) / risk
 
 
 # ============================================================
-# PERFORMANCE
+# UPDATE PERFORMANCE
 # ============================================================
 
 def update_history(
@@ -2261,9 +2300,7 @@ def update_history(
 
         if result == "WIN":
 
-            trade_history[
-                "wins"
-            ] += 1
+            trade_history["wins"] += 1
 
             trade_history[
                 "gross_profit_r"
@@ -2274,9 +2311,7 @@ def update_history(
 
         elif result == "LOSS":
 
-            trade_history[
-                "losses"
-            ] += 1
+            trade_history["losses"] += 1
 
             trade_history[
                 "gross_loss_r"
@@ -2316,15 +2351,12 @@ def update_history(
             trade_history[
                 "win_rate"
             ] = round(
-
                 (
                     trade_history["wins"]
                     /
                     decisive
                 )
-                *
-                100,
-
+                * 100,
                 2
             )
 
@@ -2353,7 +2385,7 @@ def update_history(
 
 
 # ============================================================
-# MONITOR TRADES
+# MONITOR ACTIVE TRADES
 # ============================================================
 
 def monitor_active_trades():
@@ -2372,11 +2404,10 @@ def monitor_active_trades():
 
                 market = get_market_data(
                     asset,
-                    30
+                    40
                 )
 
                 if not market:
-
                     continue
 
                 highs = market["highs"]
@@ -2384,14 +2415,13 @@ def monitor_active_trades():
                 closes = market["closes"]
 
                 if not closes:
-
                     continue
 
                 current_price = closes[-1]
                 current_high = highs[-1]
                 current_low = lows[-1]
 
-                atr_values = atr(
+                atr_values = calculate_atr(
                     highs,
                     lows,
                     closes,
@@ -2419,9 +2449,7 @@ def monitor_active_trades():
                 )
 
                 is_buy = (
-                    signal["action"]
-                    ==
-                    "BUY"
+                    signal["action"] == "BUY"
                 )
 
                 if is_buy:
@@ -2457,19 +2485,20 @@ def monitor_active_trades():
                     or
                     sl_hit
                 ):
-
                     continue
 
-                # Conservative handling:
-                # if both TP and SL are touched
-                # in same candle, count as LOSS.
+                # Conservative:
+                # same candle touches TP + SL
+                # = LOSS.
                 if (
                     tp_hit
                     and
                     sl_hit
                 ):
 
-                    exit_price = signal["sl"]
+                    exit_price = (
+                        signal["sl"]
+                    )
 
                     result = "LOSS"
 
@@ -2480,7 +2509,9 @@ def monitor_active_trades():
 
                 elif tp_hit:
 
-                    exit_price = signal["tp"]
+                    exit_price = (
+                        signal["tp"]
+                    )
 
                     result = "WIN"
 
@@ -2490,9 +2521,11 @@ def monitor_active_trades():
 
                 else:
 
-                    exit_price = signal["sl"]
+                    exit_price = (
+                        signal["sl"]
+                    )
 
-                    r_value = result_r(
+                    r_value = calculate_result_r(
                         signal,
                         exit_price
                     )
@@ -2508,8 +2541,7 @@ def monitor_active_trades():
                         result = "BREAKEVEN"
 
                         status = (
-                            "🛡️ RISK-FREE "
-                            "BREAK-EVEN"
+                            "🛡️ BREAK-EVEN"
                         )
 
                     else:
@@ -2517,10 +2549,10 @@ def monitor_active_trades():
                         result = "LOSS"
 
                         status = (
-                            "❌ STOP LOSS HIT"
+                            "❌ STOP LOSS"
                         )
 
-                r_value = result_r(
+                r_value = calculate_result_r(
                     signal,
                     exit_price
                 )
@@ -2548,31 +2580,24 @@ def monitor_active_trades():
                 )
 
                 reply_markup = {
-
                     "inline_keyboard": [
-
                         [
-
                             {
                                 "text":
                                     "📈 TradingView Chart",
-
                                 "url":
                                     chart_link
                             }
-
                         ]
                     ]
                 }
 
                 message = (
 
-                    "🎯 *5M TRADE RESULT*\n"
+                    "🎯 *5M SCALPING RESULT*\n"
                     "━━━━━━━━━━━━━━━━━━\n"
 
-                    f"💹 Asset: "
-                    f"*{signal['asset']}*\n"
-
+                    f"💹 *{signal['asset']}*\n"
                     f"📊 Pattern: "
                     f"`{signal['pattern']}`\n\n"
 
@@ -2648,7 +2673,7 @@ def monitor_active_trades():
 
 
 # ============================================================
-# AUTO SCANNER
+# SCANNER
 # ============================================================
 
 def continuous_auto_scanner():
@@ -2693,7 +2718,7 @@ def home():
     return jsonify({
 
         "status":
-            "Quality 5M Scalping Bot Active",
+            "5M Scalping Bot Active",
 
         "assets": [
             "PAXGUSD",
@@ -2703,29 +2728,20 @@ def home():
         "timeframe":
             "5M",
 
-        "minimum_score":
-            MIN_SIGNAL_SCORE,
-
-        "features": [
+        "filters": [
 
             "EMA 9/21",
             "RSI",
+            "ADX",
             "ATR",
-            "Volume",
+            "Relative Volume",
             "Breakout",
-            "Double Top",
-            "Double Bottom",
-            "Triple Top",
-            "Triple Bottom",
-            "Head & Shoulders",
-            "Inverse Head & Shoulders",
-            "Trend Structure",
-            "Market Regime",
+            "Retest",
+            "Candle Confirmation",
+            "Chart Patterns",
+            "Choppy Market Filter",
             "Break Even",
-            "Trailing Stop",
-            "Coinbase Cache",
-            "429 Protection",
-            "Telegram Alerts"
+            "Trailing Stop"
         ]
     })
 
@@ -2785,35 +2801,32 @@ def health():
                 TELEGRAM_BOT_TOKEN
             ),
 
-        "active_signals":
-            len(active_signals),
-
         "assets": [
             "PAXGUSD",
             "BTCUSD"
         ],
 
         "timeframe":
-            "5M"
+            "5M",
+
+        "active_signals":
+            len(active_signals)
     })
 
 
 # ============================================================
-# BACKGROUND THREADS
+# START THREADS
 # ============================================================
 
-scanner_thread = threading.Thread(
+threading.Thread(
     target=continuous_auto_scanner,
     daemon=True
-)
+).start()
 
-monitor_thread = threading.Thread(
+threading.Thread(
     target=monitor_active_trades,
     daemon=True
-)
-
-scanner_thread.start()
-monitor_thread.start()
+).start()
 
 
 # ============================================================
