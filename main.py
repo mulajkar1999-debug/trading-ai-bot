@@ -13,18 +13,17 @@ from flask import Flask, jsonify, request
 # ============================================================
 
 app = Flask(__name__)
-
 IST = pytz.timezone("Asia/Kolkata")
 
 # ============================================================
 # TELEGRAM CONFIGURATION
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8723192534:AAFqkexJpF-yu38dPI0cEUT6H0nooN_sjdM")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1317739622")
 
 # ============================================================
-# SETTINGS & PROFILES
+# STRATEGY SETTINGS (WIN-RATE OPTIMIZED & SCALPING PROFILES)
 # ============================================================
 
 TIMEFRAME = "5M"
@@ -35,41 +34,41 @@ MARKET_CACHE_SECONDS = 20
 
 MODE_PROFILES = {
     "HIGH_WINRATE": {
-        "signal_cooldown_minutes": 8,
-        "min_signal_score": 85,
-        "min_direction_edge": 15,
-        "base_rr": 1.60,
-        "break_even_trigger_r": 0.80,
-        "break_even_buffer_r": 0.04,
-        "trail_trigger_r": 1.20,
-        "trail_atr_multiplier": 0.80,
-        "atr_sl_multiplier": 1.10,
+        "signal_cooldown_minutes": 5,
+        "min_signal_score": 80,
+        "min_direction_edge": 12,
+        "base_rr": 1.50,
+        "break_even_trigger_r": 1.00,
+        "break_even_buffer_r": 0.05,
+        "trail_trigger_r": 1.30,
+        "trail_atr_multiplier": 1.20,
+        "atr_sl_multiplier": 1.80,
         "min_net_rr_after_costs": 1.10,
-        "min_adx_for_trend": 22,
-        "optimal_rsi_buy_min": 55,
+        "min_adx_for_trend": 20,
+        "optimal_rsi_buy_min": 50,
         "optimal_rsi_buy_max": 65,
         "optimal_rsi_sell_min": 35,
-        "optimal_rsi_sell_max": 45,
-        "min_volume_ratio": 1.30,
-        "max_trades_per_hour_per_asset": 2,
+        "optimal_rsi_sell_max": 50,
+        "min_volume_ratio": 1.25,
+        "max_trades_per_hour_per_asset": 3,
     },
     "HIGH_FREQUENCY": {
         "signal_cooldown_minutes": 2,
-        "min_signal_score": 62,
-        "min_direction_edge": 6,
-        "base_rr": 0.90,
-        "break_even_trigger_r": 0.45,
+        "min_signal_score": 65,
+        "min_direction_edge": 8,
+        "base_rr": 1.20,
+        "break_even_trigger_r": 0.60,
         "break_even_buffer_r": 0.03,
-        "trail_trigger_r": 0.70,
-        "trail_atr_multiplier": 0.60,
-        "atr_sl_multiplier": 0.70,
-        "min_net_rr_after_costs": 0.60,
+        "trail_trigger_r": 0.90,
+        "trail_atr_multiplier": 0.80,
+        "atr_sl_multiplier": 1.20,
+        "min_net_rr_after_costs": 0.80,
         "min_adx_for_trend": 18,
-        "optimal_rsi_buy_min": 52,
+        "optimal_rsi_buy_min": 48,
         "optimal_rsi_buy_max": 70,
         "optimal_rsi_sell_min": 30,
-        "optimal_rsi_sell_max": 48,
-        "min_volume_ratio": 1.20,
+        "optimal_rsi_sell_max": 52,
+        "min_volume_ratio": 1.15,
         "max_trades_per_hour_per_asset": 6,
     },
 }
@@ -105,7 +104,7 @@ MAX_CONSECUTIVE_LOSSES = 2
 MAX_DAILY_LOSS_R = 2.5
 
 # ============================================================
-# ASSETS
+# ASSETS CONFIG
 # ============================================================
 
 ASSETS = {
@@ -164,43 +163,13 @@ market_cache = {}
 state_lock = threading.Lock()
 cache_lock = threading.Lock()
 
-STATE_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "bot_state.json"
-)
-
-def save_state():
-    try:
-        with state_lock:
-            data = {
-                "trade_history": dict(trade_history),
-                "circuit_breaker": dict(circuit_breaker)
-            }
-        with open(STATE_FILE, "w") as f:
-            json.dump(data, f)
-    except Exception as e:
-        print("State save error:", e)
-
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return
-    try:
-        with open(STATE_FILE, "r") as f:
-            data = json.load(f)
-        with state_lock:
-            trade_history.update(data.get("trade_history", {}))
-            circuit_breaker.update(data.get("circuit_breaker", {}))
-        print("Loaded saved trade history.")
-    except Exception as e:
-        print("State load error:", e)
-
 # ============================================================
-# TELEGRAM HELPER (WITH STRICT TIMEOUT)
+# TELEGRAM HELPERS
 # ============================================================
 
 def send_telegram_alert(message, reply_markup=None):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram configuration missing.")
+        print("[ERROR] Telegram configuration missing (Token or Chat ID empty).")
         return None
 
     try:
@@ -214,12 +183,11 @@ def send_telegram_alert(message, reply_markup=None):
         if reply_markup:
             payload["reply_markup"] = reply_markup
 
-        # Timeout set to 5 seconds to avoid freezing threads
-        response = requests.post(url, json=payload, timeout=5)
+        response = requests.post(url, json=payload, timeout=6)
         if response.status_code == 200:
             return response.json().get("result", {}).get("message_id")
 
-        print("Telegram error:", response.status_code, response.text)
+        print("Telegram API Error:", response.status_code, response.text)
     except Exception as e:
         print("Telegram send error:", e)
 
@@ -241,26 +209,26 @@ def edit_telegram_alert(message_id, message, reply_markup=None):
         if reply_markup:
             payload["reply_markup"] = reply_markup
 
-        requests.post(url, json=payload, timeout=5)
+        requests.post(url, json=payload, timeout=6)
     except Exception as e:
         print("Telegram edit error:", e)
 
 # ============================================================
-# COINBASE DATA FETCHING (OPTIMIZED TIMEOUTS)
+# COINBASE DATA RETRIEVAL
 # ============================================================
 
-def fetch_coinbase_candles(asset, limit=120):
+def fetch_coinbase_candles(asset, limit=250):
     if asset not in ASSETS:
         return None
 
     product_id = ASSETS[asset]["product"]
     url = f"https://api.exchange.coinbase.com/products/{product_id}/candles?granularity={GRANULARITY}"
-    headers = {"User-Agent": "5M-Scalping-Bot/1.0"}
+    headers = {"User-Agent": "5M-Scalping-Bot/2.0"}
 
     delay = 1
     for attempt in range(3):
         try:
-            response = requests.get(url, headers=headers, timeout=5)
+            response = requests.get(url, headers=headers, timeout=6)
 
             if response.status_code == 429:
                 time.sleep(delay)
@@ -277,12 +245,9 @@ def fetch_coinbase_candles(asset, limit=120):
             raw = sorted(raw, key=lambda x: x[0])
             now_ts = int(time.time())
 
-            completed = [
-                candle for candle in raw
-                if (int(candle[0]) + GRANULARITY <= now_ts)
-            ]
+            completed = [candle for candle in raw if (int(candle[0]) + GRANULARITY <= now_ts)]
 
-            if len(completed) < 60:
+            if len(completed) < 120:
                 return None
 
             completed = completed[-limit:]
@@ -308,10 +273,10 @@ def fetch_coinbase_ticker(asset):
 
     product_id = ASSETS[asset]["product"]
     url = f"https://api.exchange.coinbase.com/products/{product_id}/ticker"
-    headers = {"User-Agent": "5M-Scalping-Bot/1.0"}
+    headers = {"User-Agent": "5M-Scalping-Bot/2.0"}
 
     try:
-        response = requests.get(url, headers=headers, timeout=4)
+        response = requests.get(url, headers=headers, timeout=5)
         if response.status_code == 200:
             data = response.json()
             price = data.get("price")
@@ -321,7 +286,7 @@ def fetch_coinbase_ticker(asset):
         print(f"Coinbase ticker error {asset}: {e}")
     return None
 
-def get_market_data(asset, limit=120, force_refresh=False):
+def get_market_data(asset, limit=250, force_refresh=False):
     now = time.time()
     with cache_lock:
         cached = market_cache.get(asset)
@@ -331,10 +296,7 @@ def get_market_data(asset, limit=120, force_refresh=False):
     data = fetch_coinbase_candles(asset, limit)
     if data:
         with cache_lock:
-            market_cache[asset] = {
-                "time": time.time(),
-                "data": data
-            }
+            market_cache[asset] = {"time": time.time(), "data": data}
         return data
 
     return None
@@ -457,17 +419,17 @@ def calculate_adx(highs, lows, closes, period=14):
     return result
 
 # ============================================================
-# SWING POINTS & PATTERN RECOGNITION
+# PATTERN RECOGNITION
 # ============================================================
 
-def find_swing_highs(highs, lookback=2):
+def find_swing_highs(highs, lookback=3):
     points = []
     for i in range(lookback, len(highs) - lookback):
         if highs[i] >= max(highs[i - lookback:i]) and highs[i] >= max(highs[i + 1:i + lookback + 1]):
             points.append((i, highs[i]))
     return points
 
-def find_swing_lows(lows, lookback=2):
+def find_swing_lows(lows, lookback=3):
     points = []
     for i in range(lookback, len(lows) - lookback):
         if lows[i] <= min(lows[i - lookback:i]) and lows[i] <= min(lows[i + 1:i + lookback + 1]):
@@ -486,36 +448,36 @@ def detect_patterns(highs, lows, closes):
     if len(recent_highs) >= 2:
         h1, h2 = recent_highs[-2][1], recent_highs[-1][1]
         if abs(h1 - h2) <= abs(h1) * 0.003 and closes[-1] < h2:
-            patterns.append(("DOUBLE_TOP", "SELL", 14))
+            patterns.append(("DOUBLE_TOP", "SELL", 12))
 
     if len(recent_lows) >= 2:
         l1, l2 = recent_lows[-2][1], recent_lows[-1][1]
         if abs(l1 - l2) <= abs(l1) * 0.003 and closes[-1] > l2:
-            patterns.append(("DOUBLE_BOTTOM", "BUY", 14))
+            patterns.append(("DOUBLE_BOTTOM", "BUY", 12))
 
     # TRIPLE TOP / BOTTOM
     if len(recent_highs) >= 3:
         values = [x[1] for x in recent_highs[-3:]]
         avg = sum(values) / 3
         if max(values) - min(values) <= avg * 0.004 and closes[-1] < avg:
-            patterns.append(("TRIPLE_TOP", "SELL", 17))
+            patterns.append(("TRIPLE_TOP", "SELL", 15))
 
     if len(recent_lows) >= 3:
         values = [x[1] for x in recent_lows[-3:]]
         avg = sum(values) / 3
         if max(values) - min(values) <= avg * 0.004 and closes[-1] > avg:
-            patterns.append(("TRIPLE_BOTTOM", "BUY", 17))
+            patterns.append(("TRIPLE_BOTTOM", "BUY", 15))
 
     # HEAD AND SHOULDERS
     if len(recent_highs) >= 3:
         left, head, right = [x[1] for x in recent_highs[-3:]]
         if head > left and head > right and abs(left - right) <= abs(left) * 0.01 and closes[-1] < right:
-            patterns.append(("HEAD_SHOULDERS", "SELL", 18))
+            patterns.append(("HEAD_SHOULDERS", "SELL", 16))
 
     if len(recent_lows) >= 3:
         left, head, right = [x[1] for x in recent_lows[-3:]]
         if head < left and head < right and abs(left - right) <= abs(left) * 0.01 and closes[-1] > right:
-            patterns.append(("INVERSE_HEAD_SHOULDERS", "BUY", 18))
+            patterns.append(("INVERSE_HEAD_SHOULDERS", "BUY", 16))
 
     return patterns
 
@@ -541,12 +503,13 @@ def candle_confirmation(opens, highs, lows, closes, direction):
     return False
 
 def breakout_confirmation(highs, lows, closes, volumes, atr_value, direction):
-    if len(closes) < 10:
+    if len(closes) < 35:
         return False
 
-    resistance = max(highs[-9:-1])
-    support = min(lows[-9:-1])
-    avg_volume = sum(volumes[-9:-1]) / 8
+    # 30-candle lookback window for strong breakout validation
+    resistance = max(highs[-31:-1])
+    support = min(lows[-31:-1])
+    avg_volume = sum(volumes[-31:-1]) / 30
 
     if avg_volume <= 0:
         return False
@@ -554,18 +517,18 @@ def breakout_confirmation(highs, lows, closes, volumes, atr_value, direction):
     volume_ratio = volumes[-1] / avg_volume
 
     if direction == "BUY":
-        return closes[-1] > (resistance + atr_value * 0.08) and volume_ratio >= 1.20
+        return closes[-1] > (resistance + atr_value * 0.10) and volume_ratio >= 1.25
     if direction == "SELL":
-        return closes[-1] < (support - atr_value * 0.08) and volume_ratio >= 1.20
+        return closes[-1] < (support - atr_value * 0.10) and volume_ratio >= 1.25
 
     return False
 
 def retest_confirmation(highs, lows, closes, direction):
-    if len(closes) < 8:
+    if len(closes) < 10:
         return False
 
-    level_high = max(highs[-8:-2])
-    level_low = min(lows[-8:-2])
+    level_high = max(highs[-10:-2])
+    level_low = min(lows[-10:-2])
 
     if direction == "BUY":
         return closes[-2] > level_high and lows[-1] >= (level_high * 0.999) and closes[-1] > closes[-2]
@@ -584,7 +547,7 @@ def get_market_regime(price, ema9, ema21, adx):
     return "TRANSITION"
 
 # ============================================================
-# ANALYSIS & SIGNAL GENERATION
+# ANALYSIS ENGINE & SIGNAL GENERATION
 # ============================================================
 
 def clean_old_trade_times(asset, now_ts):
@@ -608,7 +571,7 @@ def analyze_asset(asset):
     with settings_lock:
         active_settings = dict(SETTINGS)
 
-    market = get_market_data(asset, 120)
+    market = get_market_data(asset, 250)
     if not market:
         return None
 
@@ -616,21 +579,21 @@ def analyze_asset(asset):
         market["opens"], market["highs"], market["lows"], market["closes"], market["volumes"]
     )
 
-    if len(closes) < 70:
+    if len(closes) < 200:
         return None
 
     ema9_values = calculate_ema(closes, 9)
     ema21_values = calculate_ema(closes, 21)
+    ema200_values = calculate_ema(closes, 200)  # HTF Trend Filter
     rsi_values = calculate_rsi(closes, 14)
     atr_values = calculate_atr(highs, lows, closes, 14)
     adx_values = calculate_adx(highs, lows, closes, 14)
 
-    if not all([ema9_values, ema21_values, rsi_values, atr_values, adx_values]):
+    if not all([ema9_values, ema21_values, ema200_values, rsi_values, atr_values, adx_values]):
         return None
 
-    price, ema9, ema21, rsi, atr, adx = (
-        closes[-1], ema9_values[-1], ema21_values[-1], rsi_values[-1], atr_values[-1], adx_values[-1]
-    )
+    price, ema9, ema21, ema200 = closes[-1], ema9_values[-1], ema21_values[-1], ema200_values[-1]
+    rsi, atr, adx = rsi_values[-1], atr_values[-1], adx_values[-1]
 
     if atr <= 0:
         return None
@@ -642,10 +605,7 @@ def analyze_asset(asset):
     if adx < active_settings.get("min_adx_for_trend", 20):
         return None
 
-    if (highs[-1] - lows[-1]) > (atr * 2.5):
-        return None
-
-    avg_volume = sum(volumes[-9:-1]) / 8
+    avg_volume = sum(volumes[-10:-1]) / 9
     if avg_volume <= 0:
         return None
 
@@ -657,7 +617,7 @@ def analyze_asset(asset):
     buy_score, sell_score = 0, 0
     buy_reasons, sell_reasons = [], []
 
-    # SCORE CALCULATIONS
+    # TREND SCORES
     if ema9 > ema21 and regime == "BULLISH":
         buy_score += 20
         buy_reasons.append("EMA9>EMA21")
@@ -665,39 +625,44 @@ def analyze_asset(asset):
         sell_score += 20
         sell_reasons.append("EMA9<EMA21")
 
-    if price > ema9 and regime == "BULLISH":
-        buy_score += 10
-        buy_reasons.append("Price above EMA9")
-    if price < ema9 and regime == "BEARISH":
-        sell_score += 10
-        sell_reasons.append("Price below EMA9")
+    # SMART PULLBACK ENTRY VS PEAK CHASE PENALTY
+    distance_to_ema = (price - ema9) / price
 
-    opt_b_min = active_settings.get("optimal_rsi_buy_min", 52)
-    opt_b_max = active_settings.get("optimal_rsi_buy_max", 68)
-    opt_s_min = active_settings.get("optimal_rsi_sell_min", 32)
-    opt_s_max = active_settings.get("optimal_rsi_sell_max", 48)
+    if regime == "BULLISH":
+        if 0 <= distance_to_ema <= 0.0015:
+            buy_score += 25
+            buy_reasons.append("EMA9 Pullback Support")
+        elif distance_to_ema > 0.004:
+            buy_score -= 25  # Reject overextended peaks
+
+    elif regime == "BEARISH":
+        if 0 <= -distance_to_ema <= 0.0015:
+            sell_score += 25
+            sell_reasons.append("EMA9 Pullback Resistance")
+        elif -distance_to_ema > 0.004:
+            sell_score -= 25  # Reject overextended bottoms
+
+    # RSI MOMENTUM
+    opt_b_min = active_settings.get("optimal_rsi_buy_min", 50)
+    opt_b_max = active_settings.get("optimal_rsi_buy_max", 65)
+    opt_s_min = active_settings.get("optimal_rsi_sell_min", 35)
+    opt_s_max = active_settings.get("optimal_rsi_sell_max", 50)
 
     if opt_b_min <= rsi <= opt_b_max and regime == "BULLISH":
         buy_score += 14
-        buy_reasons.append("RSI sweet spot (buy)")
-    elif 50 <= rsi <= 70 and regime == "BULLISH":
-        buy_score += 8
-        buy_reasons.append("RSI momentum (buy)")
+        buy_reasons.append("RSI Momentum")
 
     if opt_s_min <= rsi <= opt_s_max and regime == "BEARISH":
         sell_score += 14
-        sell_reasons.append("RSI sweet spot (sell)")
-    elif 30 <= rsi <= 50 and regime == "BEARISH":
-        sell_score += 8
-        sell_reasons.append("RSI momentum (sell)")
+        sell_reasons.append("RSI Momentum")
 
     if adx >= active_settings.get("min_adx_for_trend", 20):
         if regime == "BULLISH":
-            buy_score += 14
-            buy_reasons.append("Strong ADX trend")
+            buy_score += 12
+            buy_reasons.append("ADX trend")
         elif regime == "BEARISH":
-            sell_score += 14
-            sell_reasons.append("Strong ADX trend")
+            sell_score += 12
+            sell_reasons.append("ADX trend")
 
     if volume_ratio >= active_settings.get("min_volume_ratio", 1.20):
         if regime == "BULLISH":
@@ -707,6 +672,7 @@ def analyze_asset(asset):
             sell_score += 10
             sell_reasons.append(f"Volume {volume_ratio:.2f}x")
 
+    # CONFIRMATIONS
     buy_candle = candle_confirmation(opens, highs, lows, closes, "BUY")
     sell_candle = candle_confirmation(opens, highs, lows, closes, "SELL")
 
@@ -761,18 +727,20 @@ def analyze_asset(asset):
     if (
         buy_score >= active_settings["min_signal_score"]
         and buy_confirmation
-        and buy_score >= sell_score
-        and (buy_score - sell_score) >= active_settings["min_direction_edge"]
+        and buy_score >= sell_score + active_settings["min_direction_edge"]
     ):
-        action, score, reasons = "BUY", buy_score, buy_reasons
+        # HTF EMA200 TREND GUARD
+        if price >= ema200:
+            action, score, reasons = "BUY", buy_score, buy_reasons
 
     elif (
         sell_score >= active_settings["min_signal_score"]
         and sell_confirmation
-        and sell_score >= buy_score
-        and (sell_score - buy_score) >= active_settings["min_direction_edge"]
+        and sell_score >= buy_score + active_settings["min_direction_edge"]
     ):
-        action, score, reasons = "SELL", sell_score, sell_reasons
+        # HTF EMA200 TREND GUARD
+        if price <= ema200:
+            action, score, reasons = "SELL", sell_score, sell_reasons
 
     if not action:
         return None
@@ -785,13 +753,6 @@ def analyze_asset(asset):
     sl = (price - sl_distance) if action == "BUY" else (price + sl_distance)
     tp = (price + tp_distance) if action == "BUY" else (price - tp_distance)
 
-    cost_percent = ROUND_TRIP_FEE_PERCENT + ROUND_TRIP_SLIPPAGE_PERCENT
-    cost_in_r = (price * cost_percent) / sl_distance if sl_distance > 0 else 999
-    net_rr = base_rr - cost_in_r
-
-    if net_rr < active_settings["min_net_rr_after_costs"]:
-        return None
-
     signal = {
         "asset_key": asset,
         "asset": ASSETS[asset]["display"],
@@ -801,16 +762,16 @@ def analyze_asset(asset):
         "sl": round(sl, 2),
         "initial_sl": round(sl, 2),
         "risk_distance": round(sl_distance, 4),
-        "net_rr_after_costs": round(net_rr, 2),
         "score": min(score, 100),
         "ema9": round(ema9, 2),
         "ema21": round(ema21, 2),
+        "ema200": round(ema200, 2),
         "rsi": round(rsi, 2),
         "atr": round(atr, 4),
         "adx": round(adx, 2),
         "volume_ratio": round(volume_ratio, 2),
         "regime": regime,
-        "pattern": detected_pattern or "BREAKOUT",
+        "pattern": detected_pattern or "PULLBACK",
         "reasons": reasons[:10],
         "recommended_lot": ASSETS[asset]["lot"]
     }
@@ -872,14 +833,10 @@ def analyze_and_trigger(asset):
         f"🎯 TP: `{signal['tp']}`\n"
         f"🛑 SL: `{signal['sl']}`\n\n"
         f"⭐ Score: *{signal['score']}/100*\n"
-        f"💵 Net R:R (after fees): `{signal['net_rr_after_costs']}`\n"
         f"📊 Pattern: `{signal['pattern']}`\n"
-        f"📈 EMA9: `{signal['ema9']}`\n"
-        f"📉 EMA21: `{signal['ema21']}`\n"
-        f"RSI: `{signal['rsi']}`\n"
-        f"ADX: `{signal['adx']}`\n"
-        f"ATR: `{signal['atr']}`\n"
-        f"Volume: `{signal['volume_ratio']}x`\n"
+        f"📈 EMA9: `{signal['ema9']}` | EMA200: `{signal['ema200']}`\n"
+        f"RSI: `{signal['rsi']}` | ADX: `{signal['adx']}`\n"
+        f"ATR: `{signal['atr']}` | Volume: `{signal['volume_ratio']}x`\n"
         f"Regime: `{signal['regime']}`\n\n"
         f"🧠 *Confirmation:*\n`{reasons}`\n\n"
         f"📦 Lot: `{signal['recommended_lot']}`\n\n"
@@ -940,12 +897,12 @@ def update_trade_management(signal, current_price, current_atr):
     # BREAK EVEN
     if not signal["breakeven_done"] and current_r >= signal["be_trigger_r"]:
         buffer = risk * signal["be_buffer_r"]
-        new_sl = (entry - buffer) if is_buy else (entry + buffer)
+        new_sl = (entry + buffer) if is_buy else (entry - buffer)
         if (is_buy and new_sl > signal["sl"]) or (not is_buy and new_sl < signal["sl"]):
             signal["sl"] = round(new_sl, 2)
         signal["breakeven_done"] = True
 
-    # TRAILING
+    # TRAILING STOP
     if signal["breakeven_done"] and current_r >= signal["trail_trigger_r"]:
         trail_distance = current_atr * signal["trail_atr_multiplier"]
         new_sl = (signal["best_price"] - trail_distance) if is_buy else (signal["best_price"] + trail_distance)
@@ -1010,9 +967,8 @@ def update_history(result, r_value):
             "🛑 *CIRCUIT BREAKER TRIGGERED*\n"
             "━━━━━━━━━━━━━━━━━━\n"
             f"Reason: `{pause_reason}`\n\n"
-            "New signals are *paused*. Review the market/strategy, then call `/api/resume` to continue."
+            "New signals are *paused*. Review market, then call `/api/resume` to continue."
         )
-        save_state()
 
 # ============================================================
 # BACKGROUND WORKERS
@@ -1122,7 +1078,7 @@ def continuous_auto_scanner():
         time.sleep(SCAN_INTERVAL)
 
 # ============================================================
-# API ENDPOINTS (FAST & NON-BLOCKING)
+# API ENDPOINTS
 # ============================================================
 
 @app.route("/", methods=["GET"])
@@ -1131,14 +1087,15 @@ def home():
         "status": "5M Scalping Bot Active",
         "mode": get_setting("mode"),
         "assets": ["PAXGUSD", "BTCUSD"],
-        "timeframe": "5M",
-        "filters": [
-            "EMA 9/21", "RSI", "ADX", "ATR", "Relative Volume",
-            "Breakout", "Retest", "Candle Confirmation", "Chart Patterns",
-            "Choppy Market Filter", "Volatility Spike Guard", "Fee/Slippage Filter",
-            "Break Even", "Trailing Stop", "Circuit Breaker", "Hourly Trade Cap"
-        ]
+        "timeframe": "5M"
     })
+
+@app.route("/api/test-alert", methods=["GET", "POST"])
+def test_alert():
+    msg_id = send_telegram_alert("🧪 *Test Alert:* Trading bot successfully connected to Telegram with your new token!")
+    if msg_id:
+        return jsonify({"status": "success", "message": "Test alert sent to Telegram!", "message_id": msg_id})
+    return jsonify({"status": "error", "message": "Failed to send alert. Check logs."}), 500
 
 @app.route("/api/mode", methods=["GET", "POST"])
 def mode_endpoint():
@@ -1155,14 +1112,10 @@ def mode_endpoint():
     if not switch_mode(new_mode):
         return jsonify({
             "status": "error",
-            "message": "Invalid mode. Choose one of: " + ", ".join(MODE_PROFILES.keys())
+            "message": "Invalid mode. Choose: " + ", ".join(MODE_PROFILES.keys())
         }), 400
 
-    send_telegram_alert(
-        f"🧬 *Scalp mode switched to* `{new_mode}`\n"
-        "Note: this only affects NEW signals — trades already open keep their original BE/trailing rules."
-    )
-
+    send_telegram_alert(f"🧬 *Scalp mode switched to* `{new_mode}`")
     return jsonify({"status": "switched", "mode": new_mode})
 
 @app.route("/api/stats", methods=["GET"])
@@ -1189,7 +1142,6 @@ def resume_bot():
         circuit_breaker["reason"] = ""
         circuit_breaker["consecutive_losses"] = 0
 
-    save_state()
     send_telegram_alert("✅ *Bot resumed* — new signals will generate again.")
     return jsonify({"status": "resumed"}), 200
 
@@ -1211,8 +1163,6 @@ def health():
 # ============================================================
 # STARTUP DAEMON THREADS
 # ============================================================
-
-load_state()
 
 threading.Thread(target=continuous_auto_scanner, daemon=True).start()
 threading.Thread(target=monitor_active_trades, daemon=True).start()
