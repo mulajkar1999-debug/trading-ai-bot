@@ -1,7 +1,7 @@
+from datetime import datetime
 import os
 import threading
 import time
-from datetime import datetime
 from flask import Flask, jsonify, render_template_string
 import requests
 
@@ -50,12 +50,12 @@ market_pairs = {
 }
 
 # ==========================================
-# 3. TELEGRAM SENDER & TRADE RESULT LOGIC
+# 3. TELEGRAM SENDER WITH PRO TEMPLATES
 # ==========================================
+
+
 def send_telegram_message(message_text, signal_type=None):
-    """
-    Telegram par message bhejta hai aur /api/stats + Dashboard ke liye memory me save karta hai.
-    """
+    """Telegram par formatted message bhejta hai aur stats memory me save karta hai."""
     timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
 
     # 1. Telegram API Request
@@ -70,46 +70,87 @@ def send_telegram_message(message_text, signal_type=None):
     except Exception as e:
         print(f"Telegram Error: {e}")
 
-    # 2. Memory me save karein
-    msg_entry = {
-        "timestamp": timestamp_str,
-        "message": message_text
-    }
+    # 2. Save in memory for Web / API
+    msg_entry = {"timestamp": timestamp_str, "message": message_text}
     recent_telegram_messages.insert(0, msg_entry)
 
     if len(recent_telegram_messages) > MAX_MESSAGE_HISTORY:
         recent_telegram_messages.pop()
 
-    # 3. Win / Loss & Signal stats update
+    # 3. Stats update
     bot_stats["total_signals"] += 1
 
-    if signal_type == "WIN":
+    if signal_type == "WIN" or "TRADE RESULT: WIN" in message_text:
         bot_stats["wins"] += 1
-    elif signal_type == "LOSS":
+    elif signal_type == "LOSS" or "TRADE RESULT: LOSS" in message_text:
         bot_stats["losses"] += 1
-    elif "TP Hit" in message_text or "(WIN)" in message_text:
-        bot_stats["wins"] += 1
-    elif "SL Hit" in message_text or "(LOSS)" in message_text:
-        bot_stats["losses"] += 1
+
+
+# --- HELPER FUNCTIONS FOR CUSTOM TEMPLATES ---
+def send_win_alert(
+    asset, direction, tp_level, entry_price, exit_price, profit_rr
+):
+    """Sends professional Win Alert to Telegram"""
+    time_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
+    msg = (
+        f"🎯 <b>TRADE RESULT: WIN 🟢</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📍 <b>Asset:</b> {asset} ({direction})\n"
+        f"🎉 <b>Status:</b> {tp_level} Hit!\n"
+        f"🎯 <b>Entry:</b> {entry_price}\n"
+        f"🚀 <b>Exit Price:</b> {exit_price}\n"
+        f"📈 <b>Profit (RR):</b> {profit_rr}\n"
+        f"⏰ <b>Time:</b> {time_now}\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
+    send_telegram_message(msg, signal_type="WIN")
+
+
+def send_loss_alert(asset, direction, entry_price, exit_price):
+    """Sends professional Loss Alert to Telegram"""
+    time_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
+    msg = (
+        f"🛑 <b>TRADE RESULT: LOSS 🔴</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📍 <b>Asset:</b> {asset} ({direction})\n"
+        f"⚠️ <b>Status:</b> Stop Loss (SL) Hit\n"
+        f"🎯 <b>Entry:</b> {entry_price}\n"
+        f"🛑 <b>Exit Price:</b> {exit_price}\n"
+        f"⏰ <b>Time:</b> {time_now}\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
+    send_telegram_message(msg, signal_type="LOSS")
+
 
 # ==========================================
 # 4. BACKGROUND TRADING BOT ENGINE
 # ==========================================
+
+
 def background_trading_scanner():
     print("🚀 Background Trading Scanner Started...")
 
+    # Startup Notification
     startup_msg = (
-        "<b>🟢 Trading AI Bot Started Successfully!</b>\n\n"
-        "Scanning markets for SMC CHOCH & Liquidity setups...\n"
-        "Live logs now available at /api/stats"
+        "🤖 <b>SMC AI TRADING BOT ONLINE</b> 🟢\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "<b>Status:</b> Scanning Markets Active\n"
+        "<b>Strategy:</b> SMC CHOCH & Liquidity Sweeps\n"
+        "<b>Live API:</b> /api/stats\n"
+        "━━━━━━━━━━━━━━━━━━"
     )
     send_telegram_message(startup_msg)
 
     while True:
         try:
-            bot_stats["last_scan"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
+            bot_stats["last_scan"] = datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S IST"
+            )
 
-            # YAHAN AAPKA MARKET SCANNING LOGIC CHALEGA
+            # AAPKA TRADING / SCANNING LOGIC YAHAN CHALEGA
+            # Dynamic Alert Example Calls:
+            # send_win_alert("BTCUSD", "BUY", "Take Profit 1 (TP1)", "65,250.00", "65,925.00", "1:1.5 Risk-to-Reward")
+            # send_loss_alert("XAUUSD", "SELL", "2,450.00", "2,458.00")
 
             time.sleep(60)
 
@@ -117,8 +158,11 @@ def background_trading_scanner():
             print(f"Scanner Loop Error: {e}")
             time.sleep(10)
 
+
 # Start background thread
-scanner_thread = threading.Thread(target=background_trading_scanner, daemon=True)
+scanner_thread = threading.Thread(
+    target=background_trading_scanner, daemon=True
+)
 scanner_thread.start()
 
 # ==========================================
@@ -237,19 +281,25 @@ DASHBOARD_HTML = """
 </html>
 """
 
+
 @app.route("/")
 def home_dashboard():
     return render_template_string(
         DASHBOARD_HTML,
         stats=bot_stats,
         pairs=market_pairs,
-        messages=recent_telegram_messages
+        messages=recent_telegram_messages,
     )
+
 
 @app.route("/api/stats")
 def api_stats():
     total_trades = bot_stats["wins"] + bot_stats["losses"]
-    win_rate = f"{(bot_stats['wins'] / total_trades * 100):.1f}%" if total_trades > 0 else "0%"
+    win_rate = (
+        f"{(bot_stats['wins'] / total_trades * 100):.1f}%"
+        if total_trades > 0
+        else "0%"
+    )
 
     return jsonify({
         "status": bot_stats["status"],
@@ -259,8 +309,9 @@ def api_stats():
         "losses": bot_stats["losses"],
         "win_rate": win_rate,
         "total_messages_stored": len(recent_telegram_messages),
-        "recent_telegram_messages": recent_telegram_messages
+        "recent_telegram_messages": recent_telegram_messages,
     })
+
 
 # ==========================================
 # 6. SERVER STARTUP
