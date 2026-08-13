@@ -9,9 +9,9 @@ app = Flask(__name__)
 # =========================================================
 # ⚙️ CONFIGURATION & TELEGRAM CREDENTIALS
 # =========================================================
-# Yahan apna Telegram Bot Token aur Chat ID daalein:
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID_HERE")
+# Yahan apna REAL Telegram Bot Token aur Chat ID daalein:
+TELEGRAM_BOT_TOKEN = "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ"  # <-- Replace with your Bot Token
+TELEGRAM_CHAT_ID = "123456789"                           # <-- Replace with your Chat ID
 
 # Trading Symbol (Coinbase)
 SYMBOL = "BTC-USD"
@@ -159,8 +159,8 @@ def send_telegram_alert(message):
     """
     Telegram par Alert Message bhejta hai.
     """
-    if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE" or not TELEGRAM_BOT_TOKEN:
-        print("[WARNING] Telegram Bot Token set nahi hai! Alert skip kar diya gaya.")
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ":
+        print("[WARNING] Valid Telegram Bot Token missing! Skipping alert.")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -174,9 +174,9 @@ def send_telegram_alert(message):
         if res.status_code == 200:
             print("[INFO] Telegram alert successfully sent.")
         else:
-            print(f"[ERROR] Telegram API response: {res.status_code} - {res.text}")
+            print(f"[ERROR] Telegram API error: {res.status_code} - {res.text}")
     except Exception as e:
-        print(f"[ERROR] Telegram Alert sending failed: {e}")
+        print(f"[ERROR] Failed to send Telegram alert: {e}")
 
 # ---------------------------------------------------------
 # 4. MAIN ENGINE & ANALYSIS ROUTINE
