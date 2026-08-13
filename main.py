@@ -1,7 +1,7 @@
-from datetime import datetime
 import os
 import threading
 import time
+from datetime import datetime
 from flask import Flask, jsonify, render_template_string
 import requests
 
@@ -52,8 +52,6 @@ market_pairs = {
 # ==========================================
 # 3. TELEGRAM SENDER WITH PRO TEMPLATES
 # ==========================================
-
-
 def send_telegram_message(message_text, signal_type=None):
     """Telegram par formatted message bhejta hai aur stats memory me save karta hai."""
     timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
@@ -86,10 +84,7 @@ def send_telegram_message(message_text, signal_type=None):
         bot_stats["losses"] += 1
 
 
-# --- HELPER FUNCTIONS FOR CUSTOM TEMPLATES ---
-def send_win_alert(
-    asset, direction, tp_level, entry_price, exit_price, profit_rr
-):
+def send_win_alert(asset, direction, tp_level, entry_price, exit_price, profit_rr):
     """Sends professional Win Alert to Telegram"""
     time_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
     msg = (
@@ -125,12 +120,9 @@ def send_loss_alert(asset, direction, entry_price, exit_price):
 # ==========================================
 # 4. BACKGROUND TRADING BOT ENGINE
 # ==========================================
-
-
 def background_trading_scanner():
     print("🚀 Background Trading Scanner Started...")
 
-    # Startup Notification
     startup_msg = (
         "🤖 <b>SMC AI TRADING BOT ONLINE</b> 🟢\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -147,10 +139,7 @@ def background_trading_scanner():
                 "%Y-%m-%d %H:%M:%S IST"
             )
 
-            # AAPKA TRADING / SCANNING LOGIC YAHAN CHALEGA
-            # Dynamic Alert Example Calls:
-            # send_win_alert("BTCUSD", "BUY", "Take Profit 1 (TP1)", "65,250.00", "65,925.00", "1:1.5 Risk-to-Reward")
-            # send_loss_alert("XAUUSD", "SELL", "2,450.00", "2,458.00")
+            # AAPKA TRADING SCANNER LOGIC YAHAN CHALEGA
 
             time.sleep(60)
 
@@ -184,7 +173,7 @@ DASHBOARD_HTML = """
         .container { max-width: 1200px; margin: 0 auto; }
         .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #30363d; padding-bottom: 15px; margin-bottom: 25px; }
         .badge { background: #238636; color: white; padding: 5px 12px; border-radius: 20px; font-size: 14px; font-weight: bold; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 30px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 15px; margin-bottom: 30px; }
         .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 18px; }
         .card h3 { font-size: 12px; color: #8b949e; text-transform: uppercase; margin-bottom: 8px; }
         .card .value { font-size: 22px; font-weight: bold; color: #58a6ff; }
@@ -210,10 +199,15 @@ DASHBOARD_HTML = """
             </div>
         </div>
 
+        <!-- STATS CARDS (INCLUDING TOTAL TRADES) -->
         <div class="grid">
             <div class="card">
                 <h3>Bot Status</h3>
                 <div class="value" style="color:#3fb950;">Active</div>
+            </div>
+            <div class="card">
+                <h3>Total Trades</h3>
+                <div class="value" style="color:#58a6ff;">{{ stats.wins + stats.losses }}</div>
             </div>
             <div class="card">
                 <h3>Total Wins</h3>
@@ -235,7 +229,7 @@ DASHBOARD_HTML = """
             </div>
             <div class="card">
                 <h3>Last Scan</h3>
-                <div class="value" style="font-size:14px; margin-top:5px;">{{ stats.last_scan }}</div>
+                <div class="value" style="font-size:13px; margin-top:5px; color:#c9d1d9;">{{ stats.last_scan }}</div>
             </div>
         </div>
 
@@ -305,6 +299,7 @@ def api_stats():
         "status": bot_stats["status"],
         "bot_started_at": bot_stats["started_at"],
         "last_scan_time": bot_stats["last_scan"],
+        "total_trades": total_trades,
         "wins": bot_stats["wins"],
         "losses": bot_stats["losses"],
         "win_rate": win_rate,
