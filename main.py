@@ -1,268 +1,356 @@
 import os
+import time
+import threading
 import requests
 import pytz
 from datetime import datetime
 from flask import Flask, jsonify
+import yfinance as yf
 
 app = Flask(__name__)
 
 # =========================================================
 # ⚙️ CONFIGURATION & TELEGRAM CREDENTIALS
 # =========================================================
-# Yahan apna REAL Telegram Bot Token aur Chat ID daalein:
 TELEGRAM_BOT_TOKEN = "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ"  # <-- Replace with your Bot Token
 TELEGRAM_CHAT_ID = "123456789"                           # <-- Replace with your Chat ID
 
-# Trading Symbol (Coinbase)
-SYMBOL = "BTC-USD"
+SYMBOLS = {
+    "BTCUSD": "BTC-USD",
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "USDJPY": "JPY=X",
+    "USDCHF": "CHF=X",
+    "XAUUSD": "GC=F"
+}
 
 ist = pytz.timezone('Asia/Kolkata')
+sent_signals = set()
+active_trades = {}  # Active trade tracker for Win/Loss calculation
 
 # ---------------------------------------------------------
-# 1. CANDLE DATA FETCHING (COINBASE API)
+# 1. HELPER & DATA FETCHING
 # ---------------------------------------------------------
-def fetch_coinbase_candles(symbol, granularity=3600):
-    """
-    Coinbase se candles fetch karta hai.
-    Granularity (Seconds): 60 (1M), 300 (5M), 3600 (1H), 14400 (4H), 86400 (1D)
-    """
-    url = f"https://api.exchange.coinbase.com/products/{symbol}/candles?granularity={granularity}"
-    headers = {"Accept": "application/json", "User-Agent": "SMC-Bot/1.0"}
+def format_price(price, ticker):
+    if "JPY" in ticker:
+        return f"{price:.3f}"
+    elif any(f in ticker for f in ["EUR", "GBP", "CHF"]):
+        return f"{price:.5f}"
+    else:
+        return f"{price:.2f}"
+
+def fetch_candles(ticker_symbol, timeframe="1h"):
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            candles = []
-            for item in reversed(data):
-                candles.append({
-                    'time': item[0],
-                    'low': float(item[1]),
-                    'high': float(item[2]),
-                    'open': float(item[3]),
-                    'close': float(item[4])
-                })
-            return candles
+        period = "7d"
+        if timeframe in ['1m', '5m', '15m']:
+            period = "1d"
+        elif timeframe == '1d':
+            period = "60d"
+
+        df = yf.download(tickers=ticker_symbol, period=period, interval=timeframe, progress=False)
+        if df.empty or len(df) < 5:
+            return []
+
+        candles = []
+        for index, row in df.iterrows():
+            candles.append({
+                'time': index,
+                'open': float(row['Open'].iloc[0] if hasattr(row['Open'], 'iloc') else row['Open']),
+                'high': float(row['High'].iloc[0] if hasattr(row['High'], 'iloc') else row['High']),
+                'low': float(row['Low'].iloc[0] if hasattr(row['Low'], 'iloc') else row['Low']),
+                'close': float(row['Close'].iloc[0] if hasattr(row['Close'], 'iloc') else row['Close']),
+            })
+        return candles
     except Exception as e:
-        print(f"Error fetching candles ({granularity}s): {e}")
-    return []
+        return []
 
 # ---------------------------------------------------------
-# 2. SMC CORE LOGIC (2CR, CHOCH, MTF)
+# 2. TRADE LEVEL CALCULATION & CHOCH LOGIC
 # ---------------------------------------------------------
-def check_2cr_retracement(candles, trend):
-    """
-    Two-Candle Retracement (2CR) Logic
-    - Bullish: 2 consecutive red candles (2nd close < 1st low)
-    - Bearish: 2 consecutive green candles (2nd close > 1st high)
-    """
-    if len(candles) < 2:
-        return False
+def calculate_trade_levels(direction, current_price, lsm, lrm, ticker):
+    if direction == 'BULLISH':
+        entry = current_price
+        sl = lsm * 0.9995
+        risk = entry - sl
+        tp1 = entry + (risk * 1.5)
+        tp2 = entry + (risk * 2.5)
+    else:
+        entry = current_price
+        sl = lrm * 1.0005
+        risk = sl - entry
+        tp1 = entry - (risk * 1.5)
+        tp2 = entry - (risk * 2.5)
 
-    c1, c2 = candles[-2], candles[-1]
-
-    if trend == 'BULLISH':
-        if c1['close'] < c1['open'] and c2['close'] < c2['open']:
-            if c2['close'] < c1['low']:
-                return True
-    elif trend == 'BEARISH':
-        if c1['close'] > c1['open'] and c2['close'] > c2['open']:
-            if c2['close'] > c1['high']:
-                return True
-    return False
+    return {
+        "raw_entry": entry,
+        "raw_sl": sl,
+        "raw_tp1": tp1,
+        "raw_tp2": tp2,
+        "entry": format_price(entry, ticker),
+        "sl": format_price(sl, ticker),
+        "tp1": format_price(tp1, ticker),
+        "tp2": format_price(tp2, ticker)
+    }
 
 def check_choch(candles, ref_level, current_trend):
-    """
-    Change of Character (CHOCH) & Fakeout Filter
-    2 consecutive candle closes beyond LSM/LRM is required.
-    """
     if len(candles) < 2:
-        return {'confirmed': False, 'fakeout': False, 'new_trend': current_trend}
+        return {'confirmed': False, 'new_trend': current_trend}
 
     c1, c2 = candles[-2], candles[-1]
 
-    if current_trend == 'BULLISH':  # Check Bearish CHOCH
-        c1_below = c1['close'] < ref_level
-        c2_below = c2['close'] < ref_level
+    if current_trend == 'BULLISH':
+        if c1['close'] < ref_level and c2['close'] < ref_level:
+            return {'confirmed': True, 'new_trend': 'BEARISH'}
 
-        if c1_below and c2_below:
-            return {'confirmed': True, 'fakeout': False, 'new_trend': 'BEARISH'}
-        elif c1_below and not c2_below:
-            return {'confirmed': False, 'fakeout': True, 'new_trend': 'BULLISH'}
+    elif current_trend == 'BEARISH':
+        if c1['close'] > ref_level and c2['close'] > ref_level:
+            return {'confirmed': True, 'new_trend': 'BULLISH'}
 
-    elif current_trend == 'BEARISH':  # Check Bullish CHOCH
-        c1_above = c1['close'] > ref_level
-        c2_above = c2['close'] > ref_level
+    return {'confirmed': False, 'new_trend': current_trend}
 
-        if c1_above and c2_above:
-            return {'confirmed': True, 'fakeout': False, 'new_trend': 'BULLISH'}
-        elif c1_above and not c2_above:
-            return {'confirmed': False, 'fakeout': True, 'new_trend': 'BEARISH'}
-
-    return {'confirmed': False, 'fakeout': False, 'new_trend': current_trend}
-
-def determine_structure_and_trend(candles):
-    """
-    Calculates LSM, LRM, and Trend for a given timeframe.
-    """
-    if len(candles) < 10:
+def determine_trend_and_levels(candles):
+    if len(candles) < 5:
         return {'trend': 'NEUTRAL', 'lsm': None, 'lrm': None}
 
     highs = [c['high'] for c in candles[-10:]]
     lows = [c['low'] for c in candles[-10:]]
 
-    lrm = max(highs)  # Last Resistance in Market
-    lsm = min(lows)   # Last Support in Market
+    lrm = max(highs)
+    lsm = min(lows)
 
     last_close = candles[-1]['close']
     mid = (lrm + lsm) / 2
-
     trend = 'BULLISH' if last_close > mid else 'BEARISH'
 
     return {'trend': trend, 'lsm': lsm, 'lrm': lrm}
 
-def evaluate_mtf_condition(daily_trend, h4_trend, h1_trend):
-    """
-    Multi-Timeframe Decision Matrix (C1, C2, C3)
-    """
-    if daily_trend == h4_trend == h1_trend:
-        return {
-            'condition': 'C1',
-            'trade_tf': '1H',
-            'confirm_tf': '1M',
-            'description': 'All Timeframes Aligned'
-        }
-    elif daily_trend == h4_trend and h1_trend != daily_trend:
-        return {
-            'condition': 'C2',
-            'trade_tf': '4H',
-            'confirm_tf': '5M',
-            'description': '1H Counter-Trend to Daily & 4H'
-        }
-    elif h4_trend == h1_trend and h4_trend != daily_trend:
-        return {
-            'condition': 'C3',
-            'trade_tf': 'Daily',
-            'confirm_tf': '1H',
-            'description': '4H & 1H Counter-Trend to Daily'
-        }
-    return {
-        'condition': 'MIXED',
-        'trade_tf': None,
-        'confirm_tf': None,
-        'description': 'Mixed Market Structure'
-    }
+def evaluate_mtf_matrix(daily_trend, h1_trend):
+    if daily_trend == h1_trend:
+        return {'condition': 'C1', 'confirm_tf': '5m', 'desc': 'Trend Aligned'}
+    else:
+        return {'condition': 'C2/C3', 'confirm_tf': '15m', 'desc': 'Counter Trend Setup'}
 
 # ---------------------------------------------------------
 # 3. TELEGRAM ALERT SENDER
 # ---------------------------------------------------------
 def send_telegram_alert(message):
-    """
-    Telegram par Alert Message bhejta hai.
-    """
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ":
-        print("[WARNING] Valid Telegram Bot Token missing! Skipping alert.")
+        print("[WARNING] Valid Telegram Token missing!")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        res = requests.post(url, json=payload, timeout=5)
-        if res.status_code == 200:
-            print("[INFO] Telegram alert successfully sent.")
-        else:
-            print(f"[ERROR] Telegram API error: {res.status_code} - {res.text}")
+        requests.post(url, json=payload, timeout=5)
     except Exception as e:
-        print(f"[ERROR] Failed to send Telegram alert: {e}")
+        print(f"[ERROR] Alert error: {e}")
 
 # ---------------------------------------------------------
-# 4. MAIN ENGINE & ANALYSIS ROUTINE
+# 4. WIN / LOSS TRACKER ENGINE
 # ---------------------------------------------------------
-def analyze_asset():
-    """
-    Full Analysis Execution Loop
-    """
-    daily_candles = fetch_coinbase_candles(SYMBOL, 86400)
-    h4_candles = fetch_coinbase_candles(SYMBOL, 14400)
-    h1_candles = fetch_coinbase_candles(SYMBOL, 3600)
-    m1_candles = fetch_coinbase_candles(SYMBOL, 60)
+def track_active_trades(timestamp_str):
+    """ Checks active trades against current market high/low for Win/Loss """
+    for display_name, trade in list(active_trades.items()):
+        ticker = SYMBOLS[display_name]
+        m1_candles = fetch_candles(ticker, "1m")
+        if not m1_candles:
+            continue
 
-    if not (daily_candles and h4_candles and h1_candles):
-        return {"status": "error", "message": "Failed to fetch market candles"}
+        latest_candle = m1_candles[-1]
+        high = latest_candle['high']
+        low = latest_candle['low']
+        close = latest_candle['close']
 
-    # Timeframe Structure Analysis
-    daily_struct = determine_structure_and_trend(daily_candles)
-    h4_struct = determine_structure_and_trend(h4_candles)
-    h1_struct = determine_structure_and_trend(h1_candles)
+        direction = trade['direction']
+        raw_sl = trade['raw_sl']
+        raw_tp1 = trade['raw_tp1']
+        raw_tp2 = trade['raw_tp2']
 
-    # MTF Condition Evaluation
-    mtf = evaluate_mtf_condition(
-        daily_struct['trend'],
-        h4_struct['trend'],
-        h1_struct['trend']
-    )
+        # BUY Trade Evaluation
+        if direction == 'BULLISH':
+            if high >= raw_tp2:
+                msg = (
+                    f"🎯 *TRADE RESULT: WIN 🟢 (TP2 HIT)*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📍 *Asset:* `{display_name}` (BUY)\n"
+                    f"🎯 *Entry Price:* `{trade['entry']}`\n"
+                    f"🚀 *Exit Price:* `{trade['tp2']}`\n"
+                    f"📈 *Reward Ratio:* `1:2.5 RR`\n"
+                    f"⏰ *Time:* `{timestamp_str}`\n"
+                    f"━━━━━━━━━━━━━━━━━━"
+                )
+                send_telegram_alert(msg)
+                del active_trades[display_name]
 
-    # CHOCH Check on LTF Confirmation Candle
-    choch_status = {'confirmed': False, 'fakeout': False}
-    if mtf['condition'] == 'C1' and m1_candles:
-        ref_level = h1_struct['lsm'] if h1_struct['trend'] == 'BULLISH' else h1_struct['lrm']
-        choch_status = check_choch(m1_candles, ref_level, h1_struct['trend'])
+            elif high >= raw_tp1 and not trade.get('tp1_hit'):
+                trade['tp1_hit'] = True
+                msg = (
+                    f"🎯 *TRADE RESULT: WIN 🟢 (TP1 HIT)*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📍 *Asset:* `{display_name}` (BUY)\n"
+                    f"🎯 *Entry Price:* `{trade['entry']}`\n"
+                    f"🚀 *Exit Price:* `{trade['tp1']}`\n"
+                    f"📈 *Reward Ratio:* `1:1.5 RR`\n"
+                    f"⏰ *Time:* `{timestamp_str}`\n"
+                    f"━━━━━━━━━━━━━━━━━━"
+                )
+                send_telegram_alert(msg)
 
-    timestamp_str = datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S IST')
+            elif low <= raw_sl:
+                msg = (
+                    f"🛑 *TRADE RESULT: LOSS 🔴 (SL HIT)*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📍 *Asset:* `{display_name}` (BUY)\n"
+                    f"🎯 *Entry Price:* `{trade['entry']}`\n"
+                    f"🛑 *Exit Price:* `{trade['sl']}`\n"
+                    f"⏰ *Time:* `{timestamp_str}`\n"
+                    f"━━━━━━━━━━━━━━━━━━"
+                )
+                send_telegram_alert(msg)
+                del active_trades[display_name]
 
-    result = {
-        "timestamp": timestamp_str,
-        "symbol": SYMBOL,
-        "daily_trend": daily_struct['trend'],
-        "h4_trend": h4_struct['trend'],
-        "h1_trend": h1_struct['trend'],
-        "mtf_condition": mtf['condition'],
-        "trade_level_tf": mtf['trade_tf'],
-        "confirmation_tf": mtf['confirm_tf'],
-        "choch_confirmed": choch_status.get('confirmed', False),
-        "is_fakeout": choch_status.get('fakeout', False)
-    }
+        # SELL Trade Evaluation
+        elif direction == 'BEARISH':
+            if low <= raw_tp2:
+                msg = (
+                    f"🎯 *TRADE RESULT: WIN 🟢 (TP2 HIT)*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📍 *Asset:* `{display_name}` (SELL)\n"
+                    f"🎯 *Entry Price:* `{trade['entry']}`\n"
+                    f"🚀 *Exit Price:* `{trade['tp2']}`\n"
+                    f"📈 *Reward Ratio:* `1:2.5 RR`\n"
+                    f"⏰ *Time:* `{timestamp_str}`\n"
+                    f"━━━━━━━━━━━━━━━━━━"
+                )
+                send_telegram_alert(msg)
+                del active_trades[display_name]
 
-    # Signal Broadcast Trigger
-    if choch_status.get('confirmed'):
-        direction = "BUY 🟢" if choch_status.get('new_trend') == 'BULLISH' else "SELL 🔴"
-        alert_msg = (
-            f"🚀 *SMC RULEBOOK SIGNAL: {direction}*\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📍 *Symbol:* `{SYMBOL}`\n"
-            f"📊 *MTF Condition:* `{mtf['condition']}` ({mtf['description']})\n"
-            f"📈 *Daily:* `{daily_struct['trend']}` | *4H:* `{h4_struct['trend']}` | *1H:* `{h1_struct['trend']}`\n"
-            f"⚡ *CHOCH Status:* 2-candle close confirmed on `{mtf['confirm_tf']}`\n"
-            f"⏰ *Time:* `{timestamp_str}`\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ *Note:* Confirmation complete. Enter as per risk management!"
-        )
-        send_telegram_alert(alert_msg)
+            elif low <= raw_tp1 and not trade.get('tp1_hit'):
+                trade['tp1_hit'] = True
+                msg = (
+                    f"🎯 *TRADE RESULT: WIN 🟢 (TP1 HIT)*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📍 *Asset:* `{display_name}` (SELL)\n"
+                    f"🎯 *Entry Price:* `{trade['entry']}`\n"
+                    f"🚀 *Exit Price:* `{trade['tp1']}`\n"
+                    f"📈 *Reward Ratio:* `1:1.5 RR`\n"
+                    f"⏰ *Time:* `{timestamp_str}`\n"
+                    f"━━━━━━━━━━━━━━━━━━"
+                )
+                send_telegram_alert(msg)
 
-    return result
+            elif high >= raw_sl:
+                msg = (
+                    f"🛑 *TRADE RESULT: LOSS 🔴 (SL HIT)*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📍 *Asset:* `{display_name}` (SELL)\n"
+                    f"🎯 *Entry Price:* `{trade['entry']}`\n"
+                    f"🛑 *Exit Price:* `{trade['sl']}`\n"
+                    f"⏰ *Time:* `{timestamp_str}`\n"
+                    f"━━━━━━━━━━━━━━━━━━"
+                )
+                send_telegram_alert(msg)
+                del active_trades[display_name]
 
 # ---------------------------------------------------------
-# 5. FLASK SERVER ROUTES
+# 5. SCANNER LOOP & DISPATCHER
+# ---------------------------------------------------------
+def run_scanner_job():
+    print("[SYSTEM] SMC Rulebook Multi-Timeframe Scanner Started...")
+    while True:
+        try:
+            timestamp_str = datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S IST')
+            
+            # First, track active trades for Win/Loss
+            track_active_trades(timestamp_str)
+
+            for display_name, ticker in SYMBOLS.items():
+                daily_candles = fetch_candles(ticker, "1d")
+                h1_candles = fetch_candles(ticker, "1h")
+                
+                if not (daily_candles and h1_candles):
+                    continue
+
+                daily_info = determine_trend_and_levels(daily_candles)
+                h1_info = determine_trend_and_levels(h1_candles)
+
+                mtf = evaluate_mtf_matrix(daily_info['trend'], h1_info['trend'])
+                
+                confirm_candles = fetch_candles(ticker, mtf['confirm_tf'])
+                if not confirm_candles:
+                    continue
+
+                ref_level = h1_info['lsm'] if h1_info['trend'] == 'BULLISH' else h1_info['lrm']
+                choch = check_choch(confirm_candles, ref_level, h1_info['trend'])
+
+                if choch['confirmed']:
+                    signal_key = f"{display_name}_{mtf['condition']}_{choch['new_trend']}_{confirm_candles[-1]['time']}"
+                    
+                    if signal_key not in sent_signals:
+                        sent_signals.add(signal_key)
+                        
+                        direction = "BUY 🟢" if choch['new_trend'] == 'BULLISH' else "SELL 🔴"
+                        current_price = confirm_candles[-1]['close']
+                        
+                        levels = calculate_trade_levels(
+                            choch['new_trend'], 
+                            current_price, 
+                            h1_info['lsm'], 
+                            h1_info['lrm'], 
+                            ticker
+                        )
+                        
+                        # Save trade to Active Trades memory for Win/Loss tracking
+                        active_trades[display_name] = {
+                            "direction": choch['new_trend'],
+                            "raw_entry": levels['raw_entry'],
+                            "raw_sl": levels['raw_sl'],
+                            "raw_tp1": levels['raw_tp1'],
+                            "raw_tp2": levels['raw_tp2'],
+                            "entry": levels['entry'],
+                            "sl": levels['sl'],
+                            "tp1": levels['tp1'],
+                            "tp2": levels['tp2'],
+                            "tp1_hit": False
+                        }
+
+                        alert_msg = (
+                            f"🚀 *SMC RULEBOOK ALERT: {direction}*\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"📍 *Asset:* `{display_name}`\n"
+                            f"📊 *MTF Condition:* `{mtf['condition']}` ({mtf['desc']})\n\n"
+                            f"🎯 *Entry Zone:* `{levels['entry']}`\n"
+                            f"🛑 *Stop Loss (SL):* `{levels['sl']}`\n"
+                            f"📈 *Take Profit 1 (1:1.5):* `{levels['tp1']}`\n"
+                            f"🚀 *Take Profit 2 (1:2.5):* `{levels['tp2']}`\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"⏱️ *TF:* `{mtf['confirm_tf'].upper()}` | ⏰ *Time:* `{timestamp_str}`"
+                        )
+                        send_telegram_alert(alert_msg)
+
+        except Exception as e:
+            print(f"[ERROR] Scanner loop error: {e}")
+
+        time.sleep(60)
+
+scanner_thread = threading.Thread(target=run_scanner_job, daemon=True)
+scanner_thread.start()
+
+# ---------------------------------------------------------
+# 6. FLASK SERVER ROUTES
 # ---------------------------------------------------------
 @app.route("/")
 def home():
-    return "SMC Trading Rulebook Server is Live!"
+    return "SMC Multi-Asset Engine with Win/Loss Tracker Active!"
 
 @app.route("/api/stats")
 def api_stats():
     return jsonify({
-        "status": "active",
-        "system": "SMC Rulebook Engine v2.0",
+        "status": "online",
+        "active_trades_monitored": len(active_trades),
+        "total_signals_sent": len(sent_signals),
         "server_time": datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S IST')
     })
-
-@app.route("/api/latest_signal")
-def api_signal():
-    analysis = analyze_asset()
-    return jsonify(analysis)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
