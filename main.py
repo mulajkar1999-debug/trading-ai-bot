@@ -1,12 +1,12 @@
-from datetime import datetime
 import os
 import threading
 import time
+from datetime import datetime
 from flask import Flask, jsonify, render_template_string
 import requests
 
 # ==========================================
-# 1. CONFIGURATION (CREDENTIALS ADDED)
+# 1. CONFIGURATION (TELEGRAM CREDENTIALS)
 # ==========================================
 TELEGRAM_BOT_TOKEN = os.environ.get(
     "TELEGRAM_BOT_TOKEN", "8723192534:AAFqkexJpF-yu38dPI0cEUT6H0nooN_sjdM"
@@ -16,10 +16,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "1317739622")
 # ==========================================
 # 2. GLOBAL MEMORY & DATA STORES
 # ==========================================
-recent_telegram_messages = (
-    []
-)  # Telegram messages ko browser/API par dikhane ke liye
-MAX_MESSAGE_HISTORY = 30  # Maximum 30 messages history me rahenge
+recent_telegram_messages = []
+MAX_MESSAGE_HISTORY = 30
 
 bot_stats = {
     "status": "Online",
@@ -30,7 +28,6 @@ bot_stats = {
     "last_scan": "Initializing...",
 }
 
-# Live pairs tracking for Dashboard
 market_pairs = {
     "BTCUSDT": {
         "price": "65,200",
@@ -53,12 +50,12 @@ market_pairs = {
 }
 
 # ==========================================
-# 3. TELEGRAM SENDER WITH MESSAGE LOGGER
+# 3. TELEGRAM SENDER & TRADE RESULT LOGIC
 # ==========================================
-
-
-def send_telegram_message(message_text):
-    """Telegram par message bhejta hai aur /api/stats ke liye memory me save karta hai."""
+def send_telegram_message(message_text, signal_type=None):
+    """
+    Telegram par message bhejta hai aur /api/stats + Dashboard ke liye memory me save karta hai.
+    """
     timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
 
     # 1. Telegram API Request
@@ -73,27 +70,34 @@ def send_telegram_message(message_text):
     except Exception as e:
         print(f"Telegram Error: {e}")
 
-    # 2. Memory me save karein (Web Dashboard aur /api/stats ke liye)
-    msg_entry = {"timestamp": timestamp_str, "message": message_text}
-
-    recent_telegram_messages.insert(0, msg_entry)  # Latest message top par
+    # 2. Memory me save karein
+    msg_entry = {
+        "timestamp": timestamp_str,
+        "message": message_text
+    }
+    recent_telegram_messages.insert(0, msg_entry)
 
     if len(recent_telegram_messages) > MAX_MESSAGE_HISTORY:
         recent_telegram_messages.pop()
 
+    # 3. Win / Loss & Signal stats update
     bot_stats["total_signals"] += 1
 
+    if signal_type == "WIN":
+        bot_stats["wins"] += 1
+    elif signal_type == "LOSS":
+        bot_stats["losses"] += 1
+    elif "TP Hit" in message_text or "(WIN)" in message_text:
+        bot_stats["wins"] += 1
+    elif "SL Hit" in message_text or "(LOSS)" in message_text:
+        bot_stats["losses"] += 1
 
 # ==========================================
 # 4. BACKGROUND TRADING BOT ENGINE
 # ==========================================
-
-
 def background_trading_scanner():
-    """Ye thread background me bina ruke market scan karta rehta hai."""
     print("🚀 Background Trading Scanner Started...")
 
-    # Startup Notification Message
     startup_msg = (
         "<b>🟢 Trading AI Bot Started Successfully!</b>\n\n"
         "Scanning markets for SMC CHOCH & Liquidity setups...\n"
@@ -103,22 +107,18 @@ def background_trading_scanner():
 
     while True:
         try:
-            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
-            bot_stats["last_scan"] = current_time
+            bot_stats["last_scan"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
 
-            # Aapka Market Scanning Logic yahan chalega
+            # YAHAN AAPKA MARKET SCANNING LOGIC CHALEGA
 
-            time.sleep(60)  # Har 60 second me scan
+            time.sleep(60)
 
         except Exception as e:
             print(f"Scanner Loop Error: {e}")
             time.sleep(10)
 
-
-# Background Thread Start
-scanner_thread = threading.Thread(
-    target=background_trading_scanner, daemon=True
-)
+# Start background thread
+scanner_thread = threading.Thread(target=background_trading_scanner, daemon=True)
 scanner_thread.start()
 
 # ==========================================
@@ -126,7 +126,6 @@ scanner_thread.start()
 # ==========================================
 app = Flask(__name__)
 
-# Dark Themed HTML Dashboard
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -141,10 +140,10 @@ DASHBOARD_HTML = """
         .container { max-width: 1200px; margin: 0 auto; }
         .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #30363d; padding-bottom: 15px; margin-bottom: 25px; }
         .badge { background: #238636; color: white; padding: 5px 12px; border-radius: 20px; font-size: 14px; font-weight: bold; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 30px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 30px; }
         .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 18px; }
-        .card h3 { font-size: 13px; color: #8b949e; text-transform: uppercase; margin-bottom: 8px; }
-        .card .value { font-size: 24px; font-weight: bold; color: #58a6ff; }
+        .card h3 { font-size: 12px; color: #8b949e; text-transform: uppercase; margin-bottom: 8px; }
+        .card .value { font-size: 22px; font-weight: bold; color: #58a6ff; }
         table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; margin-bottom: 30px; }
         th, td { padding: 12px 16px; text-align: left; border-bottom: 1px solid #30363d; }
         th { background: #21262d; color: #8b949e; font-size: 13px; text-transform: uppercase; }
@@ -155,7 +154,6 @@ DASHBOARD_HTML = """
         .log-item:last-child { border-bottom: none; }
         .time { color: #8b949e; font-size: 11px; margin-bottom: 4px; }
         a.api-link { color: #58a6ff; text-decoration: none; font-size: 14px; }
-        a.api-link:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
@@ -174,16 +172,26 @@ DASHBOARD_HTML = """
                 <div class="value" style="color:#3fb950;">Active</div>
             </div>
             <div class="card">
-                <h3>Total Signals Sent</h3>
-                <div class="value">{{ stats.total_signals }}</div>
+                <h3>Total Wins</h3>
+                <div class="value" style="color:#3fb950;">{{ stats.wins }}</div>
             </div>
             <div class="card">
-                <h3>Last Scan Time</h3>
-                <div class="value" style="font-size:16px; margin-top:5px;">{{ stats.last_scan }}</div>
+                <h3>Total Losses</h3>
+                <div class="value" style="color:#f85149;">{{ stats.losses }}</div>
             </div>
             <div class="card">
-                <h3>Messages Cached</h3>
-                <div class="value">{{ messages|length }}</div>
+                <h3>Win Rate</h3>
+                <div class="value" style="color:#e3b341;">
+                    {% if (stats.wins + stats.losses) > 0 %}
+                        {{ "%.1f"|format((stats.wins / (stats.wins + stats.losses)) * 100) }}%
+                    {% else %}
+                        0%
+                    {% endif %}
+                </div>
+            </div>
+            <div class="card">
+                <h3>Last Scan</h3>
+                <div class="value" style="font-size:14px; margin-top:5px;">{{ stats.last_scan }}</div>
             </div>
         </div>
 
@@ -229,34 +237,30 @@ DASHBOARD_HTML = """
 </html>
 """
 
-
-# ------------------------------------------
-# ROUTE 1: Home Dashboard Page (HTML)
-# ------------------------------------------
 @app.route("/")
 def home_dashboard():
     return render_template_string(
         DASHBOARD_HTML,
         stats=bot_stats,
         pairs=market_pairs,
-        messages=recent_telegram_messages,
+        messages=recent_telegram_messages
     )
 
-
-# ------------------------------------------
-# ROUTE 2: API Stats Endpoint (JSON)
-# ------------------------------------------
 @app.route("/api/stats")
 def api_stats():
+    total_trades = bot_stats["wins"] + bot_stats["losses"]
+    win_rate = f"{(bot_stats['wins'] / total_trades * 100):.1f}%" if total_trades > 0 else "0%"
+
     return jsonify({
         "status": bot_stats["status"],
         "bot_started_at": bot_stats["started_at"],
         "last_scan_time": bot_stats["last_scan"],
-        "total_telegram_signals_sent": bot_stats["total_signals"],
+        "wins": bot_stats["wins"],
+        "losses": bot_stats["losses"],
+        "win_rate": win_rate,
         "total_messages_stored": len(recent_telegram_messages),
-        "recent_telegram_messages": recent_telegram_messages,
+        "recent_telegram_messages": recent_telegram_messages
     })
-
 
 # ==========================================
 # 6. SERVER STARTUP
