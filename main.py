@@ -1,7 +1,7 @@
 import os
-import threading
 import time
-from datetime import datetime, timezone
+import threading
+from datetime import datetime
 from collections import deque
 from statistics import mean
 
@@ -10,14 +10,35 @@ from flask import Flask, jsonify, render_template_string
 
 
 # ============================================================
-# SMC + TGL + MTF + CHOCH TRADING BOT
-# Based on User Trading Rulebook
+# RULEBOOK SMC PAPER TRADING BOT v2
 #
-# IMPORTANT:
-# - PAPER TRADING ONLY
-# - No real order execution
-# - Rule-based signal engine
-# - Public Binance market data
+# PAPER TRADING ONLY
+#
+# Rulebook:
+# Daily -> 4H -> 1H directional analysis
+# C1: All aligned -> 1H level
+# C2: 1H opposite -> 4H level
+# C3: 4H + 1H opposite Daily -> Daily level
+#
+# 1H -> 1M CHOCH
+# 4H -> 5M CHOCH
+# Daily -> 1H CHOCH -> 1M confirmation
+#
+# CHOCH = 2 consecutive CLOSED candles beyond level
+# Fakeout filter
+# TGL Level 1 / Level 2
+# 2 opposite closes = level invalid
+# Tap -> confirmation -> entry
+# Green confirmation -> BUY
+# Red confirmation -> SELL
+# A+ confluence
+# Already played / retested level avoidance
+# Counter-trend avoidance
+# Structure based SL
+# HTF reaction target
+# 0.5% risk default
+#
+# NO REAL ORDERS
 # ============================================================
 
 
@@ -25,24 +46,46 @@ from flask import Flask, jsonify, render_template_string
 # 1. CONFIG
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8723192534:AAFqkexJpF-yu38dPI0cEUT6H0nooN_sjdM", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "1317739622")
+TELEGRAM_BOT_TOKEN = os.environ.get(
+    "8723192534:AAFqkexJpF-yu38dPI0cEUT6H0nooN_sjdM",
+    ""
+)
 
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
-BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/price"
+TELEGRAM_CHAT_ID = os.environ.get(
+    "1317739622",
+    ""
+)
 
-SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", "30"))
+BINANCE_KLINES_URL = (
+    "https://api.binance.com/api/v3/klines"
+)
+
+BINANCE_TICKER_URL = (
+    "https://api.binance.com/api/v3/ticker/price"
+)
+
+SCAN_INTERVAL = int(
+    os.environ.get("SCAN_INTERVAL", "30")
+)
 
 RISK_PER_TRADE = float(
     os.environ.get("RISK_PER_TRADE", "0.005")
-)  # 0.5%
+)
 
 MIN_RR = float(
     os.environ.get("MIN_RR", "1.5")
 )
 
-MAX_MESSAGES = 50
-MAX_TRADES = 500
+A_PLUS_ONLY = (
+    os.environ.get(
+        "A_PLUS_ONLY",
+        "true"
+    ).lower()
+    == "true"
+)
+
+MAX_MESSAGES = 100
+MAX_TRADES = 1000
 
 SYMBOLS = [
     "BTCUSDT",
@@ -50,167 +93,212 @@ SYMBOLS = [
     "SOLUSDT",
 ]
 
-# Rulebook timeframe mapping
-TIMEFRAMES = {
-    "daily": "1d",
-    "4h": "4h",
-    "1h": "1h",
-    "5m": "5m",
-    "1m": "1m",
+
+# ============================================================
+# TIMEFRAME CONFIG
+# ============================================================
+
+TF = {
+    "DAILY": "1d",
+    "4H": "4h",
+    "1H": "1h",
+    "5M": "5m",
+    "1M": "1m",
 }
 
 
 # ============================================================
-# 2. GLOBAL STATE
+# GLOBAL STATE
 # ============================================================
 
-recent_telegram_messages = deque(maxlen=MAX_MESSAGES)
+recent_messages = deque(
+    maxlen=MAX_MESSAGES
+)
 
-trade_history = deque(maxlen=MAX_TRADES)
+trade_history = deque(
+    maxlen=MAX_TRADES
+)
 
 active_trades = {}
+
+played_levels = {}
 
 market_pairs = {}
 
 bot_stats = {
     "status": "STARTING",
-    "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "started_at": datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    ),
     "last_scan": "Initializing...",
-    "total_signals": 0,
+    "signals": 0,
     "wins": 0,
     "losses": 0,
     "waits": 0,
-    "invalid_setups": 0,
+    "invalidated": 0,
     "total_r": 0.0,
 }
 
 
 # ============================================================
-# 3. HELPERS
+# HELPERS
 # ============================================================
 
-def now_string():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def now():
+    return datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
 
-def safe_float(value):
+def f(value):
     try:
         return float(value)
     except Exception:
         return 0.0
 
 
-def format_price(price):
+def normalize_symbol(symbol):
+    return symbol.replace(
+        "/", ""
+    ).upper()
+
+
+def price_format(price):
     if price >= 1000:
         return f"{price:,.2f}"
+
     if price >= 1:
         return f"{price:.4f}"
+
     return f"{price:.8f}"
 
 
-def normalize_symbol(symbol):
-    return symbol.replace("/", "").upper()
+def direction_from_trend(trend):
+    if trend == "BULLISH":
+        return "BUY"
+
+    if trend == "BEARISH":
+        return "SELL"
+
+    return "WAIT"
 
 
 # ============================================================
-# 4. TELEGRAM
+# TELEGRAM
 # ============================================================
 
-def send_telegram_message(message_text, signal_type=None):
-    timestamp = now_string()
+def telegram(message, kind=None):
 
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+    if (
+        TELEGRAM_BOT_TOKEN
+        and TELEGRAM_CHAT_ID
+    ):
+
         url = (
-            f"https://api.telegram.org/bot"
+            "https://api.telegram.org/bot"
             f"{TELEGRAM_BOT_TOKEN}/sendMessage"
         )
 
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
-            "text": message_text,
+            "text": message,
             "parse_mode": "HTML",
         }
 
         try:
-            response = requests.post(
+            requests.post(
                 url,
                 json=payload,
                 timeout=10
             )
-
-            if response.status_code != 200:
-                print(
-                    "Telegram HTTP error:",
-                    response.status_code,
-                    response.text[:300]
-                )
-
         except Exception as exc:
-            print("Telegram error:", exc)
+            print(
+                "Telegram error:",
+                exc
+            )
 
-    recent_telegram_messages.appendleft({
-        "timestamp": timestamp,
-        "message": message_text,
+    recent_messages.appendleft({
+        "time": now(),
+        "message": message,
+        "type": kind or "INFO",
     })
 
-    if signal_type == "SIGNAL":
-        bot_stats["total_signals"] += 1
 
+def signal_alert(signal):
 
-def send_trade_signal(signal):
-    direction = signal["direction"]
-
-    emoji = "🟢" if direction == "BUY" else "🔴"
+    emoji = (
+        "🟢"
+        if signal["direction"] == "BUY"
+        else "🔴"
+    )
 
     message = (
-        f"{emoji} <b>SMC RULEBOOK SIGNAL</b>\n"
+        f"{emoji} <b>RULEBOOK A+ SIGNAL</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📍 <b>Asset:</b> {signal['symbol']}\n"
-        f"📌 <b>Direction:</b> {direction}\n"
-        f"⭐ <b>Grade:</b> {signal['grade']}\n"
-        f"📊 <b>Condition:</b> {signal['condition']}\n"
-        f"⏱ <b>Level TF:</b> {signal['level_tf']}\n"
-        f"🔎 <b>Confirmation TF:</b> {signal['confirmation_tf']}\n"
-        f"🧠 <b>CHOCH:</b> {signal['choch']}\n"
-        f"🎯 <b>Entry:</b> {format_price(signal['entry'])}\n"
-        f"🛑 <b>SL:</b> {format_price(signal['sl'])}\n"
-        f"🎯 <b>TP:</b> {format_price(signal['tp'])}\n"
-        f"📐 <b>RR:</b> {signal['rr']:.2f}\n"
-        f"🔐 <b>Risk:</b> {RISK_PER_TRADE * 100:.2f}%\n"
+        f"Asset: <b>{signal['symbol']}</b>\n"
+        f"Direction: <b>{signal['direction']}</b>\n"
+        f"Condition: <b>{signal['condition']}</b>\n"
+        f"Level TF: <b>{signal['level_tf']}</b>\n"
+        f"Confirmation: <b>{signal['confirmation_tf']}</b>\n"
+        f"CHOCH: <b>{signal['choch']}</b>\n"
+        f"Entry: <b>{price_format(signal['entry'])}</b>\n"
+        f"SL: <b>{price_format(signal['sl'])}</b>\n"
+        f"TP: <b>{price_format(signal['tp'])}</b>\n"
+        f"RR: <b>{signal['rr']:.2f}</b>\n"
+        f"Score: <b>{signal['score']}/100</b>\n"
+        f"Risk: <b>{RISK_PER_TRADE * 100:.2f}%</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"⏰ {now_string()}"
+        f"Reason: {', '.join(signal['reasons'])}\n"
+        f"Time: {now()}"
     )
 
-    send_telegram_message(
+    telegram(
         message,
-        signal_type="SIGNAL"
+        "SIGNAL"
     )
 
 
-def send_result_alert(trade, result, r_multiple):
-    emoji = "🟢" if result == "WIN" else "🔴"
+def result_alert(
+    trade,
+    result,
+    r_multiple
+):
+
+    emoji = (
+        "🟢"
+        if result == "WIN"
+        else "🔴"
+    )
 
     message = (
         f"{emoji} <b>TRADE RESULT: {result}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📍 <b>Asset:</b> {trade['symbol']}\n"
-        f"📌 <b>Direction:</b> {trade['direction']}\n"
-        f"🎯 <b>Entry:</b> {format_price(trade['entry'])}\n"
-        f"🚪 <b>Exit:</b> {format_price(trade['exit'])}\n"
-        f"📊 <b>R:</b> {r_multiple:.2f}R\n"
-        f"⭐ <b>Grade:</b> {trade['grade']}\n"
+        f"Asset: <b>{trade['symbol']}</b>\n"
+        f"Direction: <b>{trade['direction']}</b>\n"
+        f"Entry: <b>{price_format(trade['entry'])}</b>\n"
+        f"Exit: <b>{price_format(trade['exit'])}</b>\n"
+        f"R: <b>{r_multiple:.2f}R</b>\n"
+        f"Grade: <b>{trade['grade']}</b>\n"
+        f"Condition: <b>{trade['condition']}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"⏰ {now_string()}"
+        f"Time: {now()}"
     )
 
-    send_telegram_message(message)
+    telegram(
+        message,
+        result
+    )
 
 
 # ============================================================
-# 5. BINANCE DATA
+# BINANCE DATA
 # ============================================================
 
-def get_klines(symbol, interval, limit=250):
+def get_klines(
+    symbol,
+    interval,
+    limit=250
+):
 
     params = {
         "symbol": normalize_symbol(symbol),
@@ -219,126 +307,129 @@ def get_klines(symbol, interval, limit=250):
     }
 
     try:
+
         response = requests.get(
-            BINANCE_URL,
+            BINANCE_KLINES_URL,
             params=params,
             timeout=10
         )
 
         response.raise_for_status()
 
-        raw = response.json()
+        rows = response.json()
 
         candles = []
 
-        for row in raw:
+        for row in rows:
+
             candles.append({
                 "open_time": int(row[0]),
-                "open": safe_float(row[1]),
-                "high": safe_float(row[2]),
-                "low": safe_float(row[3]),
-                "close": safe_float(row[4]),
-                "volume": safe_float(row[5]),
+                "open": f(row[1]),
+                "high": f(row[2]),
+                "low": f(row[3]),
+                "close": f(row[4]),
+                "volume": f(row[5]),
                 "close_time": int(row[6]),
             })
+
+        # Last Binance candle can still be forming.
+        # Rulebook confirmation must use CLOSED candles.
+        if len(candles) > 2:
+
+            current_ms = int(
+                time.time() * 1000
+            )
+
+            if (
+                candles[-1]["close_time"]
+                > current_ms
+            ):
+                candles.pop()
 
         return candles
 
     except Exception as exc:
+
         print(
-            f"Kline error {symbol} {interval}:",
+            f"Kline error "
+            f"{symbol} {interval}:",
             exc
         )
+
         return []
 
 
-def get_live_price(symbol):
+def get_price(symbol):
 
     try:
 
         response = requests.get(
             BINANCE_TICKER_URL,
-            params={"symbol": normalize_symbol(symbol)},
+            params={
+                "symbol":
+                    normalize_symbol(symbol)
+            },
             timeout=10
         )
 
         response.raise_for_status()
 
-        return safe_float(
+        return f(
             response.json()["price"]
         )
 
     except Exception as exc:
-        print("Ticker error:", exc)
+
+        print(
+            "Price error:",
+            exc
+        )
+
         return 0.0
 
 
 # ============================================================
-# 6. CANDLE / STRUCTURE ENGINE
+# CANDLE FUNCTIONS
 # ============================================================
 
-def is_bullish(c):
+def bullish(c):
     return c["close"] > c["open"]
 
 
-def is_bearish(c):
+def bearish(c):
     return c["close"] < c["open"]
 
 
-def candle_body(c):
-    return abs(c["close"] - c["open"])
+def body(c):
+    return abs(
+        c["close"] - c["open"]
+    )
 
 
-def average_body(candles, length=20):
+def range_size(c):
+    return c["high"] - c["low"]
 
-    sample = candles[-length:]
+
+def average_body(
+    candles,
+    length=20
+):
+
+    sample = candles[
+        -length:
+    ]
 
     if not sample:
         return 0
 
     return mean(
-        candle_body(c)
+        body(c)
         for c in sample
     )
 
 
-def is_strong_bullish_impulse(candles):
-
-    if len(candles) < 21:
-        return False
-
-    last = candles[-1]
-
-    avg = average_body(candles[:-1])
-
-    return (
-        is_bullish(last)
-        and candle_body(last) > avg * 1.5
-        and last["close"] > last["open"]
-    )
-
-
-def is_strong_bearish_impulse(candles):
-
-    if len(candles) < 21:
-        return False
-
-    last = candles[-1]
-
-    avg = average_body(candles[:-1])
-
-    return (
-        is_bearish(last)
-        and candle_body(last) > avg * 1.5
-        and last["close"] < last["open"]
-    )
-
-
 # ============================================================
-# 7. SWING DETECTION
-#
-# Rulebook:
-# 2-candle retracement concept
+# SWING DETECTION
 # ============================================================
 
 def find_swings(candles):
@@ -346,101 +437,134 @@ def find_swings(candles):
     highs = []
     lows = []
 
-    if len(candles) < 5:
+    if len(candles) < 7:
         return highs, lows
 
-    for i in range(2, len(candles) - 2):
+    for i in range(
+        2,
+        len(candles) - 2
+    ):
 
         c = candles[i]
 
-        left1 = candles[i - 1]
-        left2 = candles[i - 2]
-
-        right1 = candles[i + 1]
-        right2 = candles[i + 2]
-
-        # Swing high
         if (
-            c["high"] > left1["high"]
-            and c["high"] > left2["high"]
-            and c["high"] >= right1["high"]
-            and c["high"] >= right2["high"]
+            c["high"]
+            > candles[i - 1]["high"]
+            and
+            c["high"]
+            > candles[i - 2]["high"]
+            and
+            c["high"]
+            >= candles[i + 1]["high"]
+            and
+            c["high"]
+            >= candles[i + 2]["high"]
         ):
+
             highs.append({
                 "index": i,
                 "price": c["high"],
-                "candle": c,
+                "time":
+                    c["open_time"],
             })
 
-        # Swing low
         if (
-            c["low"] < left1["low"]
-            and c["low"] < left2["low"]
-            and c["low"] <= right1["low"]
-            and c["low"] <= right2["low"]
+            c["low"]
+            < candles[i - 1]["low"]
+            and
+            c["low"]
+            < candles[i - 2]["low"]
+            and
+            c["low"]
+            <= candles[i + 1]["low"]
+            and
+            c["low"]
+            <= candles[i + 2]["low"]
         ):
+
             lows.append({
                 "index": i,
                 "price": c["low"],
-                "candle": c,
+                "time":
+                    c["open_time"],
             })
 
     return highs, lows
 
 
-def detect_structure(candles):
+# ============================================================
+# MARKET STRUCTURE
+# ============================================================
 
-    highs, lows = find_swings(candles)
+def structure(candles):
 
-    if len(highs) < 2 or len(lows) < 2:
-        return {
-            "trend": "UNKNOWN",
-            "highs": highs,
-            "lows": lows,
-            "last_high": None,
-            "last_low": None,
-        }
+    highs, lows = find_swings(
+        candles
+    )
 
-    h1 = highs[-1]["price"]
-    h2 = highs[-2]["price"]
-
-    l1 = lows[-1]["price"]
-    l2 = lows[-2]["price"]
-
-    if h1 > h2 and l1 > l2:
-        trend = "BULLISH"
-
-    elif h1 < h2 and l1 < l2:
-        trend = "BEARISH"
-
-    else:
-        trend = "SIDEWAYS"
-
-    return {
-        "trend": trend,
+    result = {
+        "trend": "UNKNOWN",
         "highs": highs,
         "lows": lows,
-        "last_high": highs[-1],
-        "last_low": lows[-1],
+        "last_high": None,
+        "last_low": None,
     }
+
+    if (
+        len(highs) < 2
+        or len(lows) < 2
+    ):
+        return result
+
+    latest_high = highs[-1]["price"]
+    previous_high = highs[-2]["price"]
+
+    latest_low = lows[-1]["price"]
+    previous_low = lows[-2]["price"]
+
+    if (
+        latest_high > previous_high
+        and latest_low > previous_low
+    ):
+
+        result["trend"] = "BULLISH"
+
+    elif (
+        latest_high < previous_high
+        and latest_low < previous_low
+    ):
+
+        result["trend"] = "BEARISH"
+
+    else:
+
+        result["trend"] = "SIDEWAYS"
+
+    result["last_high"] = highs[-1]
+    result["last_low"] = lows[-1]
+
+    return result
 
 
 # ============================================================
-# 8. CHOCH
+# CHOCH ENGINE
 #
-# Rulebook:
-# bullish -> bearish:
-# 2 consecutive closes below LSM
+# EXACT RULE:
+# Relevant structure level ke beyond
+# 2 consecutive CLOSED candle closes.
 #
-# bearish -> bullish:
-# 2 consecutive closes above LRM
+# Fakeout:
+# A single close beyond level is NOT CHOCH.
+# Second close must remain beyond level.
+#
+# Additional rejection:
+# If second candle closes back inside,
+# no CHOCH.
 # ============================================================
 
 def detect_choch(candles):
 
-    structure = detect_structure(candles)
-
-    trend = structure["trend"]
+    s = structure(candles)
 
     if len(candles) < 3:
         return None
@@ -448,198 +572,259 @@ def detect_choch(candles):
     c1 = candles[-2]
     c2 = candles[-1]
 
-    # Bullish -> Bearish
-    if trend == "BULLISH":
+    # Bullish structure -> bearish CHOCH
+    if s["trend"] == "BULLISH":
 
-        last_low = structure["last_low"]
+        if not s["last_low"]:
+            return None
 
-        if last_low:
+        level = s["last_low"]["price"]
 
-            level = last_low["price"]
+        first_break = (
+            c1["close"] < level
+        )
 
-            if (
-                c1["close"] < level
-                and c2["close"] < level
-            ):
-                return {
-                    "direction": "BEARISH",
-                    "level": level,
-                    "candle": c2,
-                }
+        second_break = (
+            c2["close"] < level
+        )
 
-    # Bearish -> Bullish
-    if trend == "BEARISH":
+        if (
+            first_break
+            and second_break
+        ):
 
-        last_high = structure["last_high"]
+            return {
+                "direction": "BEARISH",
+                "level": level,
+                "time": c2["open_time"],
+                "close1": c1["close"],
+                "close2": c2["close"],
+            }
 
-        if last_high:
+    # Bearish structure -> bullish CHOCH
+    if s["trend"] == "BEARISH":
 
-            level = last_high["price"]
+        if not s["last_high"]:
+            return None
 
-            if (
-                c1["close"] > level
-                and c2["close"] > level
-            ):
-                return {
-                    "direction": "BULLISH",
-                    "level": level,
-                    "candle": c2,
-                }
+        level = s["last_high"]["price"]
+
+        first_break = (
+            c1["close"] > level
+        )
+
+        second_break = (
+            c2["close"] > level
+        )
+
+        if (
+            first_break
+            and second_break
+        ):
+
+            return {
+                "direction": "BULLISH",
+                "level": level,
+                "time": c2["open_time"],
+                "close1": c1["close"],
+                "close2": c2["close"],
+            }
 
     return None
 
 
 # ============================================================
-# 9. TGL LEVELS
+# TGL ENGINE
 #
-# Rulebook:
-# latest 1-2-3 structure
-# Level 1 + Level 2
+# IMPORTANT:
+# Supplied Rulebook gives TGL Level 1/2 concept,
+# but does NOT provide a complete mathematical formula.
 #
-# Exact TGL mathematical formula is not fully formalized
-# in supplied rulebook, so this implementation derives
-# structural levels transparently.
+# Therefore this is a transparent STRUCTURAL implementation,
+# not a claimed exact proprietary TGL formula.
 # ============================================================
 
 def calculate_tgl(candles):
 
-    structure = detect_structure(candles)
+    s = structure(candles)
+
+    highs = s["highs"]
+    lows = s["lows"]
 
     levels = []
 
-    highs = structure["highs"]
-    lows = structure["lows"]
+    if (
+        len(highs) < 2
+        or len(lows) < 2
+    ):
+        return levels
 
-    if len(highs) >= 2 and len(lows) >= 2:
+    if s["trend"] == "BULLISH":
 
-        latest_high = highs[-1]["price"]
-        previous_high = highs[-2]["price"]
+        level1 = lows[-1]["price"]
 
-        latest_low = lows[-1]["price"]
-        previous_low = lows[-2]["price"]
+        # Structural retracement reference.
+        level2 = (
+            highs[-2]["price"]
+            + lows[-1]["price"]
+        ) / 2
 
-        if structure["trend"] == "BULLISH":
+        levels.append({
+            "name": "TGL-1",
+            "price": level1,
+            "side": "SUPPORT",
+            "created": lows[-1]["time"],
+        })
 
-            # TGL Level 1
-            level1 = latest_low
+        levels.append({
+            "name": "TGL-2",
+            "price": level2,
+            "side": "SUPPORT",
+            "created": lows[-1]["time"],
+        })
 
-            # TGL Level 2:
-            # structural midpoint / retracement reference
-            level2 = min(
-                latest_high,
-                max(
-                    latest_low,
-                    previous_high
-                )
-            )
+    elif s["trend"] == "BEARISH":
 
-            levels = [
-                {
-                    "name": "TGL-1",
-                    "price": level1,
-                    "type": "SUPPORT",
-                },
-                {
-                    "name": "TGL-2",
-                    "price": level2,
-                    "type": "SUPPORT",
-                }
-            ]
+        level1 = highs[-1]["price"]
 
-        elif structure["trend"] == "BEARISH":
+        level2 = (
+            lows[-2]["price"]
+            + highs[-1]["price"]
+        ) / 2
 
-            level1 = latest_high
+        levels.append({
+            "name": "TGL-1",
+            "price": level1,
+            "side": "RESISTANCE",
+            "created": highs[-1]["time"],
+        })
 
-            level2 = max(
-                latest_low,
-                min(
-                    latest_high,
-                    previous_low
-                )
-            )
-
-            levels = [
-                {
-                    "name": "TGL-1",
-                    "price": level1,
-                    "type": "RESISTANCE",
-                },
-                {
-                    "name": "TGL-2",
-                    "price": level2,
-                    "type": "RESISTANCE",
-                }
-            ]
+        levels.append({
+            "name": "TGL-2",
+            "price": level2,
+            "side": "RESISTANCE",
+            "created": highs[-1]["time"],
+        })
 
     return levels
 
 
 # ============================================================
-# 10. DEMAND / SUPPLY
-#
-# Rulebook:
-# Strong impulse + opposite candle before impulse
+# SUPPLY / DEMAND
 # ============================================================
 
-def detect_demand_supply(candles):
-
-    if len(candles) < 25:
-        return []
+def detect_zones(candles):
 
     zones = []
 
-    for i in range(3, len(candles) - 1):
+    if len(candles) < 30:
+        return zones
 
-        impulse = candles[i + 1]
+    for i in range(
+        20,
+        len(candles) - 1
+    ):
+
         base = candles[i]
+        impulse = candles[i + 1]
 
         avg = average_body(
-            candles[max(0, i - 20):i]
+            candles[
+                max(0, i - 20):i
+            ]
         )
 
-        # Demand
+        if avg <= 0:
+            continue
+
+        strong = (
+            body(impulse)
+            >= avg * 1.5
+        )
+
         if (
-            is_bullish(impulse)
-            and candle_body(impulse) > avg * 1.5
-            and is_bearish(base)
+            strong
+            and bullish(impulse)
+            and bearish(base)
         ):
+
             zones.append({
                 "type": "DEMAND",
                 "low": base["low"],
                 "high": base["high"],
-                "index": i,
+                "time": base["open_time"],
+                "played": False,
             })
 
-        # Supply
         if (
-            is_bearish(impulse)
-            and candle_body(impulse) > avg * 1.5
-            and is_bullish(base)
+            strong
+            and bearish(impulse)
+            and bullish(base)
         ):
+
             zones.append({
                 "type": "SUPPLY",
                 "low": base["low"],
                 "high": base["high"],
-                "index": i,
+                "time": base["open_time"],
+                "played": False,
             })
 
-    return zones[-10:]
+    return zones[-20:]
 
 
 # ============================================================
-# 11. LEVEL TAP
+# LEVEL TOUCH
 # ============================================================
 
-def price_tapped_level(price, level, tolerance):
+def touched(
+    price,
+    level,
+    tolerance
+):
 
-    return abs(price - level) <= tolerance
+    return (
+        abs(price - level)
+        <= tolerance
+    )
 
 
-def detect_zone_tap(price, zones):
+def find_touched_level(
+    price,
+    levels
+):
+
+    if not levels:
+        return None
+
+    # Dynamic tolerance.
+    tolerance = price * 0.001
+
+    for level in reversed(levels):
+
+        if touched(
+            price,
+            level["price"],
+            tolerance
+        ):
+
+            return level
+
+    return None
+
+
+def find_touched_zone(
+    price,
+    zones
+):
 
     for zone in reversed(zones):
 
-        if zone["low"] <= price <= zone["high"]:
+        if (
+            zone["low"]
+            <= price
+            <= zone["high"]
+        ):
 
             return zone
 
@@ -647,66 +832,166 @@ def detect_zone_tap(price, zones):
 
 
 # ============================================================
-# 12. CONFIRMATION CANDLE
-# ============================================================
-
-def bullish_confirmation(candle):
-    return is_bullish(candle)
-
-
-def bearish_confirmation(candle):
-    return is_bearish(candle)
-
-
-# ============================================================
-# 13. MTF CONDITION
+# LEVEL INVALIDATION
 #
 # Rulebook:
-#
-# C1:
-# D = 4H = 1H
-# -> trade 1H level
-#
-# C2:
-# 1H opposite
-# -> trade 4H level
-#
-# C3:
-# 4H + 1H opposite Daily
-# -> trade Daily level
+# Level ke opposite 2 consecutive closes
+# => level invalid.
 # ============================================================
 
-def determine_condition(daily, h4, h1):
+def level_invalidated(
+    candles,
+    level,
+    direction
+):
+
+    if len(candles) < 3:
+        return False
+
+    c1 = candles[-2]
+    c2 = candles[-1]
+
+    price = level["price"]
+
+    if direction == "BUY":
+
+        return (
+            c1["close"] < price
+            and
+            c2["close"] < price
+        )
+
+    if direction == "SELL":
+
+        return (
+            c1["close"] > price
+            and
+            c2["close"] > price
+        )
+
+    return True
+
+
+# ============================================================
+# PLAYED LEVEL TRACKING
+#
+# Once a level produces a completed setup/trade,
+# don't repeatedly trade same level.
+# ============================================================
+
+def level_key(
+    symbol,
+    level_tf,
+    level
+):
+
+    return (
+        f"{symbol}|"
+        f"{level_tf}|"
+        f"{level['name']}|"
+        f"{level['created']}"
+    )
+
+
+def is_level_played(
+    symbol,
+    level_tf,
+    level
+):
+
+    key = level_key(
+        symbol,
+        level_tf,
+        level
+    )
+
+    return key in played_levels
+
+
+def mark_level_played(
+    symbol,
+    level_tf,
+    level
+):
+
+    key = level_key(
+        symbol,
+        level_tf,
+        level
+    )
+
+    played_levels[key] = {
+        "time": now(),
+        "price": level["price"],
+    }
+
+
+# ============================================================
+# MTF RULEBOOK
+# ============================================================
+
+def determine_condition(
+    daily,
+    h4,
+    h1
+):
 
     d = daily["trend"]
-    h4t = h4["trend"]
-    h1t = h1["trend"]
+    h = h4["trend"]
+    o = h1["trend"]
 
+    # C1
     if (
-        d == h4t
-        and h4t == h1t
-        and d in ("BULLISH", "BEARISH")
+        d in (
+            "BULLISH",
+            "BEARISH"
+        )
+        and
+        d == h == o
     ):
+
         return "C1"
 
+    # C2
+    # Daily and 4H aligned,
+    # 1H opposite.
     if (
-        d in ("BULLISH", "BEARISH")
-        and h4t == d
-        and h1t != d
+        d in (
+            "BULLISH",
+            "BEARISH"
+        )
+        and
+        h == d
+        and
+        o != d
     ):
+
         return "C2"
 
+    # C3
+    # 4H + 1H opposite Daily.
     if (
-        d in ("BULLISH", "BEARISH")
-        and h4t != d
-        and h1t != d
+        d in (
+            "BULLISH",
+            "BEARISH"
+        )
+        and
+        h != d
+        and
+        o != d
     ):
+
         return "C3"
 
     return "WAIT"
 
 
-def condition_direction(condition, daily, h4, h1):
+def condition_direction(
+    condition,
+    daily,
+    h4,
+    h1
+):
 
     if condition == "C1":
         return h1["trend"]
@@ -721,18 +1006,169 @@ def condition_direction(condition, daily, h4, h1):
 
 
 # ============================================================
-# 14. TARGET / SL
-#
-# Rulebook:
-# SL structure/zone ke opposite side.
-# TP next HTF reaction zone.
+# CONFIRMATION MAPPING
 # ============================================================
 
-def calculate_trade_levels(
+def confirmation_mapping(
+    condition
+):
+
+    if condition == "C1":
+
+        return (
+            "1H",
+            "1M",
+        )
+
+    if condition == "C2":
+
+        return (
+            "4H",
+            "5M",
+        )
+
+    if condition == "C3":
+
+        # Daily level
+        # 1H CHOCH
+        # 1M final confirmation
+        return (
+            "DAILY",
+            "1M",
+        )
+
+    return (
+        None,
+        None
+    )
+
+
+# ============================================================
+# CONFIRMATION CANDLE
+# ============================================================
+
+def confirmation_candle(
+    candles,
+    direction
+):
+
+    if not candles:
+        return False
+
+    candle = candles[-1]
+
+    if direction == "BUY":
+        return bullish(candle)
+
+    if direction == "SELL":
+        return bearish(candle)
+
+    return False
+
+
+# ============================================================
+# A+ SCORE
+#
+# Maximum 100
+#
+# MTF direction       20
+# Relevant level      20
+# Tap                  15
+# CHOCH               20
+# Confirmation        15
+# RR >= minimum       10
+# ============================================================
+
+def score_setup(
+    direction,
+    condition,
+    level_hit,
+    zone_hit,
+    choch,
+    confirmation_ok,
+    rr
+):
+
+    score = 0
+    reasons = []
+
+    if condition == "C1":
+        score += 20
+        reasons.append(
+            "Daily-4H-1H aligned"
+        )
+
+    elif condition == "C2":
+        score += 20
+        reasons.append(
+            "4H direction priority"
+        )
+
+    elif condition == "C3":
+        score += 20
+        reasons.append(
+            "Daily direction priority"
+        )
+
+    if level_hit:
+        score += 20
+        reasons.append(
+            "TGL level tap"
+        )
+
+    if zone_hit:
+        score += 15
+        reasons.append(
+            "Supply/Demand"
+        )
+
+    if choch:
+        score += 20
+        reasons.append(
+            "2-close CHOCH"
+        )
+
+    if confirmation_ok:
+        score += 15
+        reasons.append(
+            "Confirmation candle"
+        )
+
+    if rr >= MIN_RR:
+        score += 10
+        reasons.append(
+            "RR valid"
+        )
+
+    grade = (
+        "A+"
+        if score >= 85
+        else
+        "A"
+        if score >= 75
+        else
+        "B"
+        if score >= 60
+        else
+        "WAIT"
+    )
+
+    return (
+        score,
+        grade,
+        reasons
+    )
+
+
+# ============================================================
+# SL / TP ENGINE
+# ============================================================
+
+def calculate_sl_tp(
     direction,
     entry,
-    structure,
-    zones,
+    level,
+    structure_data,
     higher_candles
 ):
 
@@ -742,51 +1178,84 @@ def calculate_trade_levels(
 
     if direction == "BUY":
 
-        candidate_lows = [
-            x["price"] for x in lows
+        candidates = [
+            x["price"]
+            for x in lows
             if x["price"] < entry
         ]
 
-        if not candidate_lows:
+        if not candidates:
             return None
 
-        sl = min(candidate_lows[-3:])
+        structure_low = min(
+            candidates[-3:]
+        )
 
-        candidate_targets = [
-            x["price"] for x in highs
+        # SL outside structure
+        buffer = (
+            abs(entry - structure_low)
+            * 0.10
+        )
+
+        sl = (
+            structure_low
+            - buffer
+        )
+
+        targets = [
+            x["price"]
+            for x in highs
             if x["price"] > entry
         ]
 
-        if not candidate_targets:
+        if not targets:
             return None
 
-        tp = min(candidate_targets)
+        tp = min(targets)
 
     else:
 
-        candidate_highs = [
-            x["price"] for x in highs
+        candidates = [
+            x["price"]
+            for x in highs
             if x["price"] > entry
         ]
 
-        if not candidate_highs:
+        if not candidates:
             return None
 
-        sl = max(candidate_highs[-3:])
+        structure_high = max(
+            candidates[-3:]
+        )
 
-        candidate_targets = [
-            x["price"] for x in lows
+        buffer = (
+            abs(structure_high - entry)
+            * 0.10
+        )
+
+        sl = (
+            structure_high
+            + buffer
+        )
+
+        targets = [
+            x["price"]
+            for x in lows
             if x["price"] < entry
         ]
 
-        if not candidate_targets:
+        if not targets:
             return None
 
-        tp = max(candidate_targets)
+        tp = max(targets)
 
-    risk = abs(entry - sl)
+    risk = abs(
+        entry - sl
+    )
 
-    reward = abs(tp - entry)
+    reward = abs(
+        tp - entry
+    )
 
     if risk <= 0:
         return None
@@ -805,128 +1274,30 @@ def calculate_trade_levels(
 
 
 # ============================================================
-# 15. A+ SCORE
-# ============================================================
-
-def calculate_setup_score(
-    direction,
-    condition,
-    structure,
-    tgl_levels,
-    zones,
-    price,
-    choch
-):
-
-    score = 0
-    reasons = []
-
-    # Core: MTF structure
-    if (
-        structure["trend"] == direction
-    ):
-        score += 30
-        reasons.append("HTF Structure")
-
-    # Condition
-    if condition == "C1":
-        score += 20
-        reasons.append("MTF Aligned")
-
-    elif condition == "C2":
-        score += 15
-        reasons.append("4H Direction")
-
-    elif condition == "C3":
-        score += 10
-        reasons.append("Daily Direction")
-
-    # TGL
-    tolerance = price * 0.002
-
-    tgl_hit = False
-
-    for level in tgl_levels:
-
-        if price_tapped_level(
-            price,
-            level["price"],
-            tolerance
-        ):
-            tgl_hit = True
-            break
-
-    if tgl_hit:
-        score += 20
-        reasons.append("TGL Tap")
-
-    # Demand / Supply
-    zone = detect_zone_tap(
-        price,
-        zones
-    )
-
-    if zone:
-
-        if (
-            direction == "BUY"
-            and zone["type"] == "DEMAND"
-        ):
-            score += 15
-            reasons.append("Demand")
-
-        elif (
-            direction == "SELL"
-            and zone["type"] == "SUPPLY"
-        ):
-            score += 15
-            reasons.append("Supply")
-
-    # CHOCH
-    if choch:
-        score += 15
-        reasons.append("CHOCH")
-
-    if score >= 80:
-        grade = "A+"
-
-    elif score >= 65:
-        grade = "A"
-
-    elif score >= 50:
-        grade = "B"
-
-    else:
-        grade = "WAIT"
-
-    return score, grade, reasons
-
-
-# ============================================================
-# 16. TRADE ENGINE
+# CREATE SIGNAL
 # ============================================================
 
 def create_signal(symbol):
 
-    # -------------------------------
-    # HTF DATA
-    # -------------------------------
+    # --------------------------------------------------------
+    # LOAD HTF
+    # --------------------------------------------------------
 
     daily_candles = get_klines(
         symbol,
-        TIMEFRAMES["daily"],
-        200
+        TF["DAILY"],
+        250
     )
 
     h4_candles = get_klines(
         symbol,
-        TIMEFRAMES["4h"],
-        200
+        TF["4H"],
+        250
     )
 
     h1_candles = get_klines(
         symbol,
-        TIMEFRAMES["1h"],
+        TF["1H"],
         250
     )
 
@@ -935,254 +1306,374 @@ def create_signal(symbol):
         and h4_candles
         and h1_candles
     ):
+
         return None
 
-    daily_structure = detect_structure(
+    daily = structure(
         daily_candles
     )
 
-    h4_structure = detect_structure(
+    h4 = structure(
         h4_candles
     )
 
-    h1_structure = detect_structure(
+    h1 = structure(
         h1_candles
     )
 
+    # --------------------------------------------------------
+    # MTF CONDITION
+    # --------------------------------------------------------
+
     condition = determine_condition(
-        daily_structure,
-        h4_structure,
-        h1_structure
+        daily,
+        h4,
+        h1
     )
 
     if condition == "WAIT":
+
         return None
 
-    direction = condition_direction(
-        condition,
-        daily_structure,
-        h4_structure,
-        h1_structure
+    direction = (
+        condition_direction(
+            condition,
+            daily,
+            h4,
+            h1
+        )
     )
 
     if direction not in (
         "BULLISH",
         "BEARISH"
     ):
+
         return None
 
-    # -------------------------------
-    # Select trading level
-    # -------------------------------
+    trade_direction = (
+        direction_from_trend(
+            direction
+        )
+    )
+
+    # --------------------------------------------------------
+    # SELECT LEVEL TF
+    # --------------------------------------------------------
+
+    level_tf, confirmation_tf = (
+        confirmation_mapping(
+            condition
+        )
+    )
 
     if condition == "C1":
 
-        level_tf = "1H"
         level_candles = h1_candles
-        confirmation_tf = "1M"
 
     elif condition == "C2":
 
-        level_tf = "4H"
         level_candles = h4_candles
-        confirmation_tf = "5M"
 
     else:
 
-        level_tf = "DAILY"
         level_candles = daily_candles
-        confirmation_tf = "1H"
 
-    # -------------------------------
+    # --------------------------------------------------------
     # TGL
-    # -------------------------------
+    # --------------------------------------------------------
 
     tgl_levels = calculate_tgl(
         level_candles
     )
 
-    # -------------------------------
-    # Demand / Supply
-    # -------------------------------
+    if not tgl_levels:
+        return None
 
-    zones = detect_demand_supply(
-        level_candles
+    # --------------------------------------------------------
+    # PRICE
+    # --------------------------------------------------------
+
+    price = get_price(
+        symbol
     )
-
-    # -------------------------------
-    # Current price
-    # -------------------------------
-
-    price = get_live_price(symbol)
 
     if price <= 0:
         return None
 
-    tolerance = price * 0.002
+    # --------------------------------------------------------
+    # LEVEL INVALIDATION
+    # --------------------------------------------------------
 
-    # Price must reach relevant level
-    level_tapped = any(
-        price_tapped_level(
-            price,
-            level["price"],
-            tolerance
-        )
-        for level in tgl_levels
-    )
+    valid_levels = []
 
-    zone_tapped = detect_zone_tap(
-        price,
-        zones
-    )
+    for level in tgl_levels:
 
-    # Rulebook:
-    # Level देखकर direct trade nahi.
-    # Price must come to relevant area.
+        if not level_invalidated(
+            level_candles,
+            level,
+            trade_direction
+        ):
 
-    if not level_tapped and not zone_tapped:
+            valid_levels.append(
+                level
+            )
+
+        else:
+
+            bot_stats[
+                "invalidated"
+            ] += 1
+
+    if not valid_levels:
         return None
 
-    # -------------------------------
-    # Confirmation timeframe
-    # -------------------------------
+    # --------------------------------------------------------
+    # PRICE TAP
+    # --------------------------------------------------------
 
-    confirmation_candles = get_klines(
-        symbol,
-        TIMEFRAMES[
-            {
-                "1M": "1m",
-                "5M": "5m",
-                "1H": "1h",
-            }[confirmation_tf]
-        ],
-        200
+    tapped_level = (
+        find_touched_level(
+            price,
+            valid_levels
+        )
+    )
+
+    zones = detect_zones(
+        level_candles
+    )
+
+    tapped_zone = (
+        find_touched_zone(
+            price,
+            zones
+        )
+    )
+
+    if (
+        not tapped_level
+        and not tapped_zone
+    ):
+
+        bot_stats["waits"] += 1
+
+        return None
+
+    # --------------------------------------------------------
+    # ALREADY PLAYED LEVEL
+    # --------------------------------------------------------
+
+    if tapped_level:
+
+        if is_level_played(
+            symbol,
+            level_tf,
+            tapped_level
+        ):
+
+            return None
+
+    # --------------------------------------------------------
+    # COUNTER TREND FILTER
+    # --------------------------------------------------------
+
+    if condition == "C1":
+
+        allowed_trend = (
+            h1["trend"]
+        )
+
+    elif condition == "C2":
+
+        allowed_trend = (
+            h4["trend"]
+        )
+
+    else:
+
+        allowed_trend = (
+            daily["trend"]
+        )
+
+    if (
+        direction
+        != allowed_trend
+    ):
+
+        return None
+
+    # --------------------------------------------------------
+    # CONFIRMATION DATA
+    # --------------------------------------------------------
+
+    confirmation_candles = (
+        get_klines(
+            symbol,
+            TF[
+                confirmation_tf
+            ],
+            200
+        )
     )
 
     if not confirmation_candles:
         return None
 
-    choch = detect_choch(
-        confirmation_candles
-    )
+    # --------------------------------------------------------
+    # CHOCH
+    # --------------------------------------------------------
 
-    if not choch:
-        return None
+    if condition == "C1":
 
-    expected_choch = (
-        "BULLISH"
-        if direction == "BULLISH"
-        else "BEARISH"
-    )
+        # 1H level -> 1M CHOCH
+        choch = detect_choch(
+            confirmation_candles
+        )
 
-    if choch["direction"] != expected_choch:
-        return None
+        expected = direction
 
-    # Daily special:
-    # Daily -> 1H CHOCH -> 1M confirmation
-    if condition == "C3":
+    elif condition == "C2":
 
-        one_hour_choch = detect_choch(
+        # 4H level -> 5M CHOCH
+        choch = detect_choch(
+            confirmation_candles
+        )
+
+        expected = direction
+
+    else:
+
+        # Daily:
+        # Daily -> 1H CHOCH
+        h1_choch = detect_choch(
             h1_candles
         )
 
-        if not one_hour_choch:
+        if not h1_choch:
             return None
 
         if (
-            one_hour_choch["direction"]
-            != expected_choch
+            h1_choch["direction"]
+            != direction
         ):
             return None
 
-        final_confirmation_candles = get_klines(
-            symbol,
-            "1m",
-            100
+        # Then 1M final confirmation
+        confirmation_candles = (
+            get_klines(
+                symbol,
+                TF["1M"],
+                200
+            )
         )
 
-        if not final_confirmation_candles:
-            return None
+        choch = h1_choch
 
-        final_candle = final_confirmation_candles[-1]
+        expected = direction
 
-    else:
+    if not choch:
 
-        final_candle = confirmation_candles[-1]
-
-    # -------------------------------
-    # Confirmation candle
-    # -------------------------------
-
-    if direction == "BULLISH":
-
-        if not bullish_confirmation(
-            final_candle
-        ):
-            return None
-
-        signal_direction = "BUY"
-
-    else:
-
-        if not bearish_confirmation(
-            final_candle
-        ):
-            return None
-
-        signal_direction = "SELL"
-
-    # -------------------------------
-    # Setup score
-    # -------------------------------
-
-    score, grade, reasons = calculate_setup_score(
-        direction,
-        condition,
-        level_candles_structure := detect_structure(
-            level_candles
-        ),
-        tgl_levels,
-        zones,
-        price,
-        choch
-    )
-
-    # Only high quality setups
-    if score < 65:
         return None
 
-    # Beginner/A+ mode
-    if os.environ.get(
-        "A_PLUS_ONLY",
-        "false"
-    ).lower() == "true":
+    if (
+        choch["direction"]
+        != expected
+    ):
 
-        if grade != "A+":
-            return None
+        return None
 
-    # -------------------------------
+    # --------------------------------------------------------
+    # FINAL CONFIRMATION
+    # --------------------------------------------------------
+
+    confirmation_ok = (
+        confirmation_candle(
+            confirmation_candles,
+            trade_direction
+        )
+    )
+
+    if not confirmation_ok:
+
+        return None
+
+    # --------------------------------------------------------
+    # ENTRY
+    # --------------------------------------------------------
+
+    entry = price
+
+    level_structure = structure(
+        level_candles
+    )
+
+    # --------------------------------------------------------
     # SL / TP
-    # -------------------------------
+    # --------------------------------------------------------
 
-    levels = calculate_trade_levels(
-        signal_direction,
-        price,
-        level_candles_structure,
-        zones,
+    levels = calculate_sl_tp(
+        trade_direction,
+        entry,
+        tapped_level,
+        level_structure,
         level_candles
     )
 
     if not levels:
+
         return None
+
+    # --------------------------------------------------------
+    # SCORE
+    # --------------------------------------------------------
+
+    score, grade, reasons = (
+        score_setup(
+            trade_direction,
+            condition,
+            tapped_level is not None,
+            tapped_zone is not None,
+            choch is not None,
+            confirmation_ok,
+            levels["rr"],
+        )
+    )
+
+    if A_PLUS_ONLY:
+
+        if grade != "A+":
+
+            return None
+
+    else:
+
+        if score < 75:
+
+            return None
+
+    # --------------------------------------------------------
+    # MARK LEVEL PLAYED
+    # --------------------------------------------------------
+
+    if tapped_level:
+
+        mark_level_played(
+            symbol,
+            level_tf,
+            tapped_level
+        )
+
+    # --------------------------------------------------------
+    # SIGNAL
+    # --------------------------------------------------------
 
     return {
         "symbol": symbol,
-        "direction": signal_direction,
+        "direction": trade_direction,
         "condition": condition,
         "level_tf": level_tf,
         "confirmation_tf": confirmation_tf,
-        "choch": "BULLISH" if signal_direction == "BUY"
-        else "BEARISH",
+        "choch": choch["direction"],
         "entry": levels["entry"],
         "sl": levels["sl"],
         "tp": levels["tp"],
@@ -1190,81 +1681,100 @@ def create_signal(symbol):
         "score": score,
         "grade": grade,
         "reasons": reasons,
-        "created_at": now_string(),
+        "created_at": now(),
     }
 
 
 # ============================================================
-# 17. PAPER TRADE MANAGEMENT
+# PAPER TRADE
 # ============================================================
 
-def open_paper_trade(signal):
+def open_trade(signal):
 
     symbol = signal["symbol"]
 
-    # Only one active trade per symbol
     if symbol in active_trades:
         return False
 
-    trade_id = (
-        f"{symbol}_"
-        f"{int(time.time())}"
-    )
-
     trade = {
-        "id": trade_id,
+        "id": (
+            f"{symbol}_"
+            f"{int(time.time())}"
+        ),
         "symbol": symbol,
-        "direction": signal["direction"],
-        "entry": signal["entry"],
-        "sl": signal["sl"],
-        "tp": signal["tp"],
-        "rr": signal["rr"],
-        "score": signal["score"],
-        "grade": signal["grade"],
-        "condition": signal["condition"],
-        "level_tf": signal["level_tf"],
-        "confirmation_tf": signal["confirmation_tf"],
-        "opened_at": now_string(),
+        "direction":
+            signal["direction"],
+        "entry":
+            signal["entry"],
+        "sl":
+            signal["sl"],
+        "tp":
+            signal["tp"],
+        "rr":
+            signal["rr"],
+        "score":
+            signal["score"],
+        "grade":
+            signal["grade"],
+        "condition":
+            signal["condition"],
+        "level_tf":
+            signal["level_tf"],
+        "confirmation_tf":
+            signal["confirmation_tf"],
+        "opened_at": now(),
         "status": "OPEN",
     }
 
-    active_trades[symbol] = trade
+    active_trades[
+        symbol
+    ] = trade
 
-    send_trade_signal(signal)
+    bot_stats[
+        "signals"
+    ] += 1
+
+    signal_alert(
+        signal
+    )
 
     return True
 
 
-def monitor_active_trades():
+# ============================================================
+# PAPER TRADE MONITOR
+# ============================================================
+
+def monitor_trades():
 
     for symbol, trade in list(
         active_trades.items()
     ):
 
-        price = get_live_price(symbol)
+        price = get_price(
+            symbol
+        )
 
         if price <= 0:
             continue
 
-        direction = trade["direction"]
-
         result = None
         exit_price = None
-        r_multiple = 0.0
+        r = 0.0
 
-        if direction == "BUY":
+        if trade["direction"] == "BUY":
 
             if price <= trade["sl"]:
 
                 result = "LOSS"
                 exit_price = trade["sl"]
-                r_multiple = -1.0
+                r = -1.0
 
             elif price >= trade["tp"]:
 
                 result = "WIN"
                 exit_price = trade["tp"]
-                r_multiple = trade["rr"]
+                r = trade["rr"]
 
         else:
 
@@ -1272,113 +1782,252 @@ def monitor_active_trades():
 
                 result = "LOSS"
                 exit_price = trade["sl"]
-                r_multiple = -1.0
+                r = -1.0
 
             elif price <= trade["tp"]:
 
                 result = "WIN"
                 exit_price = trade["tp"]
-                r_multiple = trade["rr"]
+                r = trade["rr"]
 
-        if result:
+        if not result:
+            continue
 
-            trade["exit"] = exit_price
-            trade["status"] = result
-            trade["closed_at"] = now_string()
-            trade["r_multiple"] = r_multiple
+        trade["exit"] = (
+            exit_price
+        )
 
-            trade_history.appendleft(
-                trade.copy()
-            )
+        trade["status"] = (
+            result
+        )
 
-            if result == "WIN":
-                bot_stats["wins"] += 1
+        trade["closed_at"] = (
+            now()
+        )
 
-            else:
-                bot_stats["losses"] += 1
+        trade["r_multiple"] = r
 
-            bot_stats["total_r"] += r_multiple
+        trade_history.appendleft(
+            trade.copy()
+        )
 
-            send_result_alert(
-                trade,
-                result,
-                r_multiple
-            )
+        if result == "WIN":
 
-            del active_trades[symbol]
+            bot_stats[
+                "wins"
+            ] += 1
+
+        else:
+
+            bot_stats[
+                "losses"
+            ] += 1
+
+        bot_stats[
+            "total_r"
+        ] += r
+
+        result_alert(
+            trade,
+            result,
+            r
+        )
+
+        del active_trades[
+            symbol
+        ]
 
 
 # ============================================================
-# 18. MARKET MATRIX
+# STATISTICS
 # ============================================================
 
-def update_market_matrix():
+def statistics():
+
+    wins = bot_stats[
+        "wins"
+    ]
+
+    losses = bot_stats[
+        "losses"
+    ]
+
+    total = (
+        wins + losses
+    )
+
+    win_rate = (
+        wins / total * 100
+        if total
+        else 0
+    )
+
+    avg_r = (
+        bot_stats["total_r"]
+        / total
+        if total
+        else 0
+    )
+
+    return {
+        "total_trades": total,
+        "wins": wins,
+        "losses": losses,
+        "win_rate":
+            round(
+                win_rate,
+                2
+            ),
+        "total_r":
+            round(
+                bot_stats[
+                    "total_r"
+                ],
+                2
+            ),
+        "average_r":
+            round(
+                avg_r,
+                3
+            ),
+        "active_trades":
+            len(
+                active_trades
+            ),
+    }
+
+
+# ============================================================
+# MARKET MATRIX
+# ============================================================
+
+def update_market():
 
     for symbol in SYMBOLS:
 
-        price = get_live_price(symbol)
+        try:
 
-        daily = get_klines(
-            symbol,
-            "1d",
-            100
-        )
+            price = get_price(
+                symbol
+            )
 
-        h1 = get_klines(
-            symbol,
-            "1h",
-            100
-        )
+            daily = get_klines(
+                symbol,
+                TF["DAILY"],
+                100
+            )
 
-        if not daily or not h1:
-            continue
+            h4 = get_klines(
+                symbol,
+                TF["4H"],
+                100
+            )
 
-        daily_structure = detect_structure(
-            daily
-        )
+            h1 = get_klines(
+                symbol,
+                TF["1H"],
+                100
+            )
 
-        h1_structure = detect_structure(
-            h1
-        )
+            if not (
+                daily
+                and h4
+                and h1
+            ):
+                continue
 
-        h1_choch = detect_choch(
-            h1
-        )
+            d = structure(
+                daily
+            )
 
-        structure_text = (
-            h1_choch["direction"] + " CHOCH"
-            if h1_choch
-            else h1_structure["trend"]
-        )
+            h = structure(
+                h4
+            )
 
-        market_pairs[symbol] = {
-            "price": format_price(price),
-            "trend_daily": daily_structure["trend"],
-            "trend_1h": h1_structure["trend"],
-            "structure": structure_text,
-        }
+            o = structure(
+                h1
+            )
+
+            condition = (
+                determine_condition(
+                    d,
+                    h,
+                    o
+                )
+            )
+
+            h1_choch = (
+                detect_choch(
+                    h1
+                )
+            )
+
+            choch_text = (
+                h1_choch[
+                    "direction"
+                ]
+                if h1_choch
+                else "-"
+            )
+
+            market_pairs[
+                symbol
+            ] = {
+
+                "price":
+                    price_format(
+                        price
+                    ),
+
+                "daily":
+                    d["trend"],
+
+                "4h":
+                    h["trend"],
+
+                "1h":
+                    o["trend"],
+
+                "condition":
+                    condition,
+
+                "choch":
+                    choch_text,
+            }
+
+        except Exception as exc:
+
+            print(
+                "Market update error:",
+                symbol,
+                exc
+            )
 
 
 # ============================================================
-# 19. BACKGROUND SCANNER
+# SCANNER
 # ============================================================
 
-def background_trading_scanner():
+def scanner():
 
     print(
-        "🚀 Rulebook Trading Scanner Started"
+        "Rulebook SMC "
+        "Paper Trading Bot started."
     )
 
-    bot_stats["status"] = "ONLINE"
+    bot_stats[
+        "status"
+    ] = "ONLINE"
 
-    send_telegram_message(
+    telegram(
         "🤖 <b>RULEBOOK SMC BOT ONLINE</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "Strategy:\n"
+        "Paper Trading Only\n"
         "Daily → 4H → 1H\n"
-        "TGL + Structure + CHOCH\n"
-        "Confirmation Entry\n"
-        "Paper Trading Mode\n"
+        "TGL → Tap → CHOCH\n"
+        "Fakeout Filter\n"
+        "A+ Confluence\n"
+        "0.5% Risk Framework\n"
         "━━━━━━━━━━━━━━━━━━"
     )
 
@@ -1386,35 +2035,48 @@ def background_trading_scanner():
 
         try:
 
-            bot_stats["last_scan"] = now_string()
+            bot_stats[
+                "last_scan"
+            ] = now()
 
-            update_market_matrix()
+            update_market()
 
-            # First manage existing trades
-            monitor_active_trades()
+            monitor_trades()
 
-            # Then search for new signals
             for symbol in SYMBOLS:
+
+                if symbol in active_trades:
+                    continue
 
                 try:
 
-                    if symbol in active_trades:
-                        continue
-
-                    signal = create_signal(
-                        symbol
+                    signal = (
+                        create_signal(
+                            symbol
+                        )
                     )
 
                     if signal:
 
-                        opened = open_paper_trade(
-                            signal
+                        opened = (
+                            open_trade(
+                                signal
+                            )
                         )
 
                         if opened:
+
                             print(
-                                "NEW SIGNAL:",
-                                signal
+                                "OPEN:",
+                                signal[
+                                    "symbol"
+                                ],
+                                signal[
+                                    "direction"
+                                ],
+                                signal[
+                                    "entry"
+                                ]
                             )
 
                     time.sleep(1)
@@ -1422,7 +2084,8 @@ def background_trading_scanner():
                 except Exception as exc:
 
                     print(
-                        f"Signal error {symbol}:",
+                        "Signal error:",
+                        symbol,
                         exc
                     )
 
@@ -1433,7 +2096,7 @@ def background_trading_scanner():
         except Exception as exc:
 
             print(
-                "Scanner loop error:",
+                "Scanner error:",
                 exc
             )
 
@@ -1441,59 +2104,15 @@ def background_trading_scanner():
 
 
 # ============================================================
-# 20. STATISTICS
+# FLASK
 # ============================================================
 
-def get_statistics():
-
-    wins = bot_stats["wins"]
-    losses = bot_stats["losses"]
-
-    total = wins + losses
-
-    win_rate = (
-        wins / total * 100
-        if total > 0
-        else 0
-    )
-
-    avg_r = (
-        bot_stats["total_r"] / total
-        if total > 0
-        else 0
-    )
-
-    return {
-        "total_trades": total,
-        "wins": wins,
-        "losses": losses,
-        "win_rate": round(
-            win_rate,
-            2
-        ),
-        "total_r": round(
-            bot_stats["total_r"],
-            2
-        ),
-        "average_r": round(
-            avg_r,
-            3
-        ),
-        "active_trades": len(
-            active_trades
-        ),
-    }
+app = Flask(
+    __name__
+)
 
 
-# ============================================================
-# 21. FLASK APP
-# ============================================================
-
-app = Flask(__name__)
-
-
-DASHBOARD_HTML = """
-
+HTML = """
 <!DOCTYPE html>
 
 <html>
@@ -1503,146 +2122,154 @@ DASHBOARD_HTML = """
 <meta charset="UTF-8">
 
 <meta name="viewport"
-content="width=device-width, initial-scale=1.0">
+content="width=device-width,initial-scale=1">
 
 <title>
-Rulebook SMC AI Dashboard
+Rulebook SMC Paper Trading
 </title>
 
 <style>
 
 * {
-    box-sizing: border-box;
+    box-sizing:border-box;
 }
 
 body {
-    margin: 0;
-    background: #0d1117;
-    color: #c9d1d9;
+    margin:0;
+    background:#0d1117;
+    color:#c9d1d9;
     font-family:
-        -apple-system,
-        BlinkMacSystemFont,
-        "Segoe UI",
-        sans-serif;
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
 }
 
 .container {
-    max-width: 1300px;
-    margin: auto;
-    padding: 20px;
+    max-width:1400px;
+    margin:auto;
+    padding:20px;
 }
 
 .header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 15px;
-    padding-bottom: 20px;
-    border-bottom: 1px solid #30363d;
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    border-bottom:
+    1px solid #30363d;
+    padding-bottom:18px;
 }
 
 .online {
-    color: #3fb950;
-    font-weight: bold;
+    color:#3fb950;
+    font-weight:bold;
 }
 
 .grid {
-    display: grid;
+    display:grid;
     grid-template-columns:
-        repeat(auto-fit, minmax(170px, 1fr));
-    gap: 15px;
-    margin: 25px 0;
+    repeat(auto-fit,minmax(160px,1fr));
+    gap:15px;
+    margin:25px 0;
 }
 
 .card {
-    background: #161b22;
-    border: 1px solid #30363d;
-    border-radius: 12px;
-    padding: 18px;
+    background:#161b22;
+    border:1px solid #30363d;
+    border-radius:12px;
+    padding:18px;
 }
 
 .card h3 {
-    margin: 0 0 10px;
-    color: #8b949e;
-    font-size: 12px;
-    text-transform: uppercase;
+    margin:0 0 10px;
+    color:#8b949e;
+    font-size:12px;
+    text-transform:uppercase;
 }
 
 .value {
-    font-size: 25px;
-    font-weight: bold;
-}
-
-table {
-    width: 100%;
-    border-collapse: collapse;
-    background: #161b22;
-    margin-top: 15px;
-    border-radius: 10px;
-    overflow: hidden;
-}
-
-th,
-td {
-    padding: 12px;
-    border-bottom: 1px solid #30363d;
-    text-align: left;
-}
-
-th {
-    background: #21262d;
-    color: #8b949e;
-}
-
-.bull {
-    color: #3fb950;
-    font-weight: bold;
-}
-
-.bear {
-    color: #f85149;
-    font-weight: bold;
-}
-
-.wait {
-    color: #e3b341;
-}
-
-.section {
-    margin-top: 30px;
-}
-
-.trade-open {
-    color: #58a6ff;
+    font-size:26px;
+    font-weight:bold;
 }
 
 .win {
-    color: #3fb950;
+    color:#3fb950;
 }
 
 .loss {
-    color: #f85149;
+    color:#f85149;
+}
+
+.wait {
+    color:#e3b341;
+}
+
+.blue {
+    color:#58a6ff;
+}
+
+table {
+    width:100%;
+    border-collapse:collapse;
+    background:#161b22;
+    border:1px solid #30363d;
+    border-radius:10px;
+    overflow:hidden;
+}
+
+th,td {
+    padding:11px;
+    border-bottom:
+    1px solid #30363d;
+    text-align:left;
+}
+
+th {
+    background:#21262d;
+    color:#8b949e;
+    font-size:12px;
+}
+
+.bull {
+    color:#3fb950;
+    font-weight:bold;
+}
+
+.bear {
+    color:#f85149;
+    font-weight:bold;
+}
+
+.section {
+    margin-top:30px;
 }
 
 .log {
-    background: #161b22;
-    border: 1px solid #30363d;
-    border-radius: 10px;
-    padding: 15px;
-    max-height: 400px;
-    overflow-y: auto;
+    background:#161b22;
+    border:1px solid #30363d;
+    border-radius:10px;
+    padding:15px;
+    max-height:400px;
+    overflow:auto;
 }
 
 .log-item {
-    padding: 10px;
-    border-bottom: 1px solid #21262d;
-    font-family: monospace;
-    font-size: 12px;
+    padding:10px;
+    border-bottom:
+    1px solid #21262d;
+    font-family:monospace;
+    font-size:12px;
 }
 
 .small {
-    color: #8b949e;
-    font-size: 12px;
+    color:#8b949e;
+    font-size:12px;
+}
+
+.badge {
+    padding:4px 8px;
+    border-radius:5px;
+    background:#21262d;
 }
 
 </style>
@@ -1658,11 +2285,11 @@ th {
 <div>
 
 <h1>
-⚡ Rulebook SMC AI
+⚡ Rulebook SMC
 </h1>
 
 <div class="small">
-TGL + MTF + CHOCH + Price Action
+Paper Trading • MTF • TGL • CHOCH
 </div>
 
 </div>
@@ -1706,22 +2333,29 @@ TGL + MTF + CHOCH + Price Action
 
 <div class="card">
 <h3>Total R</h3>
-<div class="value">
+<div class="value blue">
 {{ performance.total_r }}R
 </div>
 </div>
 
 <div class="card">
 <h3>Average R</h3>
-<div class="value">
+<div class="value blue">
 {{ performance.average_r }}R
 </div>
 </div>
 
 <div class="card">
-<h3>Active Trades</h3>
-<div class="value trade-open">
+<h3>Active</h3>
+<div class="value">
 {{ performance.active_trades }}
+</div>
+</div>
+
+<div class="card">
+<h3>Risk / Trade</h3>
+<div class="value">
+{{ risk }}%
 </div>
 </div>
 
@@ -1731,26 +2365,22 @@ TGL + MTF + CHOCH + Price Action
 <div class="section">
 
 <h2>
-📊 Market Matrix
+📊 MTF Market Matrix
 </h2>
 
 <table>
-
-<thead>
 
 <tr>
 <th>Symbol</th>
 <th>Price</th>
 <th>Daily</th>
+<th>4H</th>
 <th>1H</th>
-<th>Structure</th>
+<th>Condition</th>
+<th>1H CHOCH</th>
 </tr>
 
-</thead>
-
-<tbody>
-
-{% for symbol, data in pairs.items() %}
+{% for symbol,data in pairs.items() %}
 
 <tr>
 
@@ -1763,34 +2393,48 @@ TGL + MTF + CHOCH + Price Action
 </td>
 
 <td class="
-{{ 'bull' if data.trend_daily == 'BULLISH'
-else 'bear' if data.trend_daily == 'BEARISH'
+{{ 'bull'
+if data.daily == 'BULLISH'
+else 'bear'
+if data.daily == 'BEARISH'
 else 'wait' }}
 ">
-
-{{ data.trend_daily }}
-
+{{ data.daily }}
 </td>
 
 <td class="
-{{ 'bull' if data.trend_1h == 'BULLISH'
-else 'bear' if data.trend_1h == 'BEARISH'
+{{ 'bull'
+if data['4h'] == 'BULLISH'
+else 'bear'
+if data['4h'] == 'BEARISH'
 else 'wait' }}
 ">
+{{ data['4h'] }}
+</td>
 
-{{ data.trend_1h }}
-
+<td class="
+{{ 'bull'
+if data['1h'] == 'BULLISH'
+else 'bear'
+if data['1h'] == 'BEARISH'
+else 'wait' }}
+">
+{{ data['1h'] }}
 </td>
 
 <td>
-{{ data.structure }}
+<span class="badge">
+{{ data.condition }}
+</span>
+</td>
+
+<td>
+{{ data.choch }}
 </td>
 
 </tr>
 
 {% endfor %}
-
-</tbody>
 
 </table>
 
@@ -1805,8 +2449,6 @@ else 'wait' }}
 
 <table>
 
-<thead>
-
 <tr>
 <th>Symbol</th>
 <th>Direction</th>
@@ -1815,13 +2457,10 @@ else 'wait' }}
 <th>TP</th>
 <th>RR</th>
 <th>Grade</th>
+<th>Condition</th>
 </tr>
 
-</thead>
-
-<tbody>
-
-{% for symbol, trade in active.items() %}
+{% for symbol,trade in active.items() %}
 
 <tr>
 
@@ -1830,11 +2469,8 @@ else 'wait' }}
 <td class="
 {{ 'bull'
 if trade.direction == 'BUY'
-else 'bear' }}
-">
-
+else 'bear' }}">
 {{ trade.direction }}
-
 </td>
 
 <td>
@@ -1857,19 +2493,21 @@ else 'bear' }}
 {{ trade.grade }}
 </td>
 
+<td>
+{{ trade.condition }}
+</td>
+
 </tr>
 
 {% else %}
 
 <tr>
-<td colspan="7">
-No active trades
+<td colspan="8">
+No active paper trades.
 </td>
 </tr>
 
 {% endfor %}
-
-</tbody>
 
 </table>
 
@@ -1879,12 +2517,10 @@ No active trades
 <div class="section">
 
 <h2>
-📈 Trade History
+📈 Completed Trades
 </h2>
 
 <table>
-
-<thead>
 
 <tr>
 <th>Symbol</th>
@@ -1892,13 +2528,10 @@ No active trades
 <th>Result</th>
 <th>R</th>
 <th>Grade</th>
+<th>Condition</th>
 <th>Opened</th>
 <th>Closed</th>
 </tr>
-
-</thead>
-
-<tbody>
 
 {% for trade in history %}
 
@@ -1906,16 +2539,15 @@ No active trades
 
 <td>{{ trade.symbol }}</td>
 
-<td>{{ trade.direction }}</td>
+<td>
+{{ trade.direction }}
+</td>
 
 <td class="
 {{ 'win'
 if trade.status == 'WIN'
-else 'loss' }}
-">
-
+else 'loss' }}">
 {{ trade.status }}
-
 </td>
 
 <td>
@@ -1924,6 +2556,10 @@ else 'loss' }}
 
 <td>
 {{ trade.grade }}
+</td>
+
+<td>
+{{ trade.condition }}
 </td>
 
 <td>
@@ -1939,14 +2575,12 @@ else 'loss' }}
 {% else %}
 
 <tr>
-<td colspan="7">
+<td colspan="8">
 No completed trades yet.
 </td>
 </tr>
 
 {% endfor %}
-
-</tbody>
 
 </table>
 
@@ -1966,7 +2600,7 @@ No completed trades yet.
 <div class="log-item">
 
 <div class="small">
-{{ msg.timestamp }}
+{{ msg.time }}
 </div>
 
 <div>
@@ -1977,9 +2611,7 @@ No completed trades yet.
 
 {% else %}
 
-<div>
-No messages.
-</div>
+No Telegram messages.
 
 {% endfor %}
 
@@ -1995,18 +2627,25 @@ Last scan:
 
 <br><br>
 
+Paper Trading Only
+
+<br><br>
+
 <a href="/api/stats">
-Raw JSON API
+API /api/stats
 </a>
 
 </div>
 
 </div>
 
+
 <script>
 
 setTimeout(
-    () => location.reload(),
+    function() {
+        location.reload();
+    },
     15000
 );
 
@@ -2015,27 +2654,38 @@ setTimeout(
 </body>
 
 </html>
-
 """
 
 
+# ============================================================
+# ROUTES
+# ============================================================
+
 @app.route("/")
-def home():
+def dashboard():
 
     return render_template_string(
-        DASHBOARD_HTML,
+        HTML,
         stats=bot_stats,
-        performance=get_statistics(),
+        performance=statistics(),
         pairs=market_pairs,
         active=active_trades,
-        history=list(trade_history),
+        history=list(
+            trade_history
+        ),
         messages=list(
-            recent_telegram_messages
+            recent_messages
+        ),
+        risk=(
+            RISK_PER_TRADE
+            * 100
         ),
     )
 
 
-@app.route("/api/stats")
+@app.route(
+    "/api/stats"
+)
 def api_stats():
 
     return jsonify({
@@ -2043,7 +2693,7 @@ def api_stats():
         "bot": bot_stats,
 
         "performance":
-            get_statistics(),
+            statistics(),
 
         "active_trades":
             list(
@@ -2051,23 +2701,27 @@ def api_stats():
             ),
 
         "trade_history":
-            list(trade_history),
+            list(
+                trade_history
+            ),
+
+        "played_levels":
+            played_levels,
 
         "market":
             market_pairs,
 
-        "telegram_messages":
-            list(
-                recent_telegram_messages
-            ),
-
     })
 
 
-@app.route("/api/signal/<symbol>")
+@app.route(
+    "/api/signal/<symbol>"
+)
 def api_signal(symbol):
 
-    symbol = normalize_symbol(symbol)
+    symbol = normalize_symbol(
+        symbol
+    )
 
     signal = create_signal(
         symbol
@@ -2076,37 +2730,60 @@ def api_signal(symbol):
     if not signal:
 
         return jsonify({
+
             "status": "WAIT",
+
             "symbol": symbol,
+
             "message":
-                "No valid Rulebook setup."
+                "No valid Rulebook setup.",
+
         })
 
     return jsonify({
-        "status": "SIGNAL",
-        "signal": signal
+
+        "status":
+            "SIGNAL",
+
+        "signal":
+            signal,
+
     })
 
 
-@app.route("/api/health")
+@app.route(
+    "/api/health"
+)
 def health():
 
     return jsonify({
-        "status": bot_stats["status"],
-        "last_scan": bot_stats["last_scan"],
+
+        "status":
+            bot_stats[
+                "status"
+            ],
+
+        "last_scan":
+            bot_stats[
+                "last_scan"
+            ],
+
         "active_trades":
-            len(active_trades),
+            len(
+                active_trades
+            ),
+
     })
 
 
 # ============================================================
-# 22. START
+# START
 # ============================================================
 
-def start_scanner():
+def start_bot():
 
     thread = threading.Thread(
-        target=background_trading_scanner,
+        target=scanner,
         daemon=True
     )
 
@@ -2115,7 +2792,7 @@ def start_scanner():
 
 if __name__ == "__main__":
 
-    start_scanner()
+    start_bot()
 
     port = int(
         os.environ.get(
@@ -2125,7 +2802,28 @@ if __name__ == "__main__":
     )
 
     print(
-        f"Dashboard running on port {port}"
+        f"""
+========================================
+ RULEBOOK SMC PAPER TRADING BOT
+========================================
+
+ Dashboard:
+ http://localhost:{port}
+
+ API:
+ http://localhost:{port}/api/stats
+
+ Mode:
+ PAPER TRADING ONLY
+
+ Risk:
+ {RISK_PER_TRADE * 100:.2f}% per trade
+
+ A+ ONLY:
+ {A_PLUS_ONLY}
+
+========================================
+"""
     )
 
     app.run(
