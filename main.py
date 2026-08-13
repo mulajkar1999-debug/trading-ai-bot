@@ -25,8 +25,8 @@ from flask import Flask, jsonify, render_template_string
 # 1. CONFIG
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8723192534:AAFqkexJpF-yu38dPI0cEUT6H0nooN_sjdM", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "1317739622")
 
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
 BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/price"
