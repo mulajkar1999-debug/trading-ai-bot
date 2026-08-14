@@ -16,12 +16,10 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "1317739622")
 # ==========================================
 # 📈 EXCHANGE SETUP (BYBIT FOR NO REGION BLOCK)
 # ==========================================
-# ccxt.bybit US/Render servers par 451 Location Restricted Error nahi deta.
 exchange = ccxt.bybit({
     'enableRateLimit': True,
 })
 
-# Scanning Assets & Global Memory
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
 active_trades = []
 trade_logs = []
@@ -30,36 +28,36 @@ trade_logs = []
 # 📲 TELEGRAM NOTIFIER FUNCTION
 # ==========================================
 def send_telegram(message):
-    """Telegram par text alert bhejne ke liye function"""
+    """Telegram par HTML Alert Bhejne Ka Function"""
     if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID_HERE":
-        print(f"[Telegram Skip] Token/Chat ID set nahi hai. Message: {message}")
+        print(f"[Telegram Skip] Token/Chat ID set nahi hai.")
         return
         
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
-        "parse_mode": "Markdown"
+        "parse_mode": "HTML"
     }
     try:
-        requests.post(url, json=payload, timeout=5)
+        res = requests.post(url, json=payload, timeout=5)
+        if res.status_code != 200:
+            print(f"Telegram API Error: {res.text}")
     except Exception as e:
-        print(f"Telegram Notification Error: {e}")
+        print(f"Telegram Exception: {e}")
 
 # ==========================================
 # 🔍 SMC STRATEGY LOGIC & SCANNER
 # ==========================================
 def fetch_candles(symbol, timeframe, limit=30):
-    """Bybit se Candlestick Data Fetch Karne Ka Function"""
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         return ohlcv
     except Exception as e:
-        print(f"Error fetching candles for {symbol} ({timeframe}): {e}")
+        print(f"Candle Fetch Error ({symbol} {timeframe}): {e}")
         return None
 
 def get_4h_trend(symbol):
-    """4-Hour Trend Direction Check Logic"""
     candles = fetch_candles(symbol, timeframe='4h', limit=20)
     if not candles or len(candles) < 20:
         return 'NEUTRAL'
@@ -75,79 +73,74 @@ def get_4h_trend(symbol):
     return 'NEUTRAL'
 
 def check_15m_choch(symbol, trend_4h):
-    """15-Minute Change of Character (CHOCH) Confirmation Logic"""
     candles = fetch_candles(symbol, timeframe='15m', limit=5)
     if not candles or len(candles) < 3:
         return None
     
-    last_candle = candles[-2]  # Recently closed candle
+    last_candle = candles[-2]  # Recent closed candle
     prev_candle = candles[-3]
     
-    # Bullish CHOCH (BUY)
-    if trend_4h == 'BULLISH' and last_candle[4] > prev_candle[2]: # Close > Prev High
+    if trend_4h == 'BULLISH' and last_candle[4] > prev_candle[2]: 
         return 'BUY'
-    # Bearish CHOCH (SELL)
-    elif trend_4h == 'BEARISH' and last_candle[4] < prev_candle[3]: # Close < Prev Low
+    elif trend_4h == 'BEARISH' and last_candle[4] < prev_candle[3]: 
         return 'SELL'
         
     return None
 
 def background_trading_scanner():
-    """Continuous Background Scanner Thread (Runs every 30s)"""
     global active_trades, trade_logs
     print("🚀 SMC Scanner Engine Started with Bybit Feed...")
     
     while True:
         try:
             for symbol in SYMBOLS:
-                # 1. Active Trade Management & Outcome Tracking
                 ticker = exchange.fetch_ticker(symbol)
                 current_price = ticker['last']
                 
+                # Active Trades Management
                 for trade in active_trades[:]:
                     if trade['symbol'] == symbol:
-                        # Check BUY Trade Targets
+                        # BUY Position Management
                         if trade['type'] == 'BUY':
-                            # Check TP2 (Full Win)
                             if current_price >= trade['tp2']:
-                                msg = f"🎉 *TRADE RESULT: TP2 HIT (JACKPOT) 🟢*\n━━━━━━━━━━━━━━━━━━\n📍 *Asset:* {symbol}\n🚀 *Exit Price:* {current_price:.2f}"
+                                msg = f"<b>🎉 TRADE RESULT: TP2 HIT (JACKPOT) 🟢</b>\n━━━━━━━━━━━━━━━━━━\n📍 <b>Asset:</b> {symbol}\n🚀 <b>Exit Price:</b> {current_price:.2f}"
                                 send_telegram(msg)
                                 trade_logs.append(f"[WIN TP2] {symbol} @ {current_price:.2f}")
                                 active_trades.remove(trade)
-                            # Check TP1 (Auto Break-Even)
                             elif current_price >= trade['tp1'] and not trade.get('tp1_hit'):
                                 trade['tp1_hit'] = True
-                                trade['sl'] = trade['entry'] # Shift Stoploss to Entry
-                                msg = f"🎯 *TRADE RESULT: TP1 HIT 🟢*\n━━━━━━━━━━━━━━━━━━\n📍 *Asset:* {symbol}\n🎯 *Exit:* {current_price:.2f}\n🛡️ *Action:* SL Shifted to Entry (Break-Even)"
+                                trade['sl'] = trade['entry']
+                                msg = f"<b>🎯 TRADE RESULT: TP1 HIT 🟢</b>\n━━━━━━━━━━━━━━━━━━\n📍 <b>Asset:</b> {symbol}\n🎯 <b>Exit:</b> {current_price:.2f}\n🛡️ <b>Action:</b> SL Shifted to Break-Even"
                                 send_telegram(msg)
-                                trade_logs.append(f"[TP1 HIT] {symbol} - SL Trailed to Break-Even")
-                            # Check SL
+                                trade_logs.append(f"[TP1 HIT] {symbol} - SL Trailed")
                             elif current_price <= trade['sl']:
-                                msg = f"🛑 *TRADE RESULT: {'BREAK-EVEN EXIT' if trade.get('tp1_hit') else 'SL HIT'} 🔴*\n━━━━━━━━━━━━━━━━━━\n📍 *Asset:* {symbol}\n🛑 *Exit Price:* {current_price:.2f}"
+                                status = 'BREAK-EVEN EXIT' if trade.get('tp1_hit') else 'SL HIT'
+                                msg = f"<b>🛑 TRADE RESULT: {status} 🔴</b>\n━━━━━━━━━━━━━━━━━━\n📍 <b>Asset:</b> {symbol}\n🛑 <b>Exit Price:</b> {current_price:.2f}"
                                 send_telegram(msg)
-                                trade_logs.append(f"[{'BREAK-EVEN' if trade.get('tp1_hit') else 'LOSS'}] {symbol} @ {current_price:.2f}")
+                                trade_logs.append(f"[{status}] {symbol} @ {current_price:.2f}")
                                 active_trades.remove(trade)
 
-                        # Check SELL Trade Targets
+                        # SELL Position Management
                         elif trade['type'] == 'SELL':
                             if current_price <= trade['tp2']:
-                                msg = f"🎉 *TRADE RESULT: TP2 HIT (JACKPOT) 🟢*\n━━━━━━━━━━━━━━━━━━\n📍 *Asset:* {symbol}\n🚀 *Exit Price:* {current_price:.2f}"
+                                msg = f"<b>🎉 TRADE RESULT: TP2 HIT (JACKPOT) 🟢</b>\n━━━━━━━━━━━━━━━━━━\n📍 <b>Asset:</b> {symbol}\n🚀 <b>Exit Price:</b> {current_price:.2f}"
                                 send_telegram(msg)
                                 trade_logs.append(f"[WIN TP2] {symbol} @ {current_price:.2f}")
                                 active_trades.remove(trade)
                             elif current_price <= trade['tp1'] and not trade.get('tp1_hit'):
                                 trade['tp1_hit'] = True
                                 trade['sl'] = trade['entry']
-                                msg = f"🎯 *TRADE RESULT: TP1 HIT 🟢*\n━━━━━━━━━━━━━━━━━━\n📍 *Asset:* {symbol}\n🎯 *Exit:* {current_price:.2f}\n🛡️ *Action:* SL Shifted to Entry (Break-Even)"
+                                msg = f"<b>🎯 TRADE RESULT: TP1 HIT 🟢</b>\n━━━━━━━━━━━━━━━━━━\n📍 <b>Asset:</b> {symbol}\n🎯 <b>Exit:</b> {current_price:.2f}\n🛡️ <b>Action:</b> SL Shifted to Break-Even"
                                 send_telegram(msg)
-                                trade_logs.append(f"[TP1 HIT] {symbol} - SL Trailed to Break-Even")
+                                trade_logs.append(f"[TP1 HIT] {symbol} - SL Trailed")
                             elif current_price >= trade['sl']:
-                                msg = f"🛑 *TRADE RESULT: {'BREAK-EVEN EXIT' if trade.get('tp1_hit') else 'SL HIT'} 🔴*\n━━━━━━━━━━━━━━━━━━\n📍 *Asset:* {symbol}\n🛑 *Exit Price:* {current_price:.2f}"
+                                status = 'BREAK-EVEN EXIT' if trade.get('tp1_hit') else 'SL HIT'
+                                msg = f"<b>🛑 TRADE RESULT: {status} 🔴</b>\n━━━━━━━━━━━━━━━━━━\n📍 <b>Asset:</b> {symbol}\n🛑 <b>Exit Price:</b> {current_price:.2f}"
                                 send_telegram(msg)
-                                trade_logs.append(f"[{'BREAK-EVEN' if trade.get('tp1_hit') else 'LOSS'}] {symbol} @ {current_price:.2f}")
+                                trade_logs.append(f"[{status}] {symbol} @ {current_price:.2f}")
                                 active_trades.remove(trade)
 
-                # 2. Check New Trade Signals (If no open trade for this symbol)
+                # Check New Signal
                 has_active = any(t['symbol'] == symbol for t in active_trades)
                 if not has_active:
                     trend_4h = get_4h_trend(symbol)
@@ -156,15 +149,14 @@ def background_trading_scanner():
                     if signal:
                         entry = current_price
                         if signal == 'BUY':
-                            sl = entry * 0.992    # 0.8% SL
-                            tp1 = entry * 1.012   # 1:1.5 RR
-                            tp2 = entry * 1.024   # 1:3 RR
-                        else: # SELL
+                            sl = entry * 0.992
+                            tp1 = entry * 1.012
+                            tp2 = entry * 1.024
+                        else:
                             sl = entry * 1.008
                             tp1 = entry * 0.988
                             tp2 = entry * 0.976
 
-                        # Save to memory
                         new_trade = {
                             'symbol': symbol,
                             'type': signal,
@@ -176,32 +168,28 @@ def background_trading_scanner():
                         }
                         active_trades.append(new_trade)
 
-                        # Telegram Notification
+                        icon = '🟢' if signal == 'BUY' else '🔴'
                         alert_msg = (
-                            f"⚡ *NEW SMC TRADE SIGNAL ({signal}) {'🟢' if signal == 'BUY' else '🔴'}*\n"
+                            f"<b>⚡ NEW SMC TRADE SIGNAL ({signal}) {icon}</b>\n"
                             f"━━━━━━━━━━━━━━━━━━\n"
-                            f"📍 *Asset:* {symbol}\n"
-                            f"⌛ *Timeframe:* 15M CHOCH Confirmation\n"
-                            f"🎯 *Entry:* {entry:.2f}\n"
-                            f"🛑 *Stop Loss:* {sl:.2f}\n"
-                            f"🎯 *Target 1 (TP1):* {tp1:.2f}\n"
-                            f"🎯 *Target 2 (TP2):* {tp2:.2f}\n"
+                            f"📍 <b>Asset:</b> {symbol}\n"
+                            f"⌛ <b>Timeframe:</b> 15M CHOCH Confirmation\n"
+                            f"🎯 <b>Entry:</b> {entry:.2f}\n"
+                            f"🛑 <b>Stop Loss:</b> {sl:.2f}\n"
+                            f"🎯 <b>Target 1 (TP1):</b> {tp1:.2f}\n"
+                            f"🎯 <b>Target 2 (TP2):</b> {tp2:.2f}\n"
                             f"━━━━━━━━━━━━━━━━━━"
                         )
                         send_telegram(alert_msg)
                         trade_logs.append(f"[NEW SIGNAL] {signal} {symbol} Entry: {entry:.2f}")
 
         except Exception as e:
-            print(f"Scanner Loop Error: {e}")
+            print(f"Scanner Loop Exception: {e}")
 
-        time.sleep(30) # Scan loop runs every 30 seconds
-
-# Start Background Scanner in a Thread
-scanner_thread = threading.Thread(target=background_trading_scanner, daemon=True)
-scanner_thread.start()
+        time.sleep(30)
 
 # ==========================================
-# 🌐 FLASK WEB DASHBOARD (BROWSER UI)
+# 🌐 FLASK WEB DASHBOARD
 # ==========================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -296,5 +284,9 @@ def home():
     return render_template_string(HTML_TEMPLATE, active_trades=active_trades, trade_logs=trade_logs)
 
 if __name__ == "__main__":
+    # Start scanner thread safely
+    scanner_thread = threading.Thread(target=background_trading_scanner, daemon=True)
+    scanner_thread.start()
+    
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
