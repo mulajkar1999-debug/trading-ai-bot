@@ -6,11 +6,11 @@ from datetime import datetime, timezone
 
 import requests
 import ccxt
-from flask import Flask, render_template_string, jsonify
+from flask import Flask, jsonify, render_template_string
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("8723192534:AAFqkexJpF-yu38dPI0cEUT6H0nooN_sjdM", "")
@@ -20,14 +20,27 @@ DB_FILE = os.getenv("DB_FILE", "trading_bot.db")
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
 
-# Core symbols
-SYMBOLS = [
+# ============================================================
+# BYBIT SYMBOLS
+# ============================================================
+
+REQUESTED_SYMBOLS = [
     "BTC/USDT",
     "ETH/USDT",
     "SOL/USDT",
+    "XRP/USDT",
+    "BNB/USDT",
+    "DOGE/USDT",
+    "ADA/USDT",
+    "AVAX/USDT",
 ]
 
-# Rulebook timeframes
+SYMBOLS = []
+
+# ============================================================
+# TIMEFRAMES
+# ============================================================
+
 TF_DAILY = "1d"
 TF_4H = "4h"
 TF_1H = "1h"
@@ -35,17 +48,22 @@ TF_15M = "15m"
 TF_5M = "5m"
 TF_1M = "1m"
 
-# Risk rules
+CANDLE_LIMIT = 150
+
+# ============================================================
+# RISK / QUALITY SETTINGS
+# ============================================================
+
 MIN_RR = 1.50
 MAX_SL_PERCENT = 1.50
 
-# How many candles to fetch
-CANDLE_LIMIT = 150
+# Minimum setup score
+MIN_SETUP_SCORE = 80
 
-# Don't repeatedly trade same level
+# Same level par repeated trade avoid
 LEVEL_COOLDOWN_MINUTES = 60
 
-# Maximum number of simultaneous paper trades
+# Maximum active paper trades
 MAX_ACTIVE_TRADES = 3
 
 
@@ -78,7 +96,6 @@ trade_logs = []
 state_lock = threading.Lock()
 
 last_signal_key = {}
-invalidated_levels = set()
 
 
 # ============================================================
@@ -93,6 +110,7 @@ def db_connect():
 
 
 def init_db():
+
     conn = db_connect()
     cur = conn.cursor()
 
@@ -127,23 +145,42 @@ def init_db():
 
 
 def db_log_event(event):
+
     try:
+
         conn = db_connect()
+
         conn.execute(
-            "INSERT INTO events(timestamp,event) VALUES (?,?)",
-            (datetime.now(timezone.utc).isoformat(), event)
+            """
+            INSERT INTO events(timestamp,event)
+            VALUES (?,?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                event
+            )
         )
+
         conn.commit()
         conn.close()
+
     except Exception as e:
         print("DB event error:", e)
 
 
-def db_save_trade(trade, result, exit_price, r_multiple):
+def db_save_trade(
+    trade,
+    result,
+    exit_price,
+    r_multiple
+):
+
     try:
+
         conn = db_connect()
 
-        conn.execute("""
+        conn.execute(
+            """
             INSERT INTO trades(
                 timestamp,
                 symbol,
@@ -159,20 +196,22 @@ def db_save_trade(trade, result, exit_price, r_multiple):
                 reason
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            datetime.now(timezone.utc).isoformat(),
-            trade["symbol"],
-            trade["type"],
-            trade["entry"],
-            trade["sl"],
-            trade["tp1"],
-            trade["tp2"],
-            result,
-            exit_price,
-            r_multiple,
-            trade.get("score", 0),
-            trade.get("reason", "")
-        ))
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                trade["symbol"],
+                trade["type"],
+                trade["entry"],
+                trade["initial_sl"],
+                trade["tp1"],
+                trade["tp2"],
+                result,
+                exit_price,
+                r_multiple,
+                trade.get("score", 0),
+                trade.get("reason", "")
+            )
+        )
 
         conn.commit()
         conn.close()
@@ -186,13 +225,15 @@ def db_save_trade(trade, result, exit_price, r_multiple):
 # ============================================================
 
 def send_telegram(message):
+
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+
         print("[Telegram disabled]")
         return
 
     url = (
-        f"https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
     payload = {
@@ -202,6 +243,7 @@ def send_telegram(message):
     }
 
     try:
+
         response = requests.post(
             url,
             json=payload,
@@ -209,10 +251,16 @@ def send_telegram(message):
         )
 
         if response.status_code != 200:
-            print("Telegram error:", response.text)
+            print(
+                "Telegram error:",
+                response.text
+            )
 
     except Exception as e:
-        print("Telegram exception:", e)
+        print(
+            "Telegram exception:",
+            e
+        )
 
 
 # ============================================================
@@ -220,14 +268,15 @@ def send_telegram(message):
 # ============================================================
 
 def log_event(message):
+
     print(message)
 
     with state_lock:
+
         trade_logs.append(
             f"{datetime.now().strftime('%H:%M:%S')} | {message}"
         )
 
-        # Prevent unlimited RAM growth
         if len(trade_logs) > 500:
             del trade_logs[:-500]
 
@@ -235,35 +284,112 @@ def log_event(message):
 
 
 # ============================================================
+# MARKET VALIDATION
+# ============================================================
+
+def validate_symbols():
+
+    global SYMBOLS
+
+    try:
+
+        print("Loading Bybit markets...")
+
+        exchange.load_markets()
+
+        available = []
+
+        for symbol in REQUESTED_SYMBOLS:
+
+            if symbol in exchange.markets:
+
+                market = exchange.markets[symbol]
+
+                # We want spot USDT symbols
+                if (
+                    market.get("spot")
+                    and market.get("quote") == "USDT"
+                ):
+                    available.append(symbol)
+
+                else:
+                    print(
+                        f"[SKIP] {symbol} "
+                        f"not a USDT spot market"
+                    )
+
+            else:
+
+                print(
+                    f"[SKIP] {symbol} "
+                    f"not available on Bybit"
+                )
+
+        SYMBOLS = available
+
+        print(
+            "Validated Bybit symbols:",
+            ", ".join(SYMBOLS)
+        )
+
+    except Exception as e:
+
+        print(
+            "Market validation error:",
+            e
+        )
+
+        SYMBOLS = []
+
+
+# ============================================================
 # MARKET DATA
 # ============================================================
 
-def fetch_candles(symbol, timeframe, limit=CANDLE_LIMIT):
+def fetch_candles(
+    symbol,
+    timeframe,
+    limit=CANDLE_LIMIT
+):
+
     try:
-        candles = exchange.fetch_ohlcv(
+
+        return exchange.fetch_ohlcv(
             symbol,
             timeframe=timeframe,
             limit=limit
         )
 
-        if not candles:
-            return []
-
-        return candles
-
     except Exception as e:
+
         print(
-            f"Candle error | {symbol} | {timeframe} | {e}"
+            f"Candle error | "
+            f"{symbol} | "
+            f"{timeframe} | {e}"
         )
+
         return []
 
 
 def fetch_price(symbol):
+
     try:
+
         ticker = exchange.fetch_ticker(symbol)
+
+        if ticker.get("last") is None:
+            return None
+
         return float(ticker["last"])
+
     except Exception as e:
-        print("Price error:", symbol, e)
+
+        print(
+            "Price error:",
+            symbol,
+            e
+        )
+
         return None
 
 
@@ -288,11 +414,17 @@ def candle_close(c):
 
 
 def candle_body(c):
-    return abs(candle_close(c) - candle_open(c))
+    return abs(
+        candle_close(c) -
+        candle_open(c)
+    )
 
 
 def candle_range(c):
-    return candle_high(c) - candle_low(c)
+    return (
+        candle_high(c) -
+        candle_low(c)
+    )
 
 
 def is_bullish(c):
@@ -304,6 +436,7 @@ def is_bearish(c):
 
 
 def body_ratio(c):
+
     r = candle_range(c)
 
     if r <= 0:
@@ -316,45 +449,81 @@ def body_ratio(c):
 # SWING DETECTION
 # ============================================================
 
-def find_swing_highs(candles, left=2, right=2):
+def find_swing_highs(
+    candles,
+    left=2,
+    right=2
+):
+
     highs = []
 
-    for i in range(left, len(candles) - right):
+    for i in range(
+        left,
+        len(candles) - right
+    ):
+
         h = candle_high(candles[i])
 
         left_highs = [
             candle_high(candles[j])
-            for j in range(i - left, i)
+            for j in range(
+                i - left,
+                i
+            )
         ]
 
         right_highs = [
             candle_high(candles[j])
-            for j in range(i + 1, i + right + 1)
+            for j in range(
+                i + 1,
+                i + right + 1
+            )
         ]
 
-        if h > max(left_highs) and h >= max(right_highs):
+        if (
+            h > max(left_highs)
+            and h >= max(right_highs)
+        ):
             highs.append((i, h))
 
     return highs
 
 
-def find_swing_lows(candles, left=2, right=2):
+def find_swing_lows(
+    candles,
+    left=2,
+    right=2
+):
+
     lows = []
 
-    for i in range(left, len(candles) - right):
+    for i in range(
+        left,
+        len(candles) - right
+    ):
+
         l = candle_low(candles[i])
 
         left_lows = [
             candle_low(candles[j])
-            for j in range(i - left, i)
+            for j in range(
+                i - left,
+                i
+            )
         ]
 
         right_lows = [
             candle_low(candles[j])
-            for j in range(i + 1, i + right + 1)
+            for j in range(
+                i + 1,
+                i + right + 1
+            )
         ]
 
-        if l < min(left_lows) and l <= min(right_lows):
+        if (
+            l < min(left_lows)
+            and l <= min(right_lows)
+        ):
             lows.append((i, l))
 
     return lows
@@ -365,7 +534,9 @@ def find_swing_lows(candles, left=2, right=2):
 # ============================================================
 
 def detect_structure(candles):
+
     if len(candles) < 30:
+
         return {
             "trend": "NEUTRAL",
             "last_high": None,
@@ -374,10 +545,16 @@ def detect_structure(candles):
             "prev_low": None
         }
 
-    highs = find_swing_highs(candles)
-    lows = find_swing_lows(candles)
+    closed = candles[:-1]
 
-    if len(highs) < 2 or len(lows) < 2:
+    highs = find_swing_highs(closed)
+    lows = find_swing_lows(closed)
+
+    if (
+        len(highs) < 2
+        or len(lows) < 2
+    ):
+
         return {
             "trend": "NEUTRAL",
             "last_high": None,
@@ -392,10 +569,16 @@ def detect_structure(candles):
     prev_low = lows[-2][1]
     last_low = lows[-1][1]
 
-    if last_high > prev_high and last_low > prev_low:
+    if (
+        last_high > prev_high
+        and last_low > prev_low
+    ):
         trend = "BULLISH"
 
-    elif last_high < prev_high and last_low < prev_low:
+    elif (
+        last_high < prev_high
+        and last_low < prev_low
+    ):
         trend = "BEARISH"
 
     else:
@@ -410,26 +593,53 @@ def detect_structure(candles):
     }
 
 
-# ============================================================
-# MULTI TIMEFRAME TREND
-# ============================================================
+def get_structure(
+    symbol,
+    timeframe
+):
 
-def get_structure(symbol, timeframe):
-    candles = fetch_candles(symbol, timeframe)
+    candles = fetch_candles(
+        symbol,
+        timeframe
+    )
 
     if not candles:
         return None, []
 
-    return detect_structure(candles), candles
+    return (
+        detect_structure(candles),
+        candles
+    )
 
+
+# ============================================================
+# MTF BIAS
+# ============================================================
 
 def get_mtf_bias(symbol):
-    daily_structure, _ = get_structure(symbol, TF_DAILY)
-    h4_structure, _ = get_structure(symbol, TF_4H)
-    h1_structure, _ = get_structure(symbol, TF_1H)
-    m15_structure, _ = get_structure(symbol, TF_15M)
 
-    if not daily_structure or not h4_structure or not h1_structure:
+    daily, _ = get_structure(
+        symbol,
+        TF_DAILY
+    )
+
+    h4, _ = get_structure(
+        symbol,
+        TF_4H
+    )
+
+    h1, _ = get_structure(
+        symbol,
+        TF_1H
+    )
+
+    m15, _ = get_structure(
+        symbol,
+        TF_15M
+    )
+
+    if not daily or not h4 or not h1:
+
         return {
             "direction": "NEUTRAL",
             "daily": "NEUTRAL",
@@ -438,37 +648,41 @@ def get_mtf_bias(symbol):
             "m15": "NEUTRAL"
         }
 
-    daily = daily_structure["trend"]
-    h4 = h4_structure["trend"]
-    h1 = h1_structure["trend"]
+    trends = [
+        daily["trend"],
+        h4["trend"],
+        h1["trend"]
+    ]
 
-    bullish_score = 0
-    bearish_score = 0
+    bullish = trends.count("BULLISH")
+    bearish = trends.count("BEARISH")
 
-    for trend in [daily, h4, h1]:
-        if trend == "BULLISH":
-            bullish_score += 1
+    if (
+        bullish >= 2
+        and bullish > bearish
+    ):
 
-        elif trend == "BEARISH":
-            bearish_score += 1
-
-    if bullish_score >= 2 and bullish_score > bearish_score:
         direction = "BULLISH"
 
-    elif bearish_score >= 2 and bearish_score > bullish_score:
+    elif (
+        bearish >= 2
+        and bearish > bullish
+    ):
+
         direction = "BEARISH"
 
     else:
+
         direction = "NEUTRAL"
 
     return {
         "direction": direction,
-        "daily": daily,
-        "h4": h4,
-        "h1": h1,
+        "daily": daily["trend"],
+        "h4": h4["trend"],
+        "h1": h1["trend"],
         "m15": (
-            m15_structure["trend"]
-            if m15_structure else "NEUTRAL"
+            m15["trend"]
+            if m15 else "NEUTRAL"
         )
     }
 
@@ -477,57 +691,64 @@ def get_mtf_bias(symbol):
 # CHOCH
 # ============================================================
 
-def detect_choch(candles, expected_direction):
-    """
-    Conservative CHOCH:
-    Bullish = closed candle breaks recent swing high.
-    Bearish = closed candle breaks recent swing low.
-    """
+def detect_choch(
+    candles,
+    direction
+):
 
-    if len(candles) < 20:
+    if len(candles) < 25:
         return False
 
-    # Ignore currently forming candle
     closed = candles[:-1]
 
-    swings_high = find_swing_highs(closed)
-    swings_low = find_swing_lows(closed)
+    highs = find_swing_highs(closed)
+    lows = find_swing_lows(closed)
 
-    if expected_direction == "BUY":
+    if direction == "BUY":
 
-        if not swings_high:
+        if not highs:
             return False
 
-        recent_high = swings_high[-1][1]
-        last_close = candle_close(closed[-1])
+        previous_high = highs[-1][1]
 
-        return last_close > recent_high
+        return (
+            candle_close(closed[-1])
+            > previous_high
+        )
 
-    if expected_direction == "SELL":
+    if direction == "SELL":
 
-        if not swings_low:
+        if not lows:
             return False
 
-        recent_low = swings_low[-1][1]
-        last_close = candle_close(closed[-1])
+        previous_low = lows[-1][1]
 
-        return last_close < recent_low
+        return (
+            candle_close(closed[-1])
+            < previous_low
+        )
 
     return False
 
 
 # ============================================================
-# CONFIRMATION CANDLE
+# CONFIRMATION
 # ============================================================
 
-def confirmation_candle(candle, direction):
+def confirmation_candle(
+    candle,
+    direction
+):
+
     if direction == "BUY":
+
         return (
             is_bullish(candle)
             and body_ratio(candle) >= 0.45
         )
 
     if direction == "SELL":
+
         return (
             is_bearish(candle)
             and body_ratio(candle) >= 0.45
@@ -536,25 +757,33 @@ def confirmation_candle(candle, direction):
     return False
 
 
-# ============================================================
-# ENGULFING
-# ============================================================
+def bullish_engulfing(
+    previous,
+    current
+):
 
-def bullish_engulfing(prev, current):
     return (
-        is_bearish(prev)
+        is_bearish(previous)
         and is_bullish(current)
-        and candle_open(current) <= candle_close(prev)
-        and candle_close(current) >= candle_open(prev)
+        and candle_open(current)
+        <= candle_close(previous)
+        and candle_close(current)
+        >= candle_open(previous)
     )
 
 
-def bearish_engulfing(prev, current):
+def bearish_engulfing(
+    previous,
+    current
+):
+
     return (
-        is_bullish(prev)
+        is_bullish(previous)
         and is_bearish(current)
-        and candle_open(current) >= candle_close(prev)
-        and candle_close(current) <= candle_open(prev)
+        and candle_open(current)
+        >= candle_close(previous)
+        and candle_close(current)
+        <= candle_open(previous)
     )
 
 
@@ -562,43 +791,49 @@ def bearish_engulfing(prev, current):
 # LIQUIDITY SWEEP
 # ============================================================
 
-def detect_liquidity_sweep(candles, direction):
+def detect_liquidity_sweep(
+    candles,
+    direction
+):
+
     if len(candles) < 15:
         return False
 
     closed = candles[:-1]
 
-    recent = closed[-8:-1]
+    previous = closed[-8:-1]
 
-    if not recent:
+    if not previous:
         return False
 
     previous_high = max(
         candle_high(c)
-        for c in recent
+        for c in previous
     )
 
     previous_low = min(
         candle_low(c)
-        for c in recent
+        for c in previous
     )
 
     last = closed[-1]
 
     if direction == "BUY":
 
-        # Low swept and price closed back above it
         return (
-            candle_low(last) < previous_low
-            and candle_close(last) > previous_low
+            candle_low(last)
+            < previous_low
+            and candle_close(last)
+            > previous_low
         )
 
     if direction == "SELL":
 
-        # High swept and price closed back below it
         return (
-            candle_high(last) > previous_high
-            and candle_close(last) < previous_high
+            candle_high(last)
+            > previous_high
+            and candle_close(last)
+            < previous_high
         )
 
     return False
@@ -608,7 +843,11 @@ def detect_liquidity_sweep(candles, direction):
 # FVG
 # ============================================================
 
-def detect_fvg(candles, direction):
+def detect_fvg(
+    candles,
+    direction
+):
+
     if len(candles) < 5:
         return False
 
@@ -619,20 +858,27 @@ def detect_fvg(candles, direction):
 
     if direction == "BUY":
 
-        return candle_low(c) > candle_high(a)
+        return (
+            candle_low(c)
+            > candle_high(a)
+        )
 
     if direction == "SELL":
 
-        return candle_high(c) < candle_low(a)
+        return (
+            candle_high(c)
+            < candle_low(a)
+        )
 
     return False
 
 
 # ============================================================
-# DOUBLE TOP / DOUBLE BOTTOM
+# DOUBLE TOP / BOTTOM
 # ============================================================
 
 def detect_double_bottom(candles):
+
     lows = find_swing_lows(candles)
 
     if len(lows) < 2:
@@ -647,6 +893,7 @@ def detect_double_bottom(candles):
 
 
 def detect_double_top(candles):
+
     highs = find_swing_highs(candles)
 
     if len(highs) < 2:
@@ -665,123 +912,164 @@ def detect_double_top(candles):
 # ============================================================
 
 def detect_demand_zone(candles):
-    if len(candles) < 10:
+
+    if len(candles) < 15:
         return None
 
     closed = candles[:-1]
 
-    for i in range(len(closed) - 4, max(2, len(closed) - 15), -1):
+    start = max(
+        2,
+        len(closed) - 20
+    )
+
+    for i in range(
+        len(closed) - 3,
+        start - 1,
+        -1
+    ):
 
         base = closed[i]
+        next_candle = closed[i + 1]
 
-        if is_bearish(base):
+        if (
+            is_bearish(base)
+            and is_bullish(next_candle)
+            and candle_body(next_candle)
+            > candle_body(base)
+        ):
 
-            next1 = closed[i + 1]
-
-            if is_bullish(next1) and candle_body(next1) > candle_body(base):
-                return {
-                    "low": candle_low(base),
-                    "high": candle_high(base),
-                    "index": i
-                }
+            return {
+                "low": candle_low(base),
+                "high": candle_high(base),
+                "index": i
+            }
 
     return None
 
 
 def detect_supply_zone(candles):
-    if len(candles) < 10:
+
+    if len(candles) < 15:
         return None
 
     closed = candles[:-1]
 
-    for i in range(len(closed) - 4, max(2, len(closed) - 15), -1):
+    start = max(
+        2,
+        len(closed) - 20
+    )
+
+    for i in range(
+        len(closed) - 3,
+        start - 1,
+        -1
+    ):
 
         base = closed[i]
+        next_candle = closed[i + 1]
 
-        if is_bullish(base):
+        if (
+            is_bullish(base)
+            and is_bearish(next_candle)
+            and candle_body(next_candle)
+            > candle_body(base)
+        ):
 
-            next1 = closed[i + 1]
-
-            if is_bearish(next1) and candle_body(next1) > candle_body(base):
-                return {
-                    "low": candle_low(base),
-                    "high": candle_high(base),
-                    "index": i
-                }
+            return {
+                "low": candle_low(base),
+                "high": candle_high(base),
+                "index": i
+            }
 
     return None
 
 
-def price_inside_zone(price, zone):
-    if not zone:
-        return False
-
-    return (
-        zone["low"] <= price <= zone["high"]
-    )
-
-
 # ============================================================
-# TGL
+# TGL STYLE LEVEL
 # ============================================================
 
-def detect_tgl(candles, direction):
-    """
-    Conservative TGL approximation.
-
-    Uses recent strong impulse + opposite candle.
-    """
+def detect_tgl(
+    candles,
+    direction
+):
 
     if len(candles) < 20:
         return None
 
     closed = candles[:-1]
 
-    for i in range(len(closed) - 3, max(3, len(closed) - 20), -1):
+    start = max(
+        3,
+        len(closed) - 20
+    )
 
-        c = closed[i]
+    for i in range(
+        len(closed) - 3,
+        start - 1,
+        -1
+    ):
+
+        current = closed[i]
+        following = closed[i + 1]
 
         if direction == "BUY":
 
-            if is_bearish(c):
+            if (
+                is_bearish(current)
+                and is_bullish(following)
+                and body_ratio(following) >= 0.55
+            ):
 
-                following = closed[i + 1]
+                return {
+                    "low": candle_low(current),
+                    "high": candle_high(current),
+                    "index": i
+                }
 
-                if (
-                    is_bullish(following)
-                    and body_ratio(following) > 0.55
-                ):
-                    return {
-                        "low": candle_low(c),
-                        "high": candle_high(c),
-                        "index": i
-                    }
+        elif direction == "SELL":
 
-        if direction == "SELL":
+            if (
+                is_bullish(current)
+                and is_bearish(following)
+                and body_ratio(following) >= 0.55
+            ):
 
-            if is_bullish(c):
-
-                following = closed[i + 1]
-
-                if (
-                    is_bearish(following)
-                    and body_ratio(following) > 0.55
-                ):
-                    return {
-                        "low": candle_low(c),
-                        "high": candle_high(c),
-                        "index": i
-                    }
+                return {
+                    "low": candle_low(current),
+                    "high": candle_high(current),
+                    "index": i
+                }
 
     return None
 
 
 # ============================================================
-# LEVEL INVALIDATION
+# LEVEL HELPERS
 # ============================================================
 
-def level_invalidated(candles, zone, direction):
-    if not zone or len(candles) < 3:
+def price_inside_zone(
+    price,
+    zone
+):
+
+    if not zone:
+        return False
+
+    return (
+        zone["low"]
+        <= price
+        <= zone["high"]
+    )
+
+
+def level_invalidated(
+    candles,
+    zone,
+    direction
+):
+
+    if not zone or len(candles) < 4:
         return False
 
     closed = candles[:-1]
@@ -792,35 +1080,35 @@ def level_invalidated(candles, zone, direction):
     if direction == "BUY":
 
         return (
-            candle_close(c1) < zone["low"]
-            and candle_close(c2) < zone["low"]
+            candle_close(c1)
+            < zone["low"]
+            and candle_close(c2)
+            < zone["low"]
         )
 
     if direction == "SELL":
 
         return (
-            candle_close(c1) > zone["high"]
-            and candle_close(c2) > zone["high"]
+            candle_close(c1)
+            > zone["high"]
+            and candle_close(c2)
+            > zone["high"]
         )
 
     return False
 
 
 # ============================================================
-# SESSION FILTER
+# SESSION / MARKET QUALITY FILTER
 # ============================================================
 
 def session_filter():
-    """
-    Conservative crypto filter.
 
-    Crypto runs 24/7, therefore this is not a hard
-    exchange-hours filter.
-    """
+    hour = datetime.now(
+        timezone.utc
+    ).hour
 
-    hour = datetime.now(timezone.utc).hour
-
-    # Avoid very thin early UTC hours
+    # Avoid quiet early UTC period
     if 0 <= hour < 4:
         return False
 
@@ -828,48 +1116,70 @@ def session_filter():
 
 
 # ============================================================
-# SETUP SCORE
+# SETUP ENGINE
 # ============================================================
 
-def calculate_setup(symbol, direction, price):
-    """
-    Rulebook hierarchy:
-
-    Core:
-      1. MTF structure
-      2. Level
-      3. CHOCH
-      4. Candle confirmation
-
-    Extra:
-      FVG
-      Liquidity sweep
-      Demand/Supply
-      Double top/bottom
-      TGL
-    """
+def calculate_setup(
+    symbol,
+    direction,
+    price
+):
 
     if not session_filter():
         return None
 
     bias = get_mtf_bias(symbol)
 
-    if direction == "BUY" and bias["direction"] != "BULLISH":
+    # --------------------------------------------------------
+    # MTF direction must agree
+    # --------------------------------------------------------
+
+    if (
+        direction == "BUY"
+        and bias["direction"] != "BULLISH"
+    ):
         return None
 
-    if direction == "SELL" and bias["direction"] != "BEARISH":
-        return None
-
-    h1 = fetch_candles(symbol, TF_1H)
-    m15 = fetch_candles(symbol, TF_15M)
-    m5 = fetch_candles(symbol, TF_5M)
-    m1 = fetch_candles(symbol, TF_1M)
-
-    if not h1 or not m15 or not m5 or not m1:
+    if (
+        direction == "SELL"
+        and bias["direction"] != "BEARISH"
+    ):
         return None
 
     # --------------------------------------------------------
-    # Primary Level
+    # Fetch lower timeframes
+    # --------------------------------------------------------
+
+    h1 = fetch_candles(
+        symbol,
+        TF_1H
+    )
+
+    m15 = fetch_candles(
+        symbol,
+        TF_15M
+    )
+
+    m5 = fetch_candles(
+        symbol,
+        TF_5M
+    )
+
+    m1 = fetch_candles(
+        symbol,
+        TF_1M
+    )
+
+    if (
+        not h1
+        or not m15
+        or not m5
+        or not m1
+    ):
+        return None
+
+    # --------------------------------------------------------
+    # PRIMARY LEVEL
     # --------------------------------------------------------
 
     if direction == "BUY":
@@ -879,14 +1189,6 @@ def calculate_setup(symbol, direction, price):
 
         level = demand or tgl
 
-        if not level:
-            return None
-
-        if level_invalidated(h1, level, "BUY"):
-            return None
-
-        price_in_level = price_inside_zone(price, level)
-
     else:
 
         supply = detect_supply_zone(h1)
@@ -894,49 +1196,53 @@ def calculate_setup(symbol, direction, price):
 
         level = supply or tgl
 
-        if not level:
-            return None
-
-        if level_invalidated(h1, level, "SELL"):
-            return None
-
-        price_in_level = price_inside_zone(price, level)
-
-    # --------------------------------------------------------
-    # Price must actually interact with level
-    # --------------------------------------------------------
-
-    if not price_in_level:
-
-        # Small tolerance around level
-        zone_size = level["high"] - level["low"]
-
-        tolerance = max(
-            zone_size * 0.25,
-            price * 0.0005
-        )
-
-        if not (
-            level["low"] - tolerance
-            <= price
-            <= level["high"] + tolerance
-        ):
-            return None
-
-    # --------------------------------------------------------
-    # 1M CHOCH
-    # --------------------------------------------------------
-
-    choch = detect_choch(
-        m1,
-        direction
-    )
-
-    if not choch:
+    if not level:
         return None
 
     # --------------------------------------------------------
-    # 1M Confirmation Candle
+    # INVALIDATION
+    # --------------------------------------------------------
+
+    if level_invalidated(
+        h1,
+        level,
+        direction
+    ):
+        return None
+
+    # --------------------------------------------------------
+    # PRICE MUST BE AT LEVEL
+    # --------------------------------------------------------
+
+    zone_size = (
+        level["high"]
+        - level["low"]
+    )
+
+    tolerance = max(
+        zone_size * 0.25,
+        price * 0.0005
+    )
+
+    if not (
+        level["low"] - tolerance
+        <= price
+        <= level["high"] + tolerance
+    ):
+        return None
+
+    # --------------------------------------------------------
+    # FINAL 1M CHOCH
+    # --------------------------------------------------------
+
+    if not detect_choch(
+        m1,
+        direction
+    ):
+        return None
+
+    # --------------------------------------------------------
+    # FINAL CANDLE CONFIRMATION
     # --------------------------------------------------------
 
     last_closed = m1[-2]
@@ -953,12 +1259,14 @@ def calculate_setup(symbol, direction, price):
         previous = m1[-3]
 
         if direction == "BUY":
+
             engulfing = bullish_engulfing(
                 previous,
                 last_closed
             )
 
         else:
+
             engulfing = bearish_engulfing(
                 previous,
                 last_closed
@@ -967,14 +1275,14 @@ def calculate_setup(symbol, direction, price):
     if not confirmed and not engulfing:
         return None
 
-    # --------------------------------------------------------
+    # ========================================================
     # SCORE
-    # --------------------------------------------------------
+    # ========================================================
 
     score = 0
     reasons = []
 
-    # CORE
+    # Core Rulebook components
     score += 30
     reasons.append("MTF_STRUCTURE")
 
@@ -985,47 +1293,67 @@ def calculate_setup(symbol, direction, price):
     reasons.append("1M_CHOCH")
 
     score += 10
-    reasons.append("CONFIRMATION")
+    reasons.append("CANDLE_CONFIRMATION")
 
-    # EXTRA CONFIRMATION
-    if detect_fvg(m15, direction):
+    # --------------------------------------------------------
+    # Extra confluence
+    # --------------------------------------------------------
+
+    if detect_fvg(
+        m15,
+        direction
+    ):
+
         score += 5
         reasons.append("FVG")
 
-    if detect_liquidity_sweep(m15, direction):
+    if detect_liquidity_sweep(
+        m15,
+        direction
+    ):
+
         score += 10
         reasons.append("LIQUIDITY_SWEEP")
 
     if direction == "BUY":
 
         if detect_double_bottom(m15):
+
             score += 5
-            reasons.append("DOUBLE_BOTTOM")
+            reasons.append(
+                "DOUBLE_BOTTOM"
+            )
 
     else:
 
         if detect_double_top(m15):
+
             score += 5
-            reasons.append("DOUBLE_TOP")
+            reasons.append(
+                "DOUBLE_TOP"
+            )
 
     # --------------------------------------------------------
-    # Minimum setup quality
+    # Quality filter
     # --------------------------------------------------------
 
-    if score < 80:
+    if score < MIN_SETUP_SCORE:
         return None
 
-    # --------------------------------------------------------
-    # SL
-    # --------------------------------------------------------
+    # ========================================================
+    # STRUCTURAL SL
+    # ========================================================
 
     if direction == "BUY":
 
-        recent_lows = find_swing_lows(m1)
+        swing_lows = find_swing_lows(m1)
 
-        if recent_lows:
-            swing_low = recent_lows[-1][1]
+        if swing_lows:
+
+            swing_low = swing_lows[-1][1]
+
         else:
+
             swing_low = min(
                 candle_low(c)
                 for c in m1[-10:-1]
@@ -1038,32 +1366,16 @@ def calculate_setup(symbol, direction, price):
 
         risk = price - sl
 
-        if risk / price * 100 > MAX_SL_PERCENT:
-            return None
-
-        # Structural target
-        highs = find_swing_highs(m15)
-
-        targets = [
-            h[1]
-            for h in highs
-            if h[1] > price
-        ]
-
-        if targets:
-            tp2 = min(targets)
-        else:
-            tp2 = price + risk * 2.0
-
-        tp1 = price + risk * 1.0
-
     else:
 
-        recent_highs = find_swing_highs(m1)
+        swing_highs = find_swing_highs(m1)
 
-        if recent_highs:
-            swing_high = recent_highs[-1][1]
+        if swing_highs:
+
+            swing_high = swing_highs[-1][1]
+
         else:
+
             swing_high = max(
                 candle_high(c)
                 for c in m1[-10:-1]
@@ -1076,32 +1388,92 @@ def calculate_setup(symbol, direction, price):
 
         risk = sl - price
 
-        if risk / price * 100 > MAX_SL_PERCENT:
-            return None
+    # --------------------------------------------------------
+    # SL SIZE FILTER
+    # --------------------------------------------------------
 
-        lows = find_swing_lows(m15)
+    if risk <= 0:
+        return None
 
-        targets = [
+    sl_percent = (
+        risk / price
+    ) * 100
+
+    if sl_percent > MAX_SL_PERCENT:
+        return None
+
+    # ========================================================
+    # TP
+    # ========================================================
+
+    if direction == "BUY":
+
+        m15_highs = find_swing_highs(m15)
+
+        resistance = [
+            h[1]
+            for h in m15_highs
+            if h[1] > price
+        ]
+
+        tp1 = price + risk * 1.0
+
+        if resistance:
+
+            tp2 = min(resistance)
+
+            # Need minimum RR
+            if (
+                tp2 - price
+            ) / risk < MIN_RR:
+
+                tp2 = price + risk * MIN_RR
+
+        else:
+
+            tp2 = price + risk * 2.0
+
+    else:
+
+        m15_lows = find_swing_lows(m15)
+
+        support = [
             l[1]
-            for l in lows
+            for l in m15_lows
             if l[1] < price
         ]
 
-        if targets:
-            tp2 = max(targets)
-        else:
-            tp2 = price - risk * 2.0
-
         tp1 = price - risk * 1.0
 
-    # --------------------------------------------------------
-    # RR FILTER
-    # --------------------------------------------------------
+        if support:
+
+            tp2 = max(support)
+
+            if (
+                price - tp2
+            ) / risk < MIN_RR:
+
+                tp2 = price - risk * MIN_RR
+
+        else:
+
+            tp2 = price - risk * 2.0
+
+    # ========================================================
+    # FINAL RR
+    # ========================================================
 
     if direction == "BUY":
-        rr = (tp2 - price) / risk
+
+        rr = (
+            tp2 - price
+        ) / risk
+
     else:
-        rr = (price - tp2) / risk
+
+        rr = (
+            price - tp2
+        ) / risk
 
     if rr < MIN_RR:
         return None
@@ -1124,12 +1496,22 @@ def calculate_setup(symbol, direction, price):
 # DUPLICATE SIGNAL PROTECTION
 # ============================================================
 
-def signal_allowed(symbol, setup):
+def signal_allowed(
+    symbol,
+    setup
+):
+
     key = (
         symbol,
         setup["direction"],
-        round(setup["level"]["low"], 6),
-        round(setup["level"]["high"], 6)
+        round(
+            setup["level"]["low"],
+            6
+        ),
+        round(
+            setup["level"]["high"],
+            6
+        )
     )
 
     now = time.time()
@@ -1137,7 +1519,12 @@ def signal_allowed(symbol, setup):
     previous = last_signal_key.get(key)
 
     if previous:
-        if now - previous < LEVEL_COOLDOWN_MINUTES * 60:
+
+        if (
+            now - previous
+            < LEVEL_COOLDOWN_MINUTES * 60
+        ):
+
             return False
 
     last_signal_key[key] = now
@@ -1150,7 +1537,9 @@ def signal_allowed(symbol, setup):
 # ============================================================
 
 def has_active_trade(symbol):
+
     with state_lock:
+
         return any(
             t["symbol"] == symbol
             for t in active_trades
@@ -1158,57 +1547,111 @@ def has_active_trade(symbol):
 
 
 # ============================================================
-# CREATE TRADE
+# CREATE PAPER TRADE
 # ============================================================
 
-def create_trade(symbol, setup):
+def create_trade(
+    symbol,
+    setup
+):
+
     if has_active_trade(symbol):
         return
 
     with state_lock:
-        if len(active_trades) >= MAX_ACTIVE_TRADES:
+
+        if (
+            len(active_trades)
+            >= MAX_ACTIVE_TRADES
+        ):
             return
 
-    if not signal_allowed(symbol, setup):
+    if not signal_allowed(
+        symbol,
+        setup
+    ):
         return
 
     trade = {
-        "id": f"{symbol}-{int(time.time())}",
+
+        "id": (
+            f"{symbol}-"
+            f"{int(time.time())}"
+        ),
+
         "symbol": symbol,
+
         "type": setup["direction"],
+
         "entry": setup["entry"],
+
         "sl": setup["sl"],
+
         "initial_sl": setup["sl"],
+
         "tp1": setup["tp1"],
+
         "tp2": setup["tp2"],
+
         "rr": setup["rr"],
+
         "score": setup["score"],
+
         "reason": setup["reason"],
+
         "tp1_hit": False,
-        "created_at": datetime.now(
-            timezone.utc
-        ).isoformat()
+
+        "created_at":
+            datetime.now(
+                timezone.utc
+            ).isoformat()
     }
 
     with state_lock:
         active_trades.append(trade)
 
-    icon = "🟢" if trade["type"] == "BUY" else "🔴"
+    icon = (
+        "🟢"
+        if trade["type"] == "BUY"
+        else "🔴"
+    )
 
     message = (
+
         f"<b>⚡ RULEBOOK SIGNAL {icon}</b>\n"
+
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📍 <b>Asset:</b> {symbol}\n"
-        f"📈 <b>Direction:</b> {trade['type']}\n"
-        f"💰 <b>Entry:</b> {trade['entry']:.4f}\n"
-        f"🛑 <b>SL:</b> {trade['sl']:.4f}\n"
-        f"🎯 <b>TP1:</b> {trade['tp1']:.4f}\n"
-        f"🎯 <b>TP2:</b> {trade['tp2']:.4f}\n"
-        f"📊 <b>RR:</b> {trade['rr']:.2f}\n"
-        f"⭐ <b>Score:</b> {trade['score']}\n"
-        f"🧠 <b>Reason:</b> {trade['reason']}\n"
+
+        f"📍 <b>Asset:</b> "
+        f"{symbol}\n"
+
+        f"📈 <b>Direction:</b> "
+        f"{trade['type']}\n"
+
+        f"💰 <b>Entry:</b> "
+        f"{trade['entry']:.6f}\n"
+
+        f"🛑 <b>SL:</b> "
+        f"{trade['sl']:.6f}\n"
+
+        f"🎯 <b>TP1:</b> "
+        f"{trade['tp1']:.6f}\n"
+
+        f"🎯 <b>TP2:</b> "
+        f"{trade['tp2']:.6f}\n"
+
+        f"📊 <b>RR:</b> "
+        f"{trade['rr']:.2f}\n"
+
+        f"⭐ <b>Score:</b> "
+        f"{trade['score']}\n"
+
+        f"🧠 <b>Reason:</b> "
+        f"{trade['reason']}\n"
+
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Paper Trade Only</b>"
+
+        f"<b>🟡 PAPER TRADE ONLY</b>"
     )
 
     send_telegram(message)
@@ -1216,35 +1659,45 @@ def create_trade(symbol, setup):
     log_event(
         f"NEW {trade['type']} | "
         f"{symbol} | "
-        f"Entry={trade['entry']:.4f} | "
+        f"Entry={trade['entry']:.6f} | "
         f"Score={trade['score']} | "
         f"RR={trade['rr']:.2f}"
     )
 
 
 # ============================================================
-# TRADE RESULT
+# CLOSE TRADE
 # ============================================================
 
-def close_trade(trade, result, exit_price):
+def close_trade(
+    trade,
+    result,
+    exit_price
+):
+
     entry = trade["entry"]
+
     initial_sl = trade["initial_sl"]
 
-    risk = abs(entry - initial_sl)
+    risk = abs(
+        entry - initial_sl
+    )
 
     if risk <= 0:
+
         r_multiple = 0
+
+    elif trade["type"] == "BUY":
+
+        r_multiple = (
+            exit_price - entry
+        ) / risk
+
     else:
 
-        if trade["type"] == "BUY":
-            r_multiple = (
-                exit_price - entry
-            ) / risk
-
-        else:
-            r_multiple = (
-                entry - exit_price
-            ) / risk
+        r_multiple = (
+            entry - exit_price
+        ) / risk
 
     db_save_trade(
         trade,
@@ -1254,21 +1707,41 @@ def close_trade(trade, result, exit_price):
     )
 
     if result == "TP2":
+
         emoji = "🟢"
+
     elif result == "BREAK_EVEN":
+
         emoji = "🟡"
+
     else:
+
         emoji = "🔴"
 
     message = (
+
         f"<b>TRADE RESULT {emoji}</b>\n"
+
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📍 <b>Asset:</b> {trade['symbol']}\n"
-        f"📈 <b>Type:</b> {trade['type']}\n"
-        f"📌 <b>Result:</b> {result}\n"
-        f"💰 <b>Entry:</b> {entry:.4f}\n"
-        f"🚪 <b>Exit:</b> {exit_price:.4f}\n"
-        f"📊 <b>R:</b> {r_multiple:.2f}\n"
+
+        f"📍 <b>Asset:</b> "
+        f"{trade['symbol']}\n"
+
+        f"📈 <b>Type:</b> "
+        f"{trade['type']}\n"
+
+        f"📌 <b>Result:</b> "
+        f"{result}\n"
+
+        f"💰 <b>Entry:</b> "
+        f"{entry:.6f}\n"
+
+        f"🚪 <b>Exit:</b> "
+        f"{exit_price:.6f}\n"
+
+        f"📊 <b>R:</b> "
+        f"{r_multiple:.2f}\n"
+
         f"━━━━━━━━━━━━━━━━━━"
     )
 
@@ -1281,24 +1754,28 @@ def close_trade(trade, result, exit_price):
     )
 
     with state_lock:
+
         if trade in active_trades:
             active_trades.remove(trade)
 
 
 # ============================================================
-# ACTIVE TRADE MANAGEMENT
+# MANAGE ACTIVE TRADE
 # ============================================================
 
-def manage_trade(trade, price):
+def manage_trade(
+    trade,
+    price
+):
+
     direction = trade["type"]
 
-    # --------------------------------------------------------
+    # ========================================================
     # BUY
-    # --------------------------------------------------------
+    # ========================================================
 
     if direction == "BUY":
 
-        # TP2
         if price >= trade["tp2"]:
 
             close_trade(
@@ -1309,7 +1786,6 @@ def manage_trade(trade, price):
 
             return
 
-        # TP1
         if (
             price >= trade["tp1"]
             and not trade["tp1_hit"]
@@ -1317,13 +1793,12 @@ def manage_trade(trade, price):
 
             trade["tp1_hit"] = True
 
-            # Break-even
             trade["sl"] = trade["entry"]
 
             send_telegram(
                 f"<b>🎯 TP1 HIT</b>\n"
-                f"{trade['symbol']}\n"
-                f"SL moved to Break-Even."
+                f"📍 {trade['symbol']}\n"
+                f"🛡 SL → Break-Even"
             )
 
             log_event(
@@ -1332,13 +1807,13 @@ def manage_trade(trade, price):
                 f"SL → BE"
             )
 
-        # SL
         if price <= trade["sl"]:
 
-            if trade["tp1_hit"]:
-                result = "BREAK_EVEN"
-            else:
-                result = "SL"
+            result = (
+                "BREAK_EVEN"
+                if trade["tp1_hit"]
+                else "SL"
+            )
 
             close_trade(
                 trade,
@@ -1346,13 +1821,12 @@ def manage_trade(trade, price):
                 price
             )
 
-    # --------------------------------------------------------
+    # ========================================================
     # SELL
-    # --------------------------------------------------------
+    # ========================================================
 
     elif direction == "SELL":
 
-        # TP2
         if price <= trade["tp2"]:
 
             close_trade(
@@ -1363,7 +1837,6 @@ def manage_trade(trade, price):
 
             return
 
-        # TP1
         if (
             price <= trade["tp1"]
             and not trade["tp1_hit"]
@@ -1375,8 +1848,8 @@ def manage_trade(trade, price):
 
             send_telegram(
                 f"<b>🎯 TP1 HIT</b>\n"
-                f"{trade['symbol']}\n"
-                f"SL moved to Break-Even."
+                f"📍 {trade['symbol']}\n"
+                f"🛡 SL → Break-Even"
             )
 
             log_event(
@@ -1385,13 +1858,13 @@ def manage_trade(trade, price):
                 f"SL → BE"
             )
 
-        # SL
         if price >= trade["sl"]:
 
-            if trade["tp1_hit"]:
-                result = "BREAK_EVEN"
-            else:
-                result = "SL"
+            result = (
+                "BREAK_EVEN"
+                if trade["tp1_hit"]
+                else "SL"
+            )
 
             close_trade(
                 trade,
@@ -1401,7 +1874,7 @@ def manage_trade(trade, price):
 
 
 # ============================================================
-# SCANNER
+# SCAN ONE SYMBOL
 # ============================================================
 
 def scan_symbol(symbol):
@@ -1412,101 +1885,129 @@ def scan_symbol(symbol):
         return
 
     # --------------------------------------------------------
-    # Manage existing trade
+    # Existing trade
     # --------------------------------------------------------
 
     with state_lock:
+
         trades = [
-            t for t in active_trades
+            t
+            for t in active_trades
             if t["symbol"] == symbol
         ]
 
     for trade in trades:
+
         manage_trade(
             trade,
             price
         )
 
     # --------------------------------------------------------
-    # New setup
+    # Don't create another trade
     # --------------------------------------------------------
 
     if has_active_trade(symbol):
         return
 
+    # ========================================================
     # BUY
+    # ========================================================
+
     try:
 
-        buy_setup = calculate_setup(
+        setup = calculate_setup(
             symbol,
             "BUY",
             price
         )
 
-        if buy_setup:
+        if setup:
+
             create_trade(
                 symbol,
-                buy_setup
+                setup
             )
+
             return
 
     except Exception as e:
+
         print(
-            f"BUY setup error {symbol}: {e}"
+            f"BUY setup error "
+            f"{symbol}: {e}"
         )
 
+    # ========================================================
     # SELL
+    # ========================================================
+
     try:
 
-        sell_setup = calculate_setup(
+        setup = calculate_setup(
             symbol,
             "SELL",
             price
         )
 
-        if sell_setup:
+        if setup:
+
             create_trade(
                 symbol,
-                sell_setup
+                setup
             )
+
             return
 
     except Exception as e:
+
         print(
-            f"SELL setup error {symbol}: {e}"
+            f"SELL setup error "
+            f"{symbol}: {e}"
         )
 
 
 # ============================================================
-# BACKGROUND ENGINE
+# BACKGROUND SCANNER
 # ============================================================
 
 def background_trading_scanner():
 
     print(
-        "================================================"
+        "=========================================="
     )
+
     print(
         "🚀 RULEBOOK SMC SCANNER STARTED"
     )
+
     print(
         "Exchange: Bybit"
     )
+
     print(
         "Mode: PAPER / SIGNAL ONLY"
     )
+
     print(
-        "Symbols:",
-        ", ".join(SYMBOLS)
+        "=========================================="
     )
-    print(
-        "================================================"
-    )
+
+    validate_symbols()
+
+    if not SYMBOLS:
+
+        print(
+            "❌ No valid Bybit symbols found."
+        )
+
+        return
 
     send_telegram(
         "<b>🤖 Rulebook SMC Bot Started</b>\n"
-        "Mode: Paper / Signal Only\n"
-        "Exchange: Bybit"
+        f"Exchange: Bybit\n"
+        f"Symbols: {', '.join(SYMBOLS)}\n"
+        f"Mode: Paper / Signal Only"
     )
 
     while True:
@@ -1518,32 +2019,36 @@ def background_trading_scanner():
             for symbol in SYMBOLS:
 
                 try:
+
                     scan_symbol(symbol)
 
                 except Exception as e:
+
                     print(
-                        f"Symbol scanner error "
+                        f"Scanner error "
                         f"{symbol}: {e}"
                     )
 
-                # Small delay between symbols
                 time.sleep(1)
 
         except Exception as e:
 
             print(
-                "Scanner main error:",
+                "Main scanner error:",
                 e
             )
 
-        elapsed = time.time() - started
-
-        sleep_time = max(
-            5,
-            SCAN_INTERVAL - elapsed
+        elapsed = (
+            time.time() -
+            started
         )
 
-        time.sleep(sleep_time)
+        time.sleep(
+            max(
+                5,
+                SCAN_INTERVAL - elapsed
+            )
+        )
 
 
 # ============================================================
@@ -1556,29 +2061,32 @@ def get_statistics():
 
         conn = db_connect()
 
-        rows = conn.execute("""
-            SELECT
-                result,
-                r_multiple
+        rows = conn.execute(
+            """
+            SELECT result, r_multiple
             FROM trades
-        """).fetchall()
+            """
+        ).fetchall()
 
         conn.close()
 
         total = len(rows)
 
         wins = sum(
-            1 for r in rows
+            1
+            for r in rows
             if r[0] == "TP2"
         )
 
         losses = sum(
-            1 for r in rows
+            1
+            for r in rows
             if r[0] == "SL"
         )
 
         breakeven = sum(
-            1 for r in rows
+            1
+            for r in rows
             if r[0] == "BREAK_EVEN"
         )
 
@@ -1593,18 +2101,61 @@ def get_statistics():
             else 0
         )
 
+        gross_profit = sum(
+            float(r[1])
+            for r in rows
+            if float(r[1]) > 0
+        )
+
+        gross_loss = abs(
+            sum(
+                float(r[1])
+                for r in rows
+                if float(r[1]) < 0
+            )
+        )
+
+        profit_factor = (
+            gross_profit / gross_loss
+            if gross_loss > 0
+            else 0
+        )
+
         return {
+
             "total": total,
+
             "wins": wins,
+
             "losses": losses,
+
             "breakeven": breakeven,
-            "win_rate": round(win_rate, 2),
-            "total_r": round(total_r, 2)
+
+            "win_rate":
+                round(
+                    win_rate,
+                    2
+                ),
+
+            "total_r":
+                round(
+                    total_r,
+                    2
+                ),
+
+            "profit_factor":
+                round(
+                    profit_factor,
+                    2
+                )
         }
 
     except Exception as e:
 
-        print("Stats error:", e)
+        print(
+            "Statistics error:",
+            e
+        )
 
         return {
             "total": 0,
@@ -1612,7 +2163,8 @@ def get_statistics():
             "losses": 0,
             "breakeven": 0,
             "win_rate": 0,
-            "total_r": 0
+            "total_r": 0,
+            "profit_factor": 0
         }
 
 
@@ -1626,15 +2178,27 @@ def api_status():
     stats = get_statistics()
 
     with state_lock:
-        trades = list(active_trades)
+
+        trades = list(
+            active_trades
+        )
 
     return jsonify({
+
         "status": "ONLINE",
+
         "mode": "PAPER",
+
         "exchange": "BYBIT",
+
+        "symbols": SYMBOLS,
+
         "active_trades": trades,
+
         "statistics": stats,
-        "events": len(trade_logs)
+
+        "events":
+            len(trade_logs)
     })
 
 
@@ -1644,13 +2208,19 @@ def api_status():
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
+
 <html>
 
 <head>
 
-<title>Rulebook SMC Trading Bot</title>
+<title>
+Rulebook SMC Trading Bot
+</title>
 
-<meta http-equiv="refresh" content="15">
+<meta
+http-equiv="refresh"
+content="15"
+>
 
 <style>
 
@@ -1659,7 +2229,7 @@ body {
     padding:20px;
     background:#0f172a;
     color:#f8fafc;
-    font-family:Arial, sans-serif;
+    font-family:Arial,sans-serif;
 }
 
 .container {
@@ -1676,7 +2246,7 @@ body {
 .cards {
     display:grid;
     grid-template-columns:
-    repeat(auto-fit,minmax(180px,1fr));
+    repeat(auto-fit,minmax(170px,1fr));
     gap:15px;
     margin:25px 0;
 }
@@ -1685,7 +2255,7 @@ body {
     background:#1e293b;
     border:1px solid #334155;
     border-radius:10px;
-    padding:20px;
+    padding:18px;
     text-align:center;
 }
 
@@ -1695,8 +2265,20 @@ body {
 }
 
 .card p {
-    font-size:25px;
+    font-size:24px;
     font-weight:bold;
+}
+
+.online {
+    color:#4ade80;
+}
+
+.sell {
+    color:#f87171;
+}
+
+.warning {
+    color:#facc15;
 }
 
 table {
@@ -1707,23 +2289,13 @@ table {
 }
 
 th,td {
-    padding:12px;
+    padding:11px;
     border-bottom:1px solid #334155;
     text-align:left;
 }
 
 th {
     color:#94a3b8;
-}
-
-.buy {
-    color:#4ade80;
-    font-weight:bold;
-}
-
-.sell {
-    color:#f87171;
-    font-weight:bold;
 }
 
 .logs {
@@ -1736,14 +2308,6 @@ th {
     font-family:monospace;
 }
 
-.online {
-    color:#4ade80;
-}
-
-.paper {
-    color:#facc15;
-}
-
 </style>
 
 </head>
@@ -1754,18 +2318,20 @@ th {
 
 <div class="header">
 
-<h1>🤖 Rulebook SMC Trading Bot</h1>
+<h1>
+🤖 Rulebook SMC Trading Bot
+</h1>
 
 <p>
-Structure → Level → MTF → CHOCH →
-Confirmation → Risk
+Structure → Level → MTF →
+CHOCH → Confirmation → Risk
 </p>
 
 <p class="online">
 🟢 ONLINE
 </p>
 
-<p class="paper">
+<p class="warning">
 🟡 PAPER / SIGNAL MODE
 </p>
 
@@ -1775,89 +2341,205 @@ Confirmation → Risk
 <div class="cards">
 
 <div class="card">
-<h3>Active Trades</h3>
-<p>{{ active_trades|length }}</p>
+
+<h3>
+Active Trades
+</h3>
+
+<p>
+{{ active_trades|length }}
+</p>
+
 </div>
+
 
 <div class="card">
-<h3>Total Trades</h3>
-<p>{{ stats.total }}</p>
+
+<h3>
+Total Trades
+</h3>
+
+<p>
+{{ stats.total }}
+</p>
+
 </div>
+
 
 <div class="card">
-<h3>Wins</h3>
-<p class="online">{{ stats.wins }}</p>
+
+<h3>
+Wins
+</h3>
+
+<p class="online">
+{{ stats.wins }}
+</p>
+
 </div>
+
 
 <div class="card">
-<h3>Losses</h3>
-<p class="sell">{{ stats.losses }}</p>
+
+<h3>
+Losses
+</h3>
+
+<p class="sell">
+{{ stats.losses }}
+</p>
+
 </div>
+
 
 <div class="card">
-<h3>Break Even</h3>
-<p>{{ stats.breakeven }}</p>
+
+<h3>
+Break Even
+</h3>
+
+<p>
+{{ stats.breakeven }}
+</p>
+
 </div>
+
 
 <div class="card">
-<h3>Win Rate</h3>
-<p>{{ stats.win_rate }}%</p>
+
+<h3>
+Win Rate
+</h3>
+
+<p>
+{{ stats.win_rate }}%
+</p>
+
 </div>
+
 
 <div class="card">
-<h3>Total R</h3>
-<p>{{ stats.total_r }}</p>
+
+<h3>
+Profit Factor
+</h3>
+
+<p>
+{{ stats.profit_factor }}
+</p>
+
+</div>
+
+
+<div class="card">
+
+<h3>
+Total R
+</h3>
+
+<p>
+{{ stats.total_r }}
+</p>
+
 </div>
 
 </div>
 
 
-<h2>📊 Active Positions</h2>
+<h2>
+📊 Active Positions
+</h2>
 
 <table>
 
 <tr>
-<th>Symbol</th>
-<th>Direction</th>
-<th>Entry</th>
-<th>SL</th>
-<th>TP1</th>
-<th>TP2</th>
-<th>RR</th>
-<th>Score</th>
+
+<th>
+Symbol
+</th>
+
+<th>
+Direction
+</th>
+
+<th>
+Entry
+</th>
+
+<th>
+SL
+</th>
+
+<th>
+TP1
+</th>
+
+<th>
+TP2
+</th>
+
+<th>
+RR
+</th>
+
+<th>
+Score
+</th>
+
 </tr>
+
 
 {% for trade in active_trades %}
 
 <tr>
 
-<td><b>{{ trade.symbol }}</b></td>
+<td>
+<b>{{ trade.symbol }}</b>
+</td>
 
-<td class="{{ 'buy' if trade.type == 'BUY'
-else 'sell' }}">
+<td>
 {{ trade.type }}
 </td>
 
-<td>{{ "%.4f"|format(trade.entry) }}</td>
+<td>
+{{ "%.6f"|format(trade.entry) }}
+</td>
 
-<td>{{ "%.4f"|format(trade.sl) }}</td>
+<td>
+{{ "%.6f"|format(trade.sl) }}
+</td>
 
-<td>{{ "%.4f"|format(trade.tp1) }}</td>
+<td>
+{{ "%.6f"|format(trade.tp1) }}
+</td>
 
-<td>{{ "%.4f"|format(trade.tp2) }}</td>
+<td>
+{{ "%.6f"|format(trade.tp2) }}
+</td>
 
-<td>{{ "%.2f"|format(trade.rr) }}</td>
+<td>
+{{ "%.2f"|format(trade.rr) }}
+</td>
 
-<td>{{ trade.score }}</td>
+<td>
+{{ trade.score }}
+</td>
 
 </tr>
 
 {% else %}
 
 <tr>
-<td colspan="8" style="text-align:center;">
+
+<td
+colspan="8"
+style="text-align:center;"
+>
+
 No active Rulebook setup.
+
 </td>
+
 </tr>
 
 {% endfor %}
@@ -1865,17 +2547,24 @@ No active Rulebook setup.
 </table>
 
 
-<h2>📱 Activity</h2>
+<h2>
+📱 Activity Logs
+</h2>
 
 <div class="logs">
 
 {% for log in trade_logs|reverse %}
 
-<div>> {{ log }}</div>
+<div>
+&gt; {{ log }}
+</div>
 
 {% else %}
 
-<div>> Bot started. Waiting for valid Rulebook setup...</div>
+<div>
+&gt; Bot started.
+Waiting for valid Rulebook setup...
+</div>
 
 {% endfor %}
 
@@ -1899,8 +2588,14 @@ def home():
     stats = get_statistics()
 
     with state_lock:
-        trades = list(active_trades)
-        logs = list(trade_logs)
+
+        trades = list(
+            active_trades
+        )
+
+        logs = list(
+            trade_logs
+        )
 
     return render_template_string(
         HTML_TEMPLATE,
@@ -1911,17 +2606,23 @@ def home():
 
 
 # ============================================================
-# HEALTH
+# HEALTH CHECK
 # ============================================================
 
 @app.route("/health")
 def health():
 
     return jsonify({
+
         "status": "ok",
-        "time": datetime.now(
-            timezone.utc
-        ).isoformat()
+
+        "time":
+            datetime.now(
+                timezone.utc
+            ).isoformat(),
+
+        "symbols":
+            SYMBOLS
     })
 
 
@@ -1941,7 +2642,10 @@ if __name__ == "__main__":
     scanner_thread.start()
 
     port = int(
-        os.getenv("PORT", "5000")
+        os.getenv(
+            "PORT",
+            "5000"
+        )
     )
 
     app.run(
