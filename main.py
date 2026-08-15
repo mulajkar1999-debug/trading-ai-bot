@@ -13,12 +13,18 @@ from flask import Flask, jsonify, render_template_string
 # CONFIGURATION
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("8723192534:AAFqkexJpF-yu38dPI0cEUT6H0nooN_sjdM", "")
-TELEGRAM_CHAT_ID = os.getenv("1317739622", "")
+TELEGRAM_BOT_TOKEN = os.getenv("8723192534:AAFqkexJpF-yu38dPI0cEUT6H0nooN_sjdM", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("1317739622", "").strip()
 
 DB_FILE = os.getenv("DB_FILE", "trading_bot.db")
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
+
+# Telegram health check every 3 hours
+HEALTH_CHECK_INTERVAL = 3 * 60 * 60
+
+# API timeout
+API_TIMEOUT = 10000
 
 # ============================================================
 # BYBIT SYMBOLS
@@ -51,21 +57,16 @@ TF_1M = "1m"
 CANDLE_LIMIT = 150
 
 # ============================================================
-# RISK / QUALITY SETTINGS
+# STRATEGY SETTINGS
 # ============================================================
 
 MIN_RR = 1.50
 MAX_SL_PERCENT = 1.50
-
-# Minimum setup score
 MIN_SETUP_SCORE = 80
 
-# Same level par repeated trade avoid
 LEVEL_COOLDOWN_MINUTES = 60
 
-# Maximum active paper trades
 MAX_ACTIVE_TRADES = 3
-
 
 # ============================================================
 # FLASK
@@ -75,14 +76,15 @@ app = Flask(__name__)
 
 
 # ============================================================
-# BYBIT
+# BYBIT EXCHANGE
 # ============================================================
 
 exchange = ccxt.bybit({
     "enableRateLimit": True,
+    "timeout": API_TIMEOUT,
     "options": {
         "defaultType": "spot",
-    }
+    },
 })
 
 
@@ -96,6 +98,18 @@ trade_logs = []
 state_lock = threading.Lock()
 
 last_signal_key = {}
+
+bot_started_at = time.time()
+
+last_scanner_run = None
+last_bybit_check = None
+last_telegram_check = None
+
+bybit_status = "NOT_CHECKED"
+telegram_status = "NOT_CHECKED"
+scanner_status = "STARTING"
+
+market_load_error = None
 
 
 # ============================================================
@@ -165,6 +179,7 @@ def db_log_event(event):
         conn.close()
 
     except Exception as e:
+
         print("DB event error:", e)
 
 
@@ -217,6 +232,7 @@ def db_save_trade(
         conn.close()
 
     except Exception as e:
+
         print("DB trade error:", e)
 
 
@@ -226,10 +242,18 @@ def db_save_trade(
 
 def send_telegram(message):
 
+    global telegram_status
+    global last_telegram_check
+
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 
-        print("[Telegram disabled]")
-        return
+        telegram_status = "NOT_CONFIGURED"
+
+        print(
+            "[Telegram] Token or Chat ID missing."
+        )
+
+        return False
 
     url = (
         f"https://api.telegram.org/"
@@ -247,20 +271,83 @@ def send_telegram(message):
         response = requests.post(
             url,
             json=payload,
-            timeout=8
+            timeout=10
         )
 
-        if response.status_code != 200:
-            print(
-                "Telegram error:",
-                response.text
-            )
+        if response.status_code == 200:
+
+            telegram_status = "OK"
+            last_telegram_check = time.time()
+
+            return True
+
+        telegram_status = "ERROR"
+
+        print(
+            "[Telegram] API error:",
+            response.status_code,
+            response.text
+        )
+
+        return False
 
     except Exception as e:
+
+        telegram_status = "ERROR"
+
         print(
-            "Telegram exception:",
+            "[Telegram] Exception:",
             e
         )
+
+        return False
+
+
+# ============================================================
+# TELEGRAM CONNECTION TEST
+# ============================================================
+
+def telegram_connection_test():
+
+    global telegram_status
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+
+        telegram_status = "NOT_CONFIGURED"
+
+        print(
+            "⚠️ Telegram credentials are not configured."
+        )
+
+        return False
+
+    test_message = (
+        "<b>🟢 TELEGRAM CONNECTION OK</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Telegram Bot: ✅ Connected\n"
+        "Backend: ✅ Running\n"
+        "Mode: 🟡 PAPER / SIGNAL ONLY\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "The bot is ready to send Rulebook signals."
+    )
+
+    success = send_telegram(
+        test_message
+    )
+
+    if success:
+
+        print(
+            "✅ Telegram connection test successful."
+        )
+
+    else:
+
+        print(
+            "❌ Telegram connection test failed."
+        )
+
+    return success
 
 
 # ============================================================
@@ -278,68 +365,320 @@ def log_event(message):
         )
 
         if len(trade_logs) > 500:
+
             del trade_logs[:-500]
 
     db_log_event(message)
 
 
 # ============================================================
-# MARKET VALIDATION
+# BYBIT MARKET LOADING WITH RETRIES
 # ============================================================
 
-def validate_symbols():
+def load_bybit_markets():
 
     global SYMBOLS
+    global bybit_status
+    global last_bybit_check
+    global market_load_error
 
-    try:
+    max_attempts = 3
 
-        print("Loading Bybit markets...")
+    for attempt in range(
+        1,
+        max_attempts + 1
+    ):
 
-        exchange.load_markets()
+        try:
 
-        available = []
+            print(
+                f"Loading Bybit markets... "
+                f"Attempt {attempt}/{max_attempts}"
+            )
 
-        for symbol in REQUESTED_SYMBOLS:
+            exchange.load_markets(
+                reload=True
+            )
 
-            if symbol in exchange.markets:
+            available = []
+
+            for symbol in REQUESTED_SYMBOLS:
+
+                if symbol not in exchange.markets:
+
+                    print(
+                        f"[SKIP] {symbol} "
+                        f"not found on Bybit."
+                    )
+
+                    continue
 
                 market = exchange.markets[symbol]
 
-                # We want spot USDT symbols
-                if (
-                    market.get("spot")
-                    and market.get("quote") == "USDT"
-                ):
-                    available.append(symbol)
+                if not market.get("spot"):
 
-                else:
                     print(
                         f"[SKIP] {symbol} "
-                        f"not a USDT spot market"
+                        f"is not a spot market."
                     )
+
+                    continue
+
+                if market.get("quote") != "USDT":
+
+                    print(
+                        f"[SKIP] {symbol} "
+                        f"is not USDT."
+                    )
+
+                    continue
+
+                available.append(symbol)
+
+            SYMBOLS = available
+
+            bybit_status = "OK"
+            last_bybit_check = time.time()
+            market_load_error = None
+
+            print(
+                "=========================================="
+            )
+
+            print(
+                "✅ BYBIT MARKETS LOADED"
+            )
+
+            print(
+                f"Available symbols: "
+                f"{', '.join(SYMBOLS)}"
+            )
+
+            print(
+                "=========================================="
+            )
+
+            return True
+
+        except Exception as e:
+
+            market_load_error = str(e)
+
+            bybit_status = "ERROR"
+
+            print(
+                f"❌ Bybit market load failed "
+                f"(attempt {attempt}): {e}"
+            )
+
+            if attempt < max_attempts:
+
+                wait_time = attempt * 5
+
+                print(
+                    f"Retrying in "
+                    f"{wait_time} seconds..."
+                )
+
+                time.sleep(
+                    wait_time
+                )
+
+    print(
+        "❌ Unable to load Bybit markets "
+        "after all retries."
+    )
+
+    return False
+
+
+# ============================================================
+# BYBIT HEALTH CHECK
+# ============================================================
+
+def check_bybit_connection():
+
+    global bybit_status
+    global last_bybit_check
+
+    try:
+
+        # Lightweight API call
+        exchange.fetch_time()
+
+        bybit_status = "OK"
+        last_bybit_check = time.time()
+
+        return True
+
+    except Exception as e:
+
+        bybit_status = "ERROR"
+
+        print(
+            "❌ Bybit health check failed:",
+            e
+        )
+
+        return False
+
+
+# ============================================================
+# TELEGRAM 3-HOUR HEALTH MONITOR
+# ============================================================
+
+def health_monitor():
+
+    global scanner_status
+
+    # Initial wait so startup messages appear first
+    time.sleep(30)
+
+    while True:
+
+        try:
+
+            telegram_ok = check_telegram_without_message()
+
+            bybit_ok = check_bybit_connection()
+
+            with state_lock:
+
+                active_count = len(
+                    active_trades
+                )
+
+            uptime_seconds = (
+                time.time()
+                - bot_started_at
+            )
+
+            uptime_hours = (
+                uptime_seconds / 3600
+            )
+
+            if scanner_status == "RUNNING":
+
+                scanner_ok = True
 
             else:
 
-                print(
-                    f"[SKIP] {symbol} "
-                    f"not available on Bybit"
+                scanner_ok = False
+
+            telegram_text = (
+                "✅ OK"
+                if telegram_ok
+                else "❌ ERROR"
+            )
+
+            bybit_text = (
+                "✅ OK"
+                if bybit_ok
+                else "❌ ERROR"
+            )
+
+            scanner_text = (
+                "✅ RUNNING"
+                if scanner_ok
+                else "⚠️ CHECK LOGS"
+            )
+
+            if (
+                telegram_ok
+                and bybit_ok
+                and scanner_ok
+            ):
+
+                message = (
+
+                    "<b>🟢 BOT HEALTH CHECK</b>\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    f"Telegram: {telegram_text}\n"
+                    f"Bybit API: {bybit_text}\n"
+                    f"Scanner: {scanner_text}\n"
+                    "Mode: 🟡 PAPER / SIGNAL ONLY\n"
+                    f"Symbols: {len(SYMBOLS)}\n"
+                    f"Active Trades: {active_count}\n"
+                    f"Uptime: {uptime_hours:.1f} hours\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "Backend is healthy. ✅"
                 )
 
-        SYMBOLS = available
+            else:
 
-        print(
-            "Validated Bybit symbols:",
-            ", ".join(SYMBOLS)
+                message = (
+
+                    "<b>🔴 BOT HEALTH ALERT</b>\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    f"Telegram: {telegram_text}\n"
+                    f"Bybit API: {bybit_text}\n"
+                    f"Scanner: {scanner_text}\n"
+                    "Mode: 🟡 PAPER / SIGNAL ONLY\n"
+                    f"Symbols: {len(SYMBOLS)}\n"
+                    f"Active Trades: {active_count}\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "⚠️ Please check Render logs."
+                )
+
+            # This is the actual 3-hour Telegram report.
+            send_telegram(message)
+
+        except Exception as e:
+
+            print(
+                "Health monitor error:",
+                e
+            )
+
+        time.sleep(
+            HEALTH_CHECK_INTERVAL
         )
+
+
+def check_telegram_without_message():
+
+    if not TELEGRAM_BOT_TOKEN:
+
+        return False
+
+    if not TELEGRAM_CHAT_ID:
+
+        return False
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/getMe"
+    )
+
+    try:
+
+        response = requests.get(
+            url,
+            timeout=10
+        )
+
+        if response.status_code != 200:
+
+            telegram_status = "ERROR"
+
+            return False
+
+        data = response.json()
+
+        if data.get("ok"):
+
+            return True
+
+        return False
 
     except Exception as e:
 
         print(
-            "Market validation error:",
+            "Telegram health API error:",
             e
         )
 
-        SYMBOLS = []
+        return False
 
 
 # ============================================================
@@ -375,19 +714,23 @@ def fetch_price(symbol):
 
     try:
 
-        ticker = exchange.fetch_ticker(symbol)
+        ticker = exchange.fetch_ticker(
+            symbol
+        )
 
         if ticker.get("last") is None:
+
             return None
 
-        return float(ticker["last"])
+        return float(
+            ticker["last"]
+        )
 
     except Exception as e:
 
         print(
-            "Price error:",
-            symbol,
-            e
+            f"Price error | "
+            f"{symbol}: {e}"
         )
 
         return None
@@ -414,25 +757,35 @@ def candle_close(c):
 
 
 def candle_body(c):
+
     return abs(
-        candle_close(c) -
-        candle_open(c)
+        candle_close(c)
+        - candle_open(c)
     )
 
 
 def candle_range(c):
+
     return (
-        candle_high(c) -
-        candle_low(c)
+        candle_high(c)
+        - candle_low(c)
     )
 
 
 def is_bullish(c):
-    return candle_close(c) > candle_open(c)
+
+    return (
+        candle_close(c)
+        > candle_open(c)
+    )
 
 
 def is_bearish(c):
-    return candle_close(c) < candle_open(c)
+
+    return (
+        candle_close(c)
+        < candle_open(c)
+    )
 
 
 def body_ratio(c):
@@ -440,9 +793,12 @@ def body_ratio(c):
     r = candle_range(c)
 
     if r <= 0:
+
         return 0
 
-    return candle_body(c) / r
+    return (
+        candle_body(c) / r
+    )
 
 
 # ============================================================
@@ -462,7 +818,9 @@ def find_swing_highs(
         len(candles) - right
     ):
 
-        h = candle_high(candles[i])
+        h = candle_high(
+            candles[i]
+        )
 
         left_highs = [
             candle_high(candles[j])
@@ -484,7 +842,10 @@ def find_swing_highs(
             h > max(left_highs)
             and h >= max(right_highs)
         ):
-            highs.append((i, h))
+
+            highs.append(
+                (i, h)
+            )
 
     return highs
 
@@ -502,7 +863,9 @@ def find_swing_lows(
         len(candles) - right
     ):
 
-        l = candle_low(candles[i])
+        l = candle_low(
+            candles[i]
+        )
 
         left_lows = [
             candle_low(candles[j])
@@ -524,7 +887,10 @@ def find_swing_lows(
             l < min(left_lows)
             and l <= min(right_lows)
         ):
-            lows.append((i, l))
+
+            lows.append(
+                (i, l)
+            )
 
     return lows
 
@@ -547,8 +913,13 @@ def detect_structure(candles):
 
     closed = candles[:-1]
 
-    highs = find_swing_highs(closed)
-    lows = find_swing_lows(closed)
+    highs = find_swing_highs(
+        closed
+    )
+
+    lows = find_swing_lows(
+        closed
+    )
 
     if (
         len(highs) < 2
@@ -573,15 +944,18 @@ def detect_structure(candles):
         last_high > prev_high
         and last_low > prev_low
     ):
+
         trend = "BULLISH"
 
     elif (
         last_high < prev_high
         and last_low < prev_low
     ):
+
         trend = "BEARISH"
 
     else:
+
         trend = "NEUTRAL"
 
     return {
@@ -604,6 +978,7 @@ def get_structure(
     )
 
     if not candles:
+
         return None, []
 
     return (
@@ -654,8 +1029,13 @@ def get_mtf_bias(symbol):
         h1["trend"]
     ]
 
-    bullish = trends.count("BULLISH")
-    bearish = trends.count("BEARISH")
+    bullish = trends.count(
+        "BULLISH"
+    )
+
+    bearish = trends.count(
+        "BEARISH"
+    )
 
     if (
         bullish >= 2
@@ -682,7 +1062,8 @@ def get_mtf_bias(symbol):
         "h1": h1["trend"],
         "m15": (
             m15["trend"]
-            if m15 else "NEUTRAL"
+            if m15
+            else "NEUTRAL"
         )
     }
 
@@ -697,16 +1078,23 @@ def detect_choch(
 ):
 
     if len(candles) < 25:
+
         return False
 
     closed = candles[:-1]
 
-    highs = find_swing_highs(closed)
-    lows = find_swing_lows(closed)
+    highs = find_swing_highs(
+        closed
+    )
+
+    lows = find_swing_lows(
+        closed
+    )
 
     if direction == "BUY":
 
         if not highs:
+
             return False
 
         previous_high = highs[-1][1]
@@ -719,6 +1107,7 @@ def detect_choch(
     if direction == "SELL":
 
         if not lows:
+
             return False
 
         previous_low = lows[-1][1]
@@ -744,14 +1133,16 @@ def confirmation_candle(
 
         return (
             is_bullish(candle)
-            and body_ratio(candle) >= 0.45
+            and body_ratio(candle)
+            >= 0.45
         )
 
     if direction == "SELL":
 
         return (
             is_bearish(candle)
-            and body_ratio(candle) >= 0.45
+            and body_ratio(candle)
+            >= 0.45
         )
 
     return False
@@ -797,6 +1188,7 @@ def detect_liquidity_sweep(
 ):
 
     if len(candles) < 15:
+
         return False
 
     closed = candles[:-1]
@@ -804,6 +1196,7 @@ def detect_liquidity_sweep(
     previous = closed[-8:-1]
 
     if not previous:
+
         return False
 
     previous_high = max(
@@ -849,6 +1242,7 @@ def detect_fvg(
 ):
 
     if len(candles) < 5:
+
         return False
 
     closed = candles[:-1]
@@ -879,9 +1273,12 @@ def detect_fvg(
 
 def detect_double_bottom(candles):
 
-    lows = find_swing_lows(candles)
+    lows = find_swing_lows(
+        candles
+    )
 
     if len(lows) < 2:
+
         return False
 
     l1 = lows[-2][1]
@@ -889,14 +1286,20 @@ def detect_double_bottom(candles):
 
     tolerance = abs(l1) * 0.002
 
-    return abs(l1 - l2) <= tolerance
+    return (
+        abs(l1 - l2)
+        <= tolerance
+    )
 
 
 def detect_double_top(candles):
 
-    highs = find_swing_highs(candles)
+    highs = find_swing_highs(
+        candles
+    )
 
     if len(highs) < 2:
+
         return False
 
     h1 = highs[-2][1]
@@ -904,7 +1307,10 @@ def detect_double_top(candles):
 
     tolerance = abs(h1) * 0.002
 
-    return abs(h1 - h2) <= tolerance
+    return (
+        abs(h1 - h2)
+        <= tolerance
+    )
 
 
 # ============================================================
@@ -914,6 +1320,7 @@ def detect_double_top(candles):
 def detect_demand_zone(candles):
 
     if len(candles) < 15:
+
         return None
 
     closed = candles[:-1]
@@ -951,6 +1358,7 @@ def detect_demand_zone(candles):
 def detect_supply_zone(candles):
 
     if len(candles) < 15:
+
         return None
 
     closed = candles[:-1]
@@ -986,7 +1394,7 @@ def detect_supply_zone(candles):
 
 
 # ============================================================
-# TGL STYLE LEVEL
+# TGL
 # ============================================================
 
 def detect_tgl(
@@ -995,6 +1403,7 @@ def detect_tgl(
 ):
 
     if len(candles) < 20:
+
         return None
 
     closed = candles[:-1]
@@ -1018,7 +1427,8 @@ def detect_tgl(
             if (
                 is_bearish(current)
                 and is_bullish(following)
-                and body_ratio(following) >= 0.55
+                and body_ratio(following)
+                >= 0.55
             ):
 
                 return {
@@ -1032,7 +1442,8 @@ def detect_tgl(
             if (
                 is_bullish(current)
                 and is_bearish(following)
-                and body_ratio(following) >= 0.55
+                and body_ratio(following)
+                >= 0.55
             ):
 
                 return {
@@ -1045,23 +1456,8 @@ def detect_tgl(
 
 
 # ============================================================
-# LEVEL HELPERS
+# LEVEL VALIDATION
 # ============================================================
-
-def price_inside_zone(
-    price,
-    zone
-):
-
-    if not zone:
-        return False
-
-    return (
-        zone["low"]
-        <= price
-        <= zone["high"]
-    )
-
 
 def level_invalidated(
     candles,
@@ -1070,6 +1466,7 @@ def level_invalidated(
 ):
 
     if not zone or len(candles) < 4:
+
         return False
 
     closed = candles[:-1]
@@ -1099,7 +1496,7 @@ def level_invalidated(
 
 
 # ============================================================
-# SESSION / MARKET QUALITY FILTER
+# SESSION FILTER
 # ============================================================
 
 def session_filter():
@@ -1108,8 +1505,8 @@ def session_filter():
         timezone.utc
     ).hour
 
-    # Avoid quiet early UTC period
     if 0 <= hour < 4:
+
         return False
 
     return True
@@ -1126,29 +1523,28 @@ def calculate_setup(
 ):
 
     if not session_filter():
+
         return None
 
-    bias = get_mtf_bias(symbol)
-
-    # --------------------------------------------------------
-    # MTF direction must agree
-    # --------------------------------------------------------
+    bias = get_mtf_bias(
+        symbol
+    )
 
     if (
         direction == "BUY"
-        and bias["direction"] != "BULLISH"
+        and bias["direction"]
+        != "BULLISH"
     ):
+
         return None
 
     if (
         direction == "SELL"
-        and bias["direction"] != "BEARISH"
+        and bias["direction"]
+        != "BEARISH"
     ):
-        return None
 
-    # --------------------------------------------------------
-    # Fetch lower timeframes
-    # --------------------------------------------------------
+        return None
 
     h1 = fetch_candles(
         symbol,
@@ -1176,43 +1572,46 @@ def calculate_setup(
         or not m5
         or not m1
     ):
-        return None
 
-    # --------------------------------------------------------
-    # PRIMARY LEVEL
-    # --------------------------------------------------------
+        return None
 
     if direction == "BUY":
 
-        demand = detect_demand_zone(h1)
-        tgl = detect_tgl(h1, "BUY")
+        demand = detect_demand_zone(
+            h1
+        )
+
+        tgl = detect_tgl(
+            h1,
+            "BUY"
+        )
 
         level = demand or tgl
 
     else:
 
-        supply = detect_supply_zone(h1)
-        tgl = detect_tgl(h1, "SELL")
+        supply = detect_supply_zone(
+            h1
+        )
+
+        tgl = detect_tgl(
+            h1,
+            "SELL"
+        )
 
         level = supply or tgl
 
     if not level:
-        return None
 
-    # --------------------------------------------------------
-    # INVALIDATION
-    # --------------------------------------------------------
+        return None
 
     if level_invalidated(
         h1,
         level,
         direction
     ):
-        return None
 
-    # --------------------------------------------------------
-    # PRICE MUST BE AT LEVEL
-    # --------------------------------------------------------
+        return None
 
     zone_size = (
         level["high"]
@@ -1229,21 +1628,15 @@ def calculate_setup(
         <= price
         <= level["high"] + tolerance
     ):
-        return None
 
-    # --------------------------------------------------------
-    # FINAL 1M CHOCH
-    # --------------------------------------------------------
+        return None
 
     if not detect_choch(
         m1,
         direction
     ):
-        return None
 
-    # --------------------------------------------------------
-    # FINAL CANDLE CONFIRMATION
-    # --------------------------------------------------------
+        return None
 
     last_closed = m1[-2]
 
@@ -1273,6 +1666,7 @@ def calculate_setup(
             )
 
     if not confirmed and not engulfing:
+
         return None
 
     # ========================================================
@@ -1280,24 +1674,28 @@ def calculate_setup(
     # ========================================================
 
     score = 0
+
     reasons = []
 
-    # Core Rulebook components
     score += 30
-    reasons.append("MTF_STRUCTURE")
+    reasons.append(
+        "MTF_STRUCTURE"
+    )
 
     score += 25
-    reasons.append("VALID_LEVEL")
+    reasons.append(
+        "VALID_LEVEL"
+    )
 
     score += 25
-    reasons.append("1M_CHOCH")
+    reasons.append(
+        "1M_CHOCH"
+    )
 
     score += 10
-    reasons.append("CANDLE_CONFIRMATION")
-
-    # --------------------------------------------------------
-    # Extra confluence
-    # --------------------------------------------------------
+    reasons.append(
+        "CANDLE_CONFIRMATION"
+    )
 
     if detect_fvg(
         m15,
@@ -1313,11 +1711,15 @@ def calculate_setup(
     ):
 
         score += 10
-        reasons.append("LIQUIDITY_SWEEP")
+        reasons.append(
+            "LIQUIDITY_SWEEP"
+        )
 
     if direction == "BUY":
 
-        if detect_double_bottom(m15):
+        if detect_double_bottom(
+            m15
+        ):
 
             score += 5
             reasons.append(
@@ -1326,18 +1728,17 @@ def calculate_setup(
 
     else:
 
-        if detect_double_top(m15):
+        if detect_double_top(
+            m15
+        ):
 
             score += 5
             reasons.append(
                 "DOUBLE_TOP"
             )
 
-    # --------------------------------------------------------
-    # Quality filter
-    # --------------------------------------------------------
-
     if score < MIN_SETUP_SCORE:
+
         return None
 
     # ========================================================
@@ -1346,7 +1747,9 @@ def calculate_setup(
 
     if direction == "BUY":
 
-        swing_lows = find_swing_lows(m1)
+        swing_lows = find_swing_lows(
+            m1
+        )
 
         if swing_lows:
 
@@ -1362,13 +1765,16 @@ def calculate_setup(
         sl = swing_low * 0.999
 
         if sl >= price:
+
             return None
 
         risk = price - sl
 
     else:
 
-        swing_highs = find_swing_highs(m1)
+        swing_highs = find_swing_highs(
+            m1
+        )
 
         if swing_highs:
 
@@ -1384,15 +1790,13 @@ def calculate_setup(
         sl = swing_high * 1.001
 
         if sl <= price:
+
             return None
 
         risk = sl - price
 
-    # --------------------------------------------------------
-    # SL SIZE FILTER
-    # --------------------------------------------------------
-
     if risk <= 0:
+
         return None
 
     sl_percent = (
@@ -1400,6 +1804,7 @@ def calculate_setup(
     ) * 100
 
     if sl_percent > MAX_SL_PERCENT:
+
         return None
 
     # ========================================================
@@ -1408,7 +1813,9 @@ def calculate_setup(
 
     if direction == "BUY":
 
-        m15_highs = find_swing_highs(m15)
+        m15_highs = find_swing_highs(
+            m15
+        )
 
         resistance = [
             h[1]
@@ -1416,26 +1823,38 @@ def calculate_setup(
             if h[1] > price
         ]
 
-        tp1 = price + risk * 1.0
+        tp1 = (
+            price
+            + risk * 1.0
+        )
 
         if resistance:
 
-            tp2 = min(resistance)
+            tp2 = min(
+                resistance
+            )
 
-            # Need minimum RR
             if (
                 tp2 - price
             ) / risk < MIN_RR:
 
-                tp2 = price + risk * MIN_RR
+                tp2 = (
+                    price
+                    + risk * MIN_RR
+                )
 
         else:
 
-            tp2 = price + risk * 2.0
+            tp2 = (
+                price
+                + risk * 2.0
+            )
 
     else:
 
-        m15_lows = find_swing_lows(m15)
+        m15_lows = find_swing_lows(
+            m15
+        )
 
         support = [
             l[1]
@@ -1443,25 +1862,32 @@ def calculate_setup(
             if l[1] < price
         ]
 
-        tp1 = price - risk * 1.0
+        tp1 = (
+            price
+            - risk * 1.0
+        )
 
         if support:
 
-            tp2 = max(support)
+            tp2 = max(
+                support
+            )
 
             if (
                 price - tp2
             ) / risk < MIN_RR:
 
-                tp2 = price - risk * MIN_RR
+                tp2 = (
+                    price
+                    - risk * MIN_RR
+                )
 
         else:
 
-            tp2 = price - risk * 2.0
-
-    # ========================================================
-    # FINAL RR
-    # ========================================================
+            tp2 = (
+                price
+                - risk * 2.0
+            )
 
     if direction == "BUY":
 
@@ -1476,6 +1902,7 @@ def calculate_setup(
         ) / risk
 
     if rr < MIN_RR:
+
         return None
 
     return {
@@ -1493,7 +1920,7 @@ def calculate_setup(
 
 
 # ============================================================
-# DUPLICATE SIGNAL PROTECTION
+# DUPLICATE PROTECTION
 # ============================================================
 
 def signal_allowed(
@@ -1516,13 +1943,16 @@ def signal_allowed(
 
     now = time.time()
 
-    previous = last_signal_key.get(key)
+    previous = last_signal_key.get(
+        key
+    )
 
     if previous:
 
         if (
             now - previous
-            < LEVEL_COOLDOWN_MINUTES * 60
+            < LEVEL_COOLDOWN_MINUTES
+            * 60
         ):
 
             return False
@@ -1533,7 +1963,7 @@ def signal_allowed(
 
 
 # ============================================================
-# ACTIVE TRADE CHECK
+# ACTIVE TRADE
 # ============================================================
 
 def has_active_trade(symbol):
@@ -1556,6 +1986,7 @@ def create_trade(
 ):
 
     if has_active_trade(symbol):
+
         return
 
     with state_lock:
@@ -1564,42 +1995,53 @@ def create_trade(
             len(active_trades)
             >= MAX_ACTIVE_TRADES
         ):
+
             return
 
     if not signal_allowed(
         symbol,
         setup
     ):
+
         return
 
     trade = {
 
-        "id": (
-            f"{symbol}-"
-            f"{int(time.time())}"
-        ),
+        "id":
+            f"{symbol}-{int(time.time())}",
 
-        "symbol": symbol,
+        "symbol":
+            symbol,
 
-        "type": setup["direction"],
+        "type":
+            setup["direction"],
 
-        "entry": setup["entry"],
+        "entry":
+            setup["entry"],
 
-        "sl": setup["sl"],
+        "sl":
+            setup["sl"],
 
-        "initial_sl": setup["sl"],
+        "initial_sl":
+            setup["sl"],
 
-        "tp1": setup["tp1"],
+        "tp1":
+            setup["tp1"],
 
-        "tp2": setup["tp2"],
+        "tp2":
+            setup["tp2"],
 
-        "rr": setup["rr"],
+        "rr":
+            setup["rr"],
 
-        "score": setup["score"],
+        "score":
+            setup["score"],
 
-        "reason": setup["reason"],
+        "reason":
+            setup["reason"],
 
-        "tp1_hit": False,
+        "tp1_hit":
+            False,
 
         "created_at":
             datetime.now(
@@ -1608,7 +2050,10 @@ def create_trade(
     }
 
     with state_lock:
-        active_trades.append(trade)
+
+        active_trades.append(
+            trade
+        )
 
     icon = (
         "🟢"
@@ -1619,42 +2064,32 @@ def create_trade(
     message = (
 
         f"<b>⚡ RULEBOOK SIGNAL {icon}</b>\n"
-
-        f"━━━━━━━━━━━━━━━━━━\n"
-
+        "━━━━━━━━━━━━━━━━━━\n"
         f"📍 <b>Asset:</b> "
         f"{symbol}\n"
-
         f"📈 <b>Direction:</b> "
         f"{trade['type']}\n"
-
         f"💰 <b>Entry:</b> "
         f"{trade['entry']:.6f}\n"
-
         f"🛑 <b>SL:</b> "
         f"{trade['sl']:.6f}\n"
-
         f"🎯 <b>TP1:</b> "
         f"{trade['tp1']:.6f}\n"
-
         f"🎯 <b>TP2:</b> "
         f"{trade['tp2']:.6f}\n"
-
         f"📊 <b>RR:</b> "
         f"{trade['rr']:.2f}\n"
-
         f"⭐ <b>Score:</b> "
         f"{trade['score']}\n"
-
         f"🧠 <b>Reason:</b> "
         f"{trade['reason']}\n"
-
-        f"━━━━━━━━━━━━━━━━━━\n"
-
-        f"<b>🟡 PAPER TRADE ONLY</b>"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "<b>🟡 PAPER TRADE ONLY</b>"
     )
 
-    send_telegram(message)
+    send_telegram(
+        message
+    )
 
     log_event(
         f"NEW {trade['type']} | "
@@ -1721,31 +2156,25 @@ def close_trade(
     message = (
 
         f"<b>TRADE RESULT {emoji}</b>\n"
-
-        f"━━━━━━━━━━━━━━━━━━\n"
-
+        "━━━━━━━━━━━━━━━━━━\n"
         f"📍 <b>Asset:</b> "
         f"{trade['symbol']}\n"
-
         f"📈 <b>Type:</b> "
         f"{trade['type']}\n"
-
         f"📌 <b>Result:</b> "
         f"{result}\n"
-
         f"💰 <b>Entry:</b> "
         f"{entry:.6f}\n"
-
         f"🚪 <b>Exit:</b> "
         f"{exit_price:.6f}\n"
-
         f"📊 <b>R:</b> "
         f"{r_multiple:.2f}\n"
-
-        f"━━━━━━━━━━━━━━━━━━"
+        "━━━━━━━━━━━━━━━━━━"
     )
 
-    send_telegram(message)
+    send_telegram(
+        message
+    )
 
     log_event(
         f"RESULT {result} | "
@@ -1756,7 +2185,10 @@ def close_trade(
     with state_lock:
 
         if trade in active_trades:
-            active_trades.remove(trade)
+
+            active_trades.remove(
+                trade
+            )
 
 
 # ============================================================
@@ -1769,10 +2201,6 @@ def manage_trade(
 ):
 
     direction = trade["type"]
-
-    # ========================================================
-    # BUY
-    # ========================================================
 
     if direction == "BUY":
 
@@ -1793,18 +2221,20 @@ def manage_trade(
 
             trade["tp1_hit"] = True
 
-            trade["sl"] = trade["entry"]
+            trade["sl"] = (
+                trade["entry"]
+            )
 
             send_telegram(
-                f"<b>🎯 TP1 HIT</b>\n"
+                "<b>🎯 TP1 HIT</b>\n"
                 f"📍 {trade['symbol']}\n"
-                f"🛡 SL → Break-Even"
+                "🛡 SL → Break-Even"
             )
 
             log_event(
                 f"TP1 HIT | "
                 f"{trade['symbol']} | "
-                f"SL → BE"
+                "SL → BE"
             )
 
         if price <= trade["sl"]:
@@ -1820,10 +2250,6 @@ def manage_trade(
                 result,
                 price
             )
-
-    # ========================================================
-    # SELL
-    # ========================================================
 
     elif direction == "SELL":
 
@@ -1844,18 +2270,20 @@ def manage_trade(
 
             trade["tp1_hit"] = True
 
-            trade["sl"] = trade["entry"]
+            trade["sl"] = (
+                trade["entry"]
+            )
 
             send_telegram(
-                f"<b>🎯 TP1 HIT</b>\n"
+                "<b>🎯 TP1 HIT</b>\n"
                 f"📍 {trade['symbol']}\n"
-                f"🛡 SL → Break-Even"
+                "🛡 SL → Break-Even"
             )
 
             log_event(
                 f"TP1 HIT | "
                 f"{trade['symbol']} | "
-                f"SL → BE"
+                "SL → BE"
             )
 
         if price >= trade["sl"]:
@@ -1874,19 +2302,18 @@ def manage_trade(
 
 
 # ============================================================
-# SCAN ONE SYMBOL
+# SCAN SYMBOL
 # ============================================================
 
 def scan_symbol(symbol):
 
-    price = fetch_price(symbol)
+    price = fetch_price(
+        symbol
+    )
 
     if price is None:
-        return
 
-    # --------------------------------------------------------
-    # Existing trade
-    # --------------------------------------------------------
+        return
 
     with state_lock:
 
@@ -1903,17 +2330,11 @@ def scan_symbol(symbol):
             price
         )
 
-    # --------------------------------------------------------
-    # Don't create another trade
-    # --------------------------------------------------------
-
     if has_active_trade(symbol):
+
         return
 
-    # ========================================================
     # BUY
-    # ========================================================
-
     try:
 
         setup = calculate_setup(
@@ -1934,14 +2355,11 @@ def scan_symbol(symbol):
     except Exception as e:
 
         print(
-            f"BUY setup error "
+            f"BUY setup error | "
             f"{symbol}: {e}"
         )
 
-    # ========================================================
     # SELL
-    # ========================================================
-
     try:
 
         setup = calculate_setup(
@@ -1962,16 +2380,19 @@ def scan_symbol(symbol):
     except Exception as e:
 
         print(
-            f"SELL setup error "
+            f"SELL setup error | "
             f"{symbol}: {e}"
         )
 
 
 # ============================================================
-# BACKGROUND SCANNER
+# SCANNER
 # ============================================================
 
 def background_trading_scanner():
+
+    global scanner_status
+    global last_scanner_run
 
     print(
         "=========================================="
@@ -1993,21 +2414,60 @@ def background_trading_scanner():
         "=========================================="
     )
 
-    validate_symbols()
+    # --------------------------------------------------------
+    # Telegram test first
+    # --------------------------------------------------------
+
+    telegram_connection_test()
+
+    # --------------------------------------------------------
+    # Load Bybit markets
+    # --------------------------------------------------------
+
+    loaded = load_bybit_markets()
+
+    if not loaded:
+
+        scanner_status = "BYBIT_ERROR"
+
+        send_telegram(
+            "<b>🔴 BOT STARTUP ALERT</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "Telegram: Connected/Attempted\n"
+            "Bybit: ❌ Market loading failed\n"
+            "Scanner: ⚠️ Waiting for retry\n"
+            "Mode: 🟡 PAPER / SIGNAL ONLY"
+        )
+
+        # Keep retrying instead of dying
+        while not SYMBOLS:
+
+            time.sleep(30)
+
+            loaded = load_bybit_markets()
+
+            if loaded:
+
+                break
 
     if not SYMBOLS:
 
-        print(
-            "❌ No valid Bybit symbols found."
-        )
+        scanner_status = "WAITING_FOR_BYBIT"
 
         return
 
+    scanner_status = "RUNNING"
+
     send_telegram(
-        "<b>🤖 Rulebook SMC Bot Started</b>\n"
-        f"Exchange: Bybit\n"
-        f"Symbols: {', '.join(SYMBOLS)}\n"
-        f"Mode: Paper / Signal Only"
+        "<b>🟢 SCANNER READY</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Bybit API: ✅ Connected\n"
+        f"Symbols: {len(SYMBOLS)}\n"
+        f"{', '.join(SYMBOLS)}\n"
+        "Scanner: ✅ Running\n"
+        "Mode: 🟡 PAPER / SIGNAL ONLY\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Waiting for valid Rulebook setups..."
     )
 
     while True:
@@ -2016,22 +2476,65 @@ def background_trading_scanner():
 
         try:
 
-            for symbol in SYMBOLS:
+            # If Bybit was previously down,
+            # try reconnecting.
+            if bybit_status != "OK":
+
+                print(
+                    "⚠️ Bybit status is not OK. "
+                    "Trying market reload..."
+                )
+
+                if not load_bybit_markets():
+
+                    scanner_status = (
+                        "BYBIT_ERROR"
+                    )
+
+                    time.sleep(30)
+
+                    continue
+
+                scanner_status = "RUNNING"
+
+            for symbol in list(SYMBOLS):
 
                 try:
 
-                    scan_symbol(symbol)
+                    scan_symbol(
+                        symbol
+                    )
 
                 except Exception as e:
 
                     print(
-                        f"Scanner error "
+                        f"Scanner error | "
                         f"{symbol}: {e}"
                     )
 
+                # Small delay between symbols
                 time.sleep(1)
 
+            last_scanner_run = time.time()
+
+            scanner_status = "RUNNING"
+
+            elapsed = (
+                time.time()
+                - started
+            )
+
+            print(
+                f"🔄 Scanner cycle complete | "
+                f"Symbols={len(SYMBOLS)} | "
+                f"Time={elapsed:.1f}s"
+            )
+
         except Exception as e:
+
+            scanner_status = (
+                "ERROR"
+            )
 
             print(
                 "Main scanner error:",
@@ -2039,8 +2542,8 @@ def background_trading_scanner():
             )
 
         elapsed = (
-            time.time() -
-            started
+            time.time()
+            - started
         )
 
         time.sleep(
@@ -2183,19 +2686,43 @@ def api_status():
             active_trades
         )
 
+    uptime = (
+        time.time()
+        - bot_started_at
+    )
+
     return jsonify({
 
-        "status": "ONLINE",
+        "status": scanner_status,
 
         "mode": "PAPER",
 
         "exchange": "BYBIT",
+
+        "telegram": telegram_status,
+
+        "bybit": bybit_status,
 
         "symbols": SYMBOLS,
 
         "active_trades": trades,
 
         "statistics": stats,
+
+        "uptime_hours":
+            round(
+                uptime / 3600,
+                2
+            ),
+
+        "last_scanner_run":
+            last_scanner_run,
+
+        "last_bybit_check":
+            last_bybit_check,
+
+        "market_load_error":
+            market_load_error,
 
         "events":
             len(trade_logs)
@@ -2265,7 +2792,7 @@ body {
 }
 
 .card p {
-    font-size:24px;
+    font-size:22px;
     font-weight:bold;
 }
 
@@ -2273,7 +2800,7 @@ body {
     color:#4ade80;
 }
 
-.sell {
+.error {
     color:#f87171;
 }
 
@@ -2327,8 +2854,11 @@ Structure → Level → MTF →
 CHOCH → Confirmation → Risk
 </p>
 
-<p class="online">
-🟢 ONLINE
+<p>
+Status:
+<span class="online">
+{{ scanner_status }}
+</span>
 </p>
 
 <p class="warning">
@@ -2339,6 +2869,48 @@ CHOCH → Confirmation → Risk
 
 
 <div class="cards">
+
+<div class="card">
+
+<h3>
+Telegram
+</h3>
+
+<p class="
+{% if telegram_status == 'OK' %}
+online
+{% else %}
+error
+{% endif %}
+">
+
+{{ telegram_status }}
+
+</p>
+
+</div>
+
+
+<div class="card">
+
+<h3>
+Bybit API
+</h3>
+
+<p class="
+{% if bybit_status == 'OK' %}
+online
+{% else %}
+error
+{% endif %}
+">
+
+{{ bybit_status }}
+
+</p>
+
+</div>
+
 
 <div class="card">
 
@@ -2385,21 +2957,8 @@ Wins
 Losses
 </h3>
 
-<p class="sell">
+<p class="error">
 {{ stats.losses }}
-</p>
-
-</div>
-
-
-<div class="card">
-
-<h3>
-Break Even
-</h3>
-
-<p>
-{{ stats.breakeven }}
 </p>
 
 </div>
@@ -2430,19 +2989,6 @@ Profit Factor
 
 </div>
 
-
-<div class="card">
-
-<h3>
-Total R
-</h3>
-
-<p>
-{{ stats.total_r }}
-</p>
-
-</div>
-
 </div>
 
 
@@ -2454,37 +3000,14 @@ Total R
 
 <tr>
 
-<th>
-Symbol
-</th>
-
-<th>
-Direction
-</th>
-
-<th>
-Entry
-</th>
-
-<th>
-SL
-</th>
-
-<th>
-TP1
-</th>
-
-<th>
-TP2
-</th>
-
-<th>
-RR
-</th>
-
-<th>
-Score
-</th>
+<th>Symbol</th>
+<th>Direction</th>
+<th>Entry</th>
+<th>SL</th>
+<th>TP1</th>
+<th>TP2</th>
+<th>RR</th>
+<th>Score</th>
 
 </tr>
 
@@ -2562,8 +3085,7 @@ No active Rulebook setup.
 {% else %}
 
 <div>
-&gt; Bot started.
-Waiting for valid Rulebook setup...
+&gt; Waiting for scanner logs...
 </div>
 
 {% endfor %}
@@ -2601,12 +3123,15 @@ def home():
         HTML_TEMPLATE,
         active_trades=trades,
         trade_logs=logs,
-        stats=stats
+        stats=stats,
+        scanner_status=scanner_status,
+        telegram_status=telegram_status,
+        bybit_status=bybit_status
     )
 
 
 # ============================================================
-# HEALTH CHECK
+# HEALTH ENDPOINT
 # ============================================================
 
 @app.route("/health")
@@ -2616,23 +3141,36 @@ def health():
 
         "status": "ok",
 
+        "scanner":
+            scanner_status,
+
+        "telegram":
+            telegram_status,
+
+        "bybit":
+            bybit_status,
+
+        "symbols":
+            SYMBOLS,
+
         "time":
             datetime.now(
                 timezone.utc
-            ).isoformat(),
-
-        "symbols":
-            SYMBOLS
+            ).isoformat()
     })
 
 
 # ============================================================
-# START
+# START APPLICATION
 # ============================================================
 
 if __name__ == "__main__":
 
     init_db()
+
+    # --------------------------------------------------------
+    # Scanner thread
+    # --------------------------------------------------------
 
     scanner_thread = threading.Thread(
         target=background_trading_scanner,
@@ -2640,6 +3178,21 @@ if __name__ == "__main__":
     )
 
     scanner_thread.start()
+
+    # --------------------------------------------------------
+    # 3-hour health monitor
+    # --------------------------------------------------------
+
+    health_thread = threading.Thread(
+        target=health_monitor,
+        daemon=True
+    )
+
+    health_thread.start()
+
+    # --------------------------------------------------------
+    # Render PORT
+    # --------------------------------------------------------
 
     port = int(
         os.getenv(
