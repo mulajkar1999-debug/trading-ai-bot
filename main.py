@@ -13,8 +13,8 @@ from flask import Flask, jsonify, render_template_string
 # CONFIGURATION
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("8723192534:AAFqkexJpF-yu38dPI0cEUT6H0nooN_sjdM", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("1317739622", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 DB_FILE = os.getenv("DB_FILE", "trading_bot.db")
 
