@@ -3,7 +3,6 @@ import time
 import sqlite3
 import threading
 import traceback
-import json
 from datetime import datetime, timezone
 
 import requests
@@ -23,27 +22,24 @@ SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
 HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", str(3 * 60 * 60)))
 API_TIMEOUT = int(os.getenv("API_TIMEOUT", "15"))
 
-BINANCE_BASE_URL = os.getenv(
-    "BINANCE_BASE_URL",
-    "https://api.binance.com"
-).rstrip("/")
+BYBIT_BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com").rstrip("/")
 
-BINANCE_CATEGORY = "spot"
+BYBIT_CATEGORY = "spot"
 
-BINANCE_MAX_RETRIES = int(os.getenv("BINANCE_MAX_RETRIES", "5"))
-BINANCE_RETRY_DELAY = int(os.getenv("BINANCE_RETRY_DELAY", "5"))
+BYBIT_MAX_RETRIES = int(os.getenv("BYBIT_MAX_RETRIES", "5"))
+BYBIT_RETRY_DELAY = int(os.getenv("BYBIT_RETRY_DELAY", "5"))
 
 # Prevent infinite startup retry loop.
-BINANCE_STARTUP_MAX_ATTEMPTS = int(
-    os.getenv("BINANCE_STARTUP_MAX_ATTEMPTS", "3")
+BYBIT_STARTUP_MAX_ATTEMPTS = int(
+    os.getenv("BYBIT_STARTUP_MAX_ATTEMPTS", "3")
 )
-BINANCE_STARTUP_BACKOFF_MAX = int(
-    os.getenv("BINANCE_STARTUP_BACKOFF_MAX", "60")
+BYBIT_STARTUP_BACKOFF_MAX = int(
+    os.getenv("BYBIT_STARTUP_BACKOFF_MAX", "60")
 )
 
-# After a fatal Binance error, do not hammer the API.
-BINANCE_FATAL_COOLDOWN = int(
-    os.getenv("BINANCE_FATAL_COOLDOWN", "300")
+# After a fatal Bybit error, do not hammer the API.
+BYBIT_FATAL_COOLDOWN = int(
+    os.getenv("BYBIT_FATAL_COOLDOWN", "300")
 )
 
 RENDER_DIAGNOSTICS = os.getenv(
@@ -61,7 +57,7 @@ REAL_ORDERS_ENABLED = False
 
 
 # ============================================================
-# BINANCE SYMBOLS
+# BYBIT SYMBOLS
 # ============================================================
 
 REQUESTED_SYMBOLS = [
@@ -76,7 +72,7 @@ REQUESTED_SYMBOLS = [
 ]
 
 SYMBOLS = []
-BINANCE_SYMBOL_MAP = {}
+BYBIT_SYMBOL_MAP = {}
 
 
 # ============================================================
@@ -152,30 +148,37 @@ last_signal_key = {}
 bot_started_at = time.time()
 
 last_scanner_run = None
-last_binance_check = None
+last_bybit_check = None
 last_telegram_check = None
 
-binance_status = "NOT_CHECKED"
+bybit_status = "NOT_CHECKED"
 telegram_status = "NOT_CHECKED"
 scanner_status = "STARTING"
 
 market_load_error = None
 
-last_binance_error = None
+last_bybit_error = None
 last_telegram_error = None
 
-binance_request_count = 0
+bybit_request_count = 0
+bybit_403_count = 0
+bybit_429_count = 0
+bybit_451_count = 0
+bybit_5xx_count = 0
+bybit_last_http_status = None
+startup_max_attempts = int(os.getenv("STARTUP_MAX_ATTEMPTS", "3"))
 
-# Render / Binance diagnostics
-binance_last_http_status = None
-binance_last_url = None
-binance_last_response = None
-binance_last_request_at = None
-binance_last_success_at = None
 
-binance_403_count = 0
-binance_429_count = 0
-binance_5xx_count = 0
+# Render / Bybit diagnostics
+bybit_last_http_status = None
+bybit_last_url = None
+bybit_last_response = None
+bybit_last_request_at = None
+bybit_last_success_at = None
+
+bybit_403_count = 0
+bybit_429_count = 0
+bybit_5xx_count = 0
 
 scanner_cycle_count = 0
 scanner_error_count = 0
@@ -184,8 +187,8 @@ scanner_last_duration = None
 startup_attempts = 0
 startup_failed_reason = None
 
-fatal_binance_error = False
-fatal_binance_error_at = None
+fatal_bybit_error = False
+fatal_bybit_error_at = None
 
 process_pid = os.getpid()
 
@@ -196,15 +199,15 @@ render_instance = os.getenv(
 
 
 # ============================================================
-# CUSTOM BINANCE ERRORS
+# CUSTOM BYBIT ERRORS
 # ============================================================
 
-class BinanceFatalError(RuntimeError):
-    """Non-retryable Binance error."""
+class BybitFatalError(RuntimeError):
+    """Non-retryable Bybit error."""
 
 
-class BinanceTemporaryError(RuntimeError):
-    """Temporary Binance/API error."""
+class BybitTemporaryError(RuntimeError):
+    """Temporary Bybit/API error."""
 
 
 # ============================================================
@@ -346,84 +349,280 @@ def log_exception(prefix, exc):
 
 
 # ============================================================
-# GENERIC BINANCE HTTP REQUEST
+# GENERIC BYBIT HTTP REQUEST
 # 403 = fatal / no retry
 # 429 and 5xx = retry with backoff
 # ============================================================
 
-def binance_get(path, params=None, retries=None):
-    """Bounded Binance public REST request.
+def bybit_get(path, params=None, retries=None):
+    global bybit_request_count
+    global last_bybit_error
 
-    Public market-data endpoints require no API key.
-    HTTP 429 and 5xx are retryable; other 4xx errors are NOT retried.
-    """
-    global binance_request_count, last_binance_error, binance_status, binance_429_count
+    global bybit_last_http_status
+    global bybit_last_url
+    global bybit_last_response
+    global bybit_last_request_at
+    global bybit_last_success_at
+
+    global bybit_403_count
+    global bybit_429_count
+    global bybit_5xx_count
+
+    global fatal_bybit_error
+    global fatal_bybit_error_at
 
     if retries is None:
-        retries = BINANCE_MAX_RETRIES
+        retries = BYBIT_MAX_RETRIES
 
-    url = BINANCE_BASE_URL + path
+    retries = max(1, int(retries))
+
+    url = BYBIT_BASE_URL + path
     last_exception = None
 
     for attempt in range(1, retries + 1):
-        try:
-            binance_request_count += 1
+        bybit_request_count += 1
+        bybit_last_request_at = time.time()
+        bybit_last_url = url
 
+        try:
             response = requests.get(
                 url,
                 params=params or {},
                 timeout=API_TIMEOUT,
-                headers={"User-Agent": "Rulebook-SMC-Bot/1.0"}
+                headers={
+                    "User-Agent": "Rulebook-SMC-Bot/2.0",
+                    "Accept": "application/json"
+                }
             )
 
-            code = response.status_code
-            body = response.text[:1000]
+            status_code = response.status_code
+            response_text = response.text[:1500]
 
-            if code == 429:
-                binance_429_count += 1
-                last_binance_error = f"HTTP 429 | URL={url} | Response={body}"
-                binance_status = "RATE_LIMITED"
-                print(f"[Binance] 429 | attempt {attempt}/{retries}")
+            bybit_last_http_status = status_code
+            bybit_last_response = response_text
+
+            # ------------------------------
+            # 403: NEVER retry
+            # ------------------------------
+            if status_code == 403:
+                bybit_403_count += 1
+
+                error_message = (
+                    "BYBIT HTTP 403 FORBIDDEN | "
+                    f"URL={url} | "
+                    f"Attempt={attempt}/{retries} | "
+                    f"Response={response_text}"
+                )
+
+                last_bybit_error = error_message
+                fatal_bybit_error = True
+                fatal_bybit_error_at = time.time()
+
+                print("ð« [Bybit] HTTP 403 detected.")
+                print("ð« [Bybit] NON-RETRYABLE.")
+                print(f"ð« [Bybit] URL: {url}")
+                print(f"ð« [Bybit] Response: {response_text}")
+                print("ð« [Bybit] Request retry loop stopped.")
+
+                raise BybitFatalError(error_message)
+
+            # ------------------------------
+            # 429: retry
+            # ------------------------------
+            if status_code == 429:
+                bybit_429_count += 1
+
+                error_message = (
+                    f"BYBIT HTTP 429 RATE LIMITED | "
+                    f"URL={url} | "
+                    f"Attempt={attempt}/{retries} | "
+                    f"Response={response_text}"
+                )
+
+                last_bybit_error = error_message
+                print(f"â ï¸ [Bybit] {error_message}")
+
                 if attempt < retries:
-                    time.sleep(min(60, BINANCE_RETRY_DELAY * attempt))
+                    delay = min(60, BYBIT_RETRY_DELAY * attempt)
+                    print(f"â³ Rate-limit backoff: {delay}s")
+                    time.sleep(delay)
                     continue
-                raise RuntimeError(last_binance_error)
 
-            if 400 <= code < 500:
-                last_binance_error = f"HTTP {code} | URL={url} | Response={body}"
-                binance_status = "ERROR"
-                print(f"[Binance] NON-RETRYABLE: {last_binance_error}")
-                raise RuntimeError(last_binance_error)
+                raise BybitTemporaryError(error_message)
 
-            if code >= 500:
-                last_binance_error = f"HTTP {code} | URL={url} | Response={body}"
-                print(f"[Binance] transient HTTP {code} | attempt {attempt}/{retries}")
+            # ------------------------------
+            # 5xx: retry
+            # ------------------------------
+            if status_code in (500, 502, 503, 504):
+                bybit_5xx_count += 1
+
+                error_message = (
+                    f"BYBIT HTTP {status_code} SERVER ERROR | "
+                    f"URL={url} | "
+                    f"Attempt={attempt}/{retries} | "
+                    f"Response={response_text}"
+                )
+
+                last_bybit_error = error_message
+                print(f"â ï¸ [Bybit] {error_message}")
+
                 if attempt < retries:
-                    time.sleep(min(60, BINANCE_RETRY_DELAY * attempt))
+                    delay = min(60, BYBIT_RETRY_DELAY * attempt)
+                    print(f"â³ Server-error backoff: {delay}s")
+                    time.sleep(delay)
                     continue
-                raise RuntimeError(last_binance_error)
 
+                raise BybitTemporaryError(error_message)
+
+            # ------------------------------
+            # Other HTTP errors
+            # ------------------------------
+            if status_code != 200:
+                error_message = (
+                    f"BYBIT HTTP {status_code} ERROR | "
+                    f"URL={url} | "
+                    f"Response={response_text}"
+                )
+
+                last_bybit_error = error_message
+                print(f"â [Bybit] {error_message}")
+
+                # Client/permission errors are not fixed by retries.
+                if 400 <= status_code < 500:
+                    raise BybitFatalError(error_message)
+
+                if attempt < retries:
+                    delay = min(60, BYBIT_RETRY_DELAY * attempt)
+                    time.sleep(delay)
+                    continue
+
+                raise BybitTemporaryError(error_message)
+
+            # ------------------------------
+            # JSON
+            # ------------------------------
             try:
                 data = response.json()
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Invalid JSON from Binance | HTTP={code} | Response={body}"
-                ) from exc
+            except Exception as e:
+                error_message = (
+                    "BYBIT INVALID JSON | "
+                    f"HTTP={status_code} | "
+                    f"Response={response_text}"
+                )
+                last_bybit_error = error_message
+                raise BybitTemporaryError(error_message) from e
 
-            last_binance_error = None
-            binance_status = "OK"
+            # ------------------------------
+            # Bybit retCode
+            # ------------------------------
+            ret_code = data.get("retCode")
+
+            if ret_code != 0:
+                ret_msg = data.get(
+                    "retMsg",
+                    "Unknown Bybit error"
+                )
+
+                error_message = (
+                    f"BYBIT API ERROR | "
+                    f"retCode={ret_code} | "
+                    f"retMsg={ret_msg} | "
+                    f"URL={url}"
+                )
+
+                last_bybit_error = error_message
+                print(f"â [Bybit] {error_message}")
+
+                # Common auth/permission/request errors.
+                fatal_codes = {
+                    10003,
+                    10004,
+                    10005,
+                    10006
+                }
+
+                if ret_code in fatal_codes:
+                    fatal_bybit_error = True
+                    fatal_bybit_error_at = time.time()
+                    raise BybitFatalError(error_message)
+
+                if attempt < retries:
+                    delay = min(60, BYBIT_RETRY_DELAY * attempt)
+                    time.sleep(delay)
+                    continue
+
+                raise BybitTemporaryError(error_message)
+
+            # ------------------------------
+            # SUCCESS
+            # ------------------------------
+            last_bybit_error = None
+            fatal_bybit_error = False
+            bybit_last_success_at = time.time()
+
             return data
 
-        except requests.RequestException as exc:
-            last_exception = exc
-            last_binance_error = f"{type(exc).__name__}: {exc}"
-            print(f"[Binance] network error | attempt {attempt}/{retries}: {last_binance_error}")
+        except BybitFatalError:
+            raise
+
+        except BybitTemporaryError as e:
+            last_exception = e
+            if attempt >= retries:
+                raise
+
+        except requests.exceptions.Timeout as e:
+            last_exception = e
+            last_bybit_error = (
+                f"BYBIT TIMEOUT | {type(e).__name__}: {e}"
+            )
+
+            print(
+                f"â ï¸ [Bybit] Timeout "
+                f"{attempt}/{retries}"
+            )
+
             if attempt < retries:
-                time.sleep(min(60, BINANCE_RETRY_DELAY * attempt))
+                delay = min(60, BYBIT_RETRY_DELAY * attempt)
+                time.sleep(delay)
+
+        except requests.exceptions.ConnectionError as e:
+            last_exception = e
+            last_bybit_error = (
+                f"BYBIT CONNECTION ERROR | "
+                f"{type(e).__name__}: {e}"
+            )
+
+            print(
+                f"â ï¸ [Bybit] Connection error "
+                f"{attempt}/{retries}: {e}"
+            )
+
+            if attempt < retries:
+                delay = min(60, BYBIT_RETRY_DELAY * attempt)
+                time.sleep(delay)
+
+        except Exception as e:
+            last_exception = e
+            last_bybit_error = (
+                f"{type(e).__name__}: {e}"
+            )
+
+            print(
+                f"â [Bybit] Unexpected exception "
+                f"{attempt}/{retries}: "
+                f"{type(e).__name__}: {e}"
+            )
+
+            if attempt < retries:
+                delay = min(60, BYBIT_RETRY_DELAY * attempt)
+                time.sleep(delay)
 
     if last_exception:
         raise last_exception
-    raise RuntimeError("Binance request failed without exception.")
+
+    raise BybitTemporaryError(
+        "Bybit request failed without exception."
+    )
 
 
 # ============================================================
@@ -650,7 +849,7 @@ def telegram_connection_test():
         "Telegram Bot: â Connected\n"
         "Chat ID: â Valid\n"
         "Backend: â Starting\n"
-        "Binance: â³ Checking...\n"
+        "Bybit: â³ Checking...\n"
         "Mode: ð¡ PAPER / SIGNAL ONLY\n"
         "ââââââââââââââââââ\n"
         "Rulebook scanner is starting."
@@ -667,12 +866,12 @@ def telegram_connection_test():
 
 
 # ============================================================
-# BINANCE PUBLIC SERVER TIME
+# BYBIT PUBLIC SERVER TIME
 # ============================================================
 
-def check_binance_server_time():
+def check_bybit_server_time():
     try:
-        data = binance_get(
+        data = bybit_get(
             "/v5/market/time",
             retries=3
         )
@@ -680,112 +879,211 @@ def check_binance_server_time():
         result = data.get("result", {})
 
         print(
-            "â Binance server time OK | "
+            "â Bybit server time OK | "
             f"timeSecond={result.get('timeSecond')}"
         )
 
         return True
 
-    except BinanceFatalError:
+    except BybitFatalError:
         raise
 
     except Exception as e:
         log_exception(
-            "BINANCE SERVER TIME CHECK FAILED",
+            "BYBIT SERVER TIME CHECK FAILED",
             e
         )
         return False
 
 
 # ============================================================
-# BINANCE PUBLIC MARKET LOADING
+# BYBIT PUBLIC MARKET LOADING
 # ============================================================
 
-def load_binance_public_markets():
-    global SYMBOLS, BINANCE_SYMBOL_MAP
-    global binance_status, last_binance_check, market_load_error
+def load_bybit_public_markets():
+    global SYMBOLS
+    global BYBIT_SYMBOL_MAP
+    global bybit_status
+    global last_bybit_check
+    global market_load_error
 
     print("==========================================")
-    print("ð BINANCE PUBLIC MARKET LOADING")
-    print(f"Endpoint: {BINANCE_BASE_URL}/api/v3/exchangeInfo")
-    print("Market data: PUBLIC / NO API KEY")
+    print("ð BYBIT PUBLIC MARKET LOADING")
+    print(
+        f"Endpoint: "
+        f"{BYBIT_BASE_URL}/v5/market/instruments-info"
+    )
+    print(f"Category: {BYBIT_CATEGORY}")
     print("==========================================")
 
     try:
-        data = binance_get(
-            "/api/v3/exchangeInfo",
+        check_bybit_server_time()
+
+        data = bybit_get(
+            "/v5/market/instruments-info",
             params={
-                "symbols": json.dumps(
-                    [s.replace("/", "").upper() for s in REQUESTED_SYMBOLS],
-                    separators=(",", ":")
-                )
+                "category": BYBIT_CATEGORY,
+                "status": "Trading"
             }
         )
 
+        result = data.get("result", {})
+        market_list = result.get("list", [])
+
+        if not market_list:
+            raise RuntimeError(
+                "Bybit returned zero spot markets."
+            )
+
         available_native = {
             item.get("symbol")
-            for item in data.get("symbols", [])
-            if item.get("symbol") and item.get("status") == "TRADING"
+            for item in market_list
+            if item.get("symbol")
         }
 
         available = []
         new_map = {}
 
         for requested in REQUESTED_SYMBOLS:
-            native = requested.replace("/", "").upper()
-            if native in available_native:
+            native_symbol_value = (
+                requested.replace("/", "").upper()
+            )
+
+            if native_symbol_value in available_native:
                 available.append(requested)
-                new_map[requested] = native
-                print(f"â Market available: {requested} -> {native}")
+                new_map[requested] = native_symbol_value
+
+                print(
+                    f"â Market available: "
+                    f"{requested} -> "
+                    f"{native_symbol_value}"
+                )
             else:
-                print(f"â ï¸ Market unavailable: {requested}")
+                print(
+                    f"â ï¸ Market unavailable: "
+                    f"{requested}"
+                )
 
         SYMBOLS = available
-        BINANCE_SYMBOL_MAP = new_map
+        BYBIT_SYMBOL_MAP = new_map
 
         if not SYMBOLS:
-            raise RuntimeError("None of REQUESTED_SYMBOLS are available on Binance Spot.")
+            raise RuntimeError(
+                "None of REQUESTED_SYMBOLS "
+                "are available on Bybit Spot."
+            )
 
-        binance_status = "OK"
-        last_binance_check = time.time()
+        bybit_status = "OK"
+        last_bybit_check = time.time()
         market_load_error = None
-        print(f"â BINANCE MARKETS LOADED | {len(SYMBOLS)} symbols")
+
+        print("==========================================")
+        print("â BYBIT PUBLIC MARKETS LOADED")
+        print(f"Requested: {len(REQUESTED_SYMBOLS)}")
+        print(f"Available: {len(SYMBOLS)}")
+        print(f"Symbols: {', '.join(SYMBOLS)}")
+        print("==========================================")
+
         return True
 
-    except Exception as exc:
-        binance_status = "ERROR"
-        market_load_error = f"{type(exc).__name__}: {exc}"
-        log_exception("BINANCE PUBLIC MARKET LOAD FAILED", exc)
+    except BybitFatalError as e:
+        bybit_status = "FORBIDDEN" if "403" in str(e) else "FATAL_ERROR"
+        market_load_error = str(e)
+
+        log_event(
+            "ð« BYBIT FATAL | " + str(e)
+        )
+
+        print("==========================================")
+        print("ð« BYBIT ACCESS / FATAL ERROR")
+        print(str(e))
+        print("No automatic retry will be performed.")
+        print("==========================================")
+
+        return False
+
+    except Exception as e:
+        bybit_status = "ERROR"
+        market_load_error = (
+            f"{type(e).__name__}: {e}"
+        )
+
+        log_exception(
+            "BYBIT PUBLIC MARKET LOAD FAILED",
+            e
+        )
+
         return False
 
 
 # ============================================================
-# BINANCE HEALTH CHECK
+# BYBIT HEALTH CHECK
 # ============================================================
 
-def check_binance_connection():
-    global binance_status, last_binance_check, market_load_error
+def check_bybit_connection():
+    global bybit_status
+    global last_bybit_check
+    global market_load_error
 
     try:
-        data = binance_get(
-            "/api/v3/ticker/price",
-            params={"symbol": "BTCUSDT"},
+        data = bybit_get(
+            "/v5/market/tickers",
+            params={
+                "category": BYBIT_CATEGORY,
+                "symbol": "BTCUSDT"
+            },
             retries=3
         )
-        price = data.get("price")
-        if not price:
-            raise RuntimeError("BTCUSDT ticker response missing price.")
 
-        binance_status = "OK"
-        last_binance_check = time.time()
+        ticker_list = (
+            data
+            .get("result", {})
+            .get("list", [])
+        )
+
+        if not ticker_list:
+            raise RuntimeError(
+                "BTCUSDT ticker response empty."
+            )
+
+        last_price = ticker_list[0].get("lastPrice")
+
+        if not last_price:
+            raise RuntimeError(
+                "BTCUSDT lastPrice missing."
+            )
+
+        bybit_status = "OK"
+        last_bybit_check = time.time()
         market_load_error = None
-        print(f"â Binance public API health OK | BTCUSDT={price}")
+
+        print(
+            "â Bybit public API health OK | "
+            f"BTCUSDT={last_price}"
+        )
+
         return True
 
-    except Exception as exc:
-        binance_status = "ERROR"
-        market_load_error = f"{type(exc).__name__}: {exc}"
-        log_exception("BINANCE HEALTH CHECK FAILED", exc)
+    except BybitFatalError:
+        bybit_status = (
+            "FORBIDDEN"
+            if bybit_last_http_status == 403
+            else "FATAL_ERROR"
+        )
+        market_load_error = last_bybit_error
+        raise
+
+    except Exception as e:
+        bybit_status = "ERROR"
+        market_load_error = (
+            f"{type(e).__name__}: {e}"
+        )
+
+        log_exception(
+            "BYBIT HEALTH CHECK FAILED",
+            e
+        )
+
         return False
 
 
@@ -794,17 +1092,27 @@ def check_binance_connection():
 # ============================================================
 
 def native_symbol(symbol):
-    native = BINANCE_SYMBOL_MAP.get(symbol)
+    native = BYBIT_SYMBOL_MAP.get(symbol)
     if native:
         return native
 
     return symbol.replace("/", "").upper()
 
 
-BINANCE_INTERVALS = {
-    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m",
-    "30m": "30m", "1h": "1h", "2h": "2h", "4h": "4h",
-    "6h": "6h", "12h": "12h", "1d": "1d", "1w": "1w", "1M": "1M"
+BYBIT_INTERVALS = {
+    "1m": "1",
+    "3m": "3",
+    "5m": "5",
+    "15m": "15",
+    "30m": "30",
+    "1h": "60",
+    "2h": "120",
+    "4h": "240",
+    "6h": "360",
+    "12h": "720",
+    "1d": "D",
+    "1w": "W",
+    "1M": "M"
 }
 
 
@@ -814,48 +1122,107 @@ BINANCE_INTERVALS = {
 
 def fetch_candles(symbol, timeframe, limit=CANDLE_LIMIT):
     native = native_symbol(symbol)
-    interval = BINANCE_INTERVALS.get(timeframe)
+
+    interval = BYBIT_INTERVALS.get(timeframe)
 
     if interval is None:
-        print(f"â Unsupported timeframe: {timeframe}")
+        print(
+            f"â Unsupported timeframe: {timeframe}"
+        )
         return []
 
     try:
-        rows = binance_get(
-            "/api/v3/klines",
+        data = bybit_get(
+            "/v5/market/kline",
             params={
+                "category": BYBIT_CATEGORY,
                 "symbol": native,
                 "interval": interval,
                 "limit": min(int(limit), 1000)
             }
         )
 
+        rows = (
+            data
+            .get("result", {})
+            .get("list", [])
+        )
+
+        if not rows:
+            print(
+                f"â ï¸ Empty candles | "
+                f"{symbol} | {timeframe}"
+            )
+            return []
+
         candles = []
-        for row in rows or []:
-            if len(row) >= 6:
-                candles.append([
-                    int(row[0]), float(row[1]), float(row[2]),
-                    float(row[3]), float(row[4]), float(row[5])
-                ])
+
+        for row in rows:
+            if len(row) < 6:
+                continue
+
+            candles.append([
+                int(row[0]),
+                float(row[1]),
+                float(row[2]),
+                float(row[3]),
+                float(row[4]),
+                float(row[5])
+            ])
+
+        candles.reverse()
         return candles
 
-    except Exception as exc:
-        print(f"â Candle error | {symbol} | {timeframe} | {type(exc).__name__}: {exc}")
+    except BybitFatalError:
+        raise
+
+    except Exception as e:
+        print(
+            f"â Candle error | "
+            f"{symbol} | {timeframe} | "
+            f"{type(e).__name__}: {e}"
+        )
         return []
 
 
 def fetch_price(symbol):
     native = native_symbol(symbol)
+
     try:
-        data = binance_get(
-            "/api/v3/ticker/price",
-            params={"symbol": native},
+        data = bybit_get(
+            "/v5/market/tickers",
+            params={
+                "category": BYBIT_CATEGORY,
+                "symbol": native
+            },
             retries=3
         )
-        value = data.get("price")
-        return float(value) if value is not None else None
-    except Exception as exc:
-        print(f"â Price error | {symbol} | {type(exc).__name__}: {exc}")
+
+        rows = (
+            data
+            .get("result", {})
+            .get("list", [])
+        )
+
+        if not rows:
+            return None
+
+        last = rows[0].get("lastPrice")
+
+        if last is None:
+            return None
+
+        return float(last)
+
+    except BybitFatalError:
+        raise
+
+    except Exception as e:
+        print(
+            f"â Price error | "
+            f"{symbol} | "
+            f"{type(e).__name__}: {e}"
+        )
         return None
 
 
@@ -2082,7 +2449,7 @@ def create_trade(symbol, setup):
         f"ð§  <b>Reason:</b> {trade['reason']}\n"
         "ââââââââââââââââââ\n"
         "<b>ð¡ PAPER TRADE ONLY</b>\n"
-        "No real Binance order was placed."
+        "No real Bybit order was placed."
     )
 
     telegram_sent = send_telegram(message)
@@ -2281,7 +2648,7 @@ def scan_symbol(symbol):
             create_trade(symbol, setup)
             return
 
-    except BinanceFatalError:
+    except BybitFatalError:
         raise
 
     except Exception as e:
@@ -2301,7 +2668,7 @@ def scan_symbol(symbol):
             create_trade(symbol, setup)
             return
 
-    except BinanceFatalError:
+    except BybitFatalError:
         raise
 
     except Exception as e:
@@ -2323,9 +2690,9 @@ def health_monitor():
             telegram_ok = check_telegram_without_message()
 
             try:
-                binance_ok = check_binance_connection()
-            except BinanceFatalError:
-                binance_ok = False
+                bybit_ok = check_bybit_connection()
+            except BybitFatalError:
+                bybit_ok = False
 
             with state_lock:
                 active_count = len(active_trades)
@@ -2346,9 +2713,9 @@ def health_monitor():
                 else "â ERROR"
             )
 
-            binance_text = (
+            bybit_text = (
                 "â OK"
-                if binance_ok
+                if bybit_ok
                 else "â ERROR"
             )
 
@@ -2360,7 +2727,7 @@ def health_monitor():
 
             if (
                 telegram_ok
-                and binance_ok
+                and bybit_ok
                 and scanner_ok
             ):
                 title = "ð¢ BOT HEALTH CHECK"
@@ -2373,14 +2740,14 @@ def health_monitor():
                 f"<b>{title}</b>\n"
                 "ââââââââââââââââââ\n"
                 f"Telegram: {telegram_text}\n"
-                f"Binance API: {binance_text}\n"
+                f"Bybit API: {bybit_text}\n"
                 f"Scanner: {scanner_text}\n"
                 f"Mode: ð¡ {TRADING_MODE}\n"
                 f"Symbols: {len(SYMBOLS)}\n"
                 f"Active Trades: {active_count}\n"
                 f"Uptime: {uptime_hours:.1f} hours\n"
-                f"Binance 403 Count: {binance_403_count}\n"
-                f"Binance 429 Count: {binance_429_count}\n"
+                f"Bybit 403 Count: {bybit_403_count}\n"
+                f"Bybit 429 Count: {bybit_429_count}\n"
                 "ââââââââââââââââââ\n"
                 f"{final}"
             )
@@ -2408,8 +2775,8 @@ def startup_diagnostics():
     print(f"Process PID: {process_pid}")
     print(f"Render instance: {render_instance}")
 
-    print(f"Binance URL: {BINANCE_BASE_URL}")
-    print(f"Binance Category: {BINANCE_CATEGORY}")
+    print(f"Bybit URL: {BYBIT_BASE_URL}")
+    print(f"Bybit Category: {BYBIT_CATEGORY}")
 
     print(
         "Telegram configured: "
@@ -2425,13 +2792,13 @@ def startup_diagnostics():
     print(f"API timeout: {API_TIMEOUT}s")
 
     print(
-        f"Binance max retries: "
-        f"{BINANCE_MAX_RETRIES}"
+        f"Bybit max retries: "
+        f"{BYBIT_MAX_RETRIES}"
     )
 
     print(
         f"Startup max attempts: "
-        f"{BINANCE_STARTUP_MAX_ATTEMPTS}"
+        f"{BYBIT_STARTUP_MAX_ATTEMPTS}"
     )
 
     print("Indicator configuration:")
@@ -2469,46 +2836,164 @@ def startup_diagnostics():
 # ============================================================
 
 def background_trading_scanner():
-    global scanner_status, last_scanner_run
+    global scanner_status
+    global last_scanner_run
+
+    global scanner_cycle_count
+    global scanner_error_count
+    global scanner_last_duration
+
+    global startup_attempts
+    global startup_failed_reason
 
     print("==========================================")
     print("ð RULEBOOK SMC SCANNER STARTED")
-    print("Exchange: Binance Spot")
+    print("Exchange: Bybit")
     print(f"Mode: {TRADING_MODE}")
     print("Real Orders: DISABLED")
     print("==========================================")
 
     startup_diagnostics()
+
+    # Telegram
     telegram_connection_test()
 
-    if not load_binance_public_markets():
-        scanner_status = "BINANCE_ERROR"
-        error_text = market_load_error or "Unknown Binance error"
-        print(f"ð´ BINANCE STARTUP FAILED: {error_text}")
-        print("ð Scanner stopped. No infinite retry loop.")
+    # --------------------------------------------------------
+    # BOUNDED BYBIT STARTUP RETRIES
+    # --------------------------------------------------------
+
+    startup_attempts = 0
+    loaded = False
+
+    while (
+        not loaded
+        and startup_attempts < BYBIT_STARTUP_MAX_ATTEMPTS
+    ):
+        startup_attempts += 1
+
+        print("==========================================")
+        print(
+            f"ð¡ BYBIT MARKET LOAD ATTEMPT "
+            f"{startup_attempts}/"
+            f"{BYBIT_STARTUP_MAX_ATTEMPTS}"
+        )
+
+        try:
+            loaded = load_bybit_public_markets()
+
+        except BybitFatalError as e:
+            loaded = False
+            scanner_status = "BYBIT_FATAL_ERROR"
+            startup_failed_reason = str(e)
+
+            print("==========================================")
+            print("ð« FATAL BYBIT ERROR")
+            print(f"Reason: {e}")
+            print("Scanner startup retry STOPPED.")
+            print("==========================================")
+
+            send_telegram(
+                "<b>ð« BYBIT FATAL ERROR</b>\n"
+                "ââââââââââââââââââ\n"
+                "Scanner startup stopped.\n"
+                "Bybit returned a non-retryable error.\n\n"
+                f"<code>{str(e)[:700]}</code>\n\n"
+                "Check Render network/API configuration."
+            )
+
+            break
+
+        except Exception as e:
+            loaded = False
+
+            startup_failed_reason = (
+                f"{type(e).__name__}: {e}"
+            )
+
+            print(
+                f"â ï¸ Startup attempt failed: "
+                f"{startup_failed_reason}"
+            )
+
+            if (
+                startup_attempts
+                < BYBIT_STARTUP_MAX_ATTEMPTS
+            ):
+                delay = min(
+                    BYBIT_STARTUP_BACKOFF_MAX,
+                    10 * startup_attempts
+                )
+
+                print(
+                    f"â³ Waiting {delay}s "
+                    "before next startup attempt..."
+                )
+
+                time.sleep(delay)
+
+    # --------------------------------------------------------
+    # STARTUP FAILURE
+    # --------------------------------------------------------
+
+    if not loaded:
+        scanner_status = "STARTUP_FAILED"
+
+        print("==========================================")
+        print("ð´ SCANNER STARTUP FAILED")
+        print(f"Attempts: {startup_attempts}")
+        print(f"Reason: {startup_failed_reason}")
+        print(
+            "Scanner will NOT enter an "
+            "infinite retry loop."
+        )
+        print(
+            "Render web server remains available "
+            "for diagnostics."
+        )
+        print("==========================================")
 
         send_telegram(
-            "<b>ð´ BOT STARTUP ALERT</b>\n"
+            "<b>ð´ SCANNER STARTUP FAILED</b>\n"
             "ââââââââââââââââââ\n"
-            "Telegram: â Connected\n"
-            "Binance: â Market loading failed\n"
-            "Scanner: ð STOPPED\n"
-            f"Error: <code>{error_text[:500]}</code>\n"
-            "Mode: ð¡ PAPER / SIGNAL ONLY"
+            f"Attempts: {startup_attempts}\n"
+            f"Reason: "
+            f"<code>{str(startup_failed_reason)[:700]}</code>\n"
+            "Scanner retry loop: â STOPPED\n"
+            "Render diagnostics: â AVAILABLE"
         )
+
         return
 
     if not SYMBOLS:
         scanner_status = "WAITING_FOR_SYMBOLS"
-        return
 
-    if not check_binance_connection():
-        scanner_status = "BINANCE_ERROR"
         send_telegram(
-            "<b>ð´ BINANCE HEALTH CHECK FAILED</b>\n"
-            f"<code>{(last_binance_error or 'Unknown')[:500]}</code>\n"
+            "<b>ð´ NO BYBIT SYMBOLS</b>\n"
+            "ââââââââââââââââââ\n"
+            "Public market API responded,\n"
+            "but requested symbols were not found.\n"
             "Scanner stopped."
         )
+
+        return
+
+    # --------------------------------------------------------
+    # Initial health check
+    # --------------------------------------------------------
+
+    try:
+        check_bybit_connection()
+    except BybitFatalError:
+        scanner_status = "BYBIT_FATAL_ERROR"
+
+        send_telegram(
+            "<b>ð« BYBIT ACCESS BLOCKED</b>\n"
+            "ââââââââââââââââââ\n"
+            "Initial health check returned a fatal "
+            "Bybit error.\n"
+            "Scanner stopped."
+        )
+
         return
 
     scanner_status = "RUNNING"
@@ -2517,47 +3002,128 @@ def background_trading_scanner():
         "<b>ð¢ SCANNER READY</b>\n"
         "ââââââââââââââââââ\n"
         "Telegram: â Connected\n"
-        "Binance Public API: â Connected\n"
+        "Bybit Public API: â Connected\n"
         f"Symbols: {len(SYMBOLS)}\n"
         f"{', '.join(SYMBOLS)}\n"
         "Scanner: â Running\n"
+        "Indicators: EMA9/21 + RSI14 + ATR14 + Volume\n"
         "Mode: ð¡ PAPER / SIGNAL ONLY\n"
         "Real Orders: â DISABLED\n"
         "ââââââââââââââââââ\n"
         "Waiting for valid Rulebook setups..."
     )
 
+    # --------------------------------------------------------
+    # MAIN SCANNER LOOP
+    # --------------------------------------------------------
+
     while True:
         started = time.time()
+        scanner_cycle_count += 1
+
         try:
+            # Periodic public API health check.
             if (
-                last_binance_check is None
-                or time.time() - last_binance_check > 300
+                last_bybit_check is None
+                or
+                time.time() - last_bybit_check > 300
             ):
-                if not check_binance_connection():
-                    scanner_status = "BINANCE_ERROR"
-                    log_event("Binance health failed; scanner cycle skipped.")
-                    time.sleep(max(30, SCAN_INTERVAL))
+                try:
+                    bybit_ok = check_bybit_connection()
+                except BybitFatalError as e:
+                    scanner_status = "BYBIT_FATAL_ERROR"
+
+                    print(
+                        "ð« Fatal Bybit error during scanner:"
+                    )
+                    print(str(e))
+
+                    send_telegram(
+                        "<b>ð« BYBIT ACCESS BLOCKED</b>\n"
+                        "ââââââââââââââââââ\n"
+                        f"<code>{str(e)[:700]}</code>\n\n"
+                        "Scanner stopped requesting Bybit.\n"
+                        "Check /api/diagnostics."
+                    )
+
+                    break
+
+                if not bybit_ok:
+                    scanner_status = "BYBIT_ERROR"
+
+                    print(
+                        "â ï¸ Temporary Bybit health failure."
+                    )
+
+                    time.sleep(30)
                     continue
+
+                scanner_status = "RUNNING"
 
             for symbol in list(SYMBOLS):
                 try:
                     scan_symbol(symbol)
-                except Exception as exc:
-                    log_exception(f"Scanner error | {symbol}", exc)
+
+                except BybitFatalError as e:
+                    scanner_status = "BYBIT_FATAL_ERROR"
+
+                    print(
+                        f"ð« Fatal Bybit error | "
+                        f"{symbol}: {e}"
+                    )
+
+                    send_telegram(
+                        "<b>ð« BYBIT FATAL ERROR</b>\n"
+                        "ââââââââââââââââââ\n"
+                        f"Symbol: {symbol}\n"
+                        f"<code>{str(e)[:700]}</code>\n"
+                        "Scanner stopped."
+                    )
+
+                    return
+
+                except Exception as e:
+                    scanner_error_count += 1
+
+                    log_exception(
+                        f"Scanner error | {symbol}",
+                        e
+                    )
+
                 time.sleep(1)
 
             last_scanner_run = time.time()
-            scanner_status = "RUNNING"
-            elapsed = time.time() - started
-            print(f"ð Scanner cycle complete | Symbols={len(SYMBOLS)} | Time={elapsed:.1f}s")
 
-        except Exception as exc:
+            scanner_status = "RUNNING"
+
+            elapsed = time.time() - started
+            scanner_last_duration = elapsed
+
+            print(
+                f"ð Scanner cycle complete | "
+                f"Cycle={scanner_cycle_count} | "
+                f"Symbols={len(SYMBOLS)} | "
+                f"Time={elapsed:.1f}s"
+            )
+
+        except Exception as e:
+            scanner_error_count += 1
             scanner_status = "ERROR"
-            log_exception("Main scanner error", exc)
+
+            log_exception(
+                "Main scanner error",
+                e
+            )
 
         elapsed = time.time() - started
-        time.sleep(max(5, SCAN_INTERVAL - elapsed))
+        scanner_last_duration = elapsed
+
+        time.sleep(
+            max(
+                5,
+                SCAN_INTERVAL - elapsed
+            )
+        )
 
 
 # ============================================================
@@ -2669,21 +3235,21 @@ def api_status():
         "status": scanner_status,
         "mode": "PAPER",
         "real_orders_enabled": REAL_ORDERS_ENABLED,
-        "exchange": "BINANCE",
-        "binance_base_url": BINANCE_BASE_URL,
-        "binance_category": BINANCE_CATEGORY,
+        "exchange": "BYBIT",
+        "bybit_base_url": BYBIT_BASE_URL,
+        "bybit_category": BYBIT_CATEGORY,
 
         "telegram": telegram_status,
         "telegram_configured": telegram_configured(),
         "telegram_last_error": last_telegram_error,
 
-        "binance": binance_status,
-        "binance_last_error": last_binance_error,
-        "binance_request_count": binance_request_count,
-        "binance_last_http_status": binance_last_http_status,
-        "binance_403_count": binance_403_count,
-        "binance_429_count": binance_429_count,
-        "binance_5xx_count": binance_5xx_count,
+        "bybit": bybit_status,
+        "bybit_last_error": last_bybit_error,
+        "bybit_request_count": bybit_request_count,
+        "bybit_last_http_status": bybit_last_http_status,
+        "bybit_403_count": bybit_403_count,
+        "bybit_429_count": bybit_429_count,
+        "bybit_5xx_count": bybit_5xx_count,
 
         "symbols": SYMBOLS,
         "active_trades": trades,
@@ -2691,7 +3257,7 @@ def api_status():
 
         "uptime_hours": round(uptime / 3600, 2),
         "last_scanner_run": last_scanner_run,
-        "last_binance_check": last_binance_check,
+        "last_bybit_check": last_bybit_check,
         "last_telegram_check": last_telegram_check,
         "market_load_error": market_load_error,
 
@@ -2778,35 +3344,35 @@ def api_diagnostics():
                 startup_failed_reason
         },
 
-        "binance": {
+        "bybit": {
             "base_url":
-                BINANCE_BASE_URL,
+                BYBIT_BASE_URL,
             "category":
-                BINANCE_CATEGORY,
+                BYBIT_CATEGORY,
             "status":
-                binance_status,
+                bybit_status,
             "fatal_error":
-                fatal_binance_error,
+                fatal_bybit_error,
             "fatal_error_at":
-                fatal_binance_error_at,
+                fatal_bybit_error_at,
             "last_http_status":
-                binance_last_http_status,
+                bybit_last_http_status,
             "last_request_at":
-                binance_last_request_at,
+                bybit_last_request_at,
             "last_success_at":
-                binance_last_success_at,
+                bybit_last_success_at,
             "request_count":
-                binance_request_count,
+                bybit_request_count,
             "http_403_count":
-                binance_403_count,
+                bybit_403_count,
             "http_429_count":
-                binance_429_count,
+                bybit_429_count,
             "http_5xx_count":
-                binance_5xx_count,
+                bybit_5xx_count,
             "last_url":
-                binance_last_url,
+                bybit_last_url,
             "last_error":
-                last_binance_error,
+                last_bybit_error,
             "market_load_error":
                 market_load_error
         },
@@ -3002,7 +3568,7 @@ Status:
 </p>
 
 <p>
-Real Binance Orders:
+Real Bybit Orders:
 <b>â DISABLED</b>
 </p>
 </div>
@@ -3029,9 +3595,9 @@ Volume: {{ "ON" if volume_filter else "OFF" }}
 </div>
 
 <div class="card">
-<h3>Binance API</h3>
-<p class="{{ 'online' if binance_status == 'OK' else 'error' }}">
-{{ binance_status }}
+<h3>Bybit API</h3>
+<p class="{{ 'online' if bybit_status == 'OK' else 'error' }}">
+{{ bybit_status }}
 </p>
 </div>
 
@@ -3071,8 +3637,8 @@ Volume: {{ "ON" if volume_filter else "OFF" }}
 </div>
 
 <div class="card">
-<h3>Binance 403</h3>
-<p class="error">{{ binance_403_count }}</p>
+<h3>Bybit 403</h3>
+<p class="error">{{ bybit_403_count }}</p>
 </div>
 
 <div class="card">
@@ -3084,7 +3650,7 @@ Volume: {{ "ON" if volume_filter else "OFF" }}
 
 {% if market_load_error %}
 <div class="error-box">
-<b>â ï¸ Last Binance Error:</b>
+<b>â ï¸ Last Bybit Error:</b>
 <br><br>
 {{ market_load_error }}
 </div>
@@ -3159,10 +3725,10 @@ def home():
         stats=stats,
         scanner_status=scanner_status,
         telegram_status=telegram_status,
-        binance_status=binance_status,
+        bybit_status=bybit_status,
         symbols=SYMBOLS,
         market_load_error=market_load_error,
-        binance_403_count=binance_403_count,
+        bybit_403_count=bybit_403_count,
         scanner_cycle_count=scanner_cycle_count,
         ema_fast=EMA_FAST,
         ema_slow=EMA_SLOW,
@@ -3186,7 +3752,7 @@ def health():
         "status": "ok",
         "scanner": scanner_status,
         "telegram": telegram_status,
-        "binance": binance_status,
+        "bybit": bybit_status,
         "symbols": SYMBOLS,
         "mode": "PAPER",
         "real_orders_enabled": False,
@@ -3208,7 +3774,7 @@ if __name__ == "__main__":
     print("Version: 2.0")
     print("Mode: PAPER / SIGNAL ONLY")
     print("Real Orders: DISABLED")
-    print("Binance: PUBLIC REST API")
+    print("Bybit: PUBLIC REST API")
     print("Indicators: EMA9/21 + RSI14 + ATR14 + Volume")
     print("==========================================")
 
