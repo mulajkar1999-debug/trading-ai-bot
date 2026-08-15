@@ -2,16 +2,23 @@ import os
 import time
 import sqlite3
 import threading
+import traceback
 from datetime import datetime, timezone
 
 import requests
-import ccxt
 from flask import Flask, jsonify, render_template_string
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
+
+# IMPORTANT:
+# Do NOT put the actual Telegram token/chat ID here.
+# Add them in Render Environment Variables.
+#
+# TELEGRAM_BOT_TOKEN = your Telegram bot token
+# TELEGRAM_CHAT_ID   = your Telegram chat ID
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -20,10 +27,25 @@ DB_FILE = os.getenv("DB_FILE", "trading_bot.db")
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
 
-# Telegram health message every 3 hours
 HEALTH_CHECK_INTERVAL = 3 * 60 * 60
 
-API_TIMEOUT = 10000
+API_TIMEOUT = int(os.getenv("API_TIMEOUT", "15"))
+
+BYBIT_BASE_URL = os.getenv(
+    "BYBIT_BASE_URL",
+    "https://api.bybit.com"
+).rstrip("/")
+
+BYBIT_CATEGORY = "spot"
+
+BYBIT_MAX_RETRIES = int(
+    os.getenv("BYBIT_MAX_RETRIES", "5")
+)
+
+BYBIT_RETRY_DELAY = int(
+    os.getenv("BYBIT_RETRY_DELAY", "5")
+)
+
 
 # ============================================================
 # MODE
@@ -31,8 +53,7 @@ API_TIMEOUT = 10000
 
 TRADING_MODE = "PAPER / SIGNAL ONLY"
 
-# IMPORTANT:
-# This bot NEVER creates real Bybit orders.
+# NEVER changed automatically.
 REAL_ORDERS_ENABLED = False
 
 
@@ -52,6 +73,12 @@ REQUESTED_SYMBOLS = [
 ]
 
 SYMBOLS = []
+
+# Bybit native symbol map:
+#
+# BTC/USDT -> BTCUSDT
+#
+BYBIT_SYMBOL_MAP = {}
 
 
 # ============================================================
@@ -89,19 +116,6 @@ app = Flask(__name__)
 
 
 # ============================================================
-# BYBIT
-# ============================================================
-
-exchange = ccxt.bybit({
-    "enableRateLimit": True,
-    "timeout": API_TIMEOUT,
-    "options": {
-        "defaultType": "spot",
-    },
-})
-
-
-# ============================================================
 # GLOBAL STATE
 # ============================================================
 
@@ -124,12 +138,18 @@ scanner_status = "STARTING"
 
 market_load_error = None
 
+last_bybit_error = None
+last_telegram_error = None
+
+bybit_request_count = 0
+
 
 # ============================================================
 # DATABASE
 # ============================================================
 
 def db_connect():
+
     return sqlite3.connect(
         DB_FILE,
         check_same_thread=False,
@@ -140,6 +160,7 @@ def db_connect():
 def init_db():
 
     conn = db_connect()
+
     cur = conn.cursor()
 
     cur.execute("""
@@ -194,7 +215,10 @@ def db_log_event(event):
 
     except Exception as e:
 
-        print("DB event error:", e)
+        print(
+            "DB event error:",
+            repr(e)
+        )
 
 
 def db_save_trade(
@@ -247,7 +271,10 @@ def db_save_trade(
 
     except Exception as e:
 
-        print("DB trade error:", e)
+        print(
+            "DB trade error:",
+            repr(e)
+        )
 
 
 # ============================================================
@@ -256,35 +283,235 @@ def db_save_trade(
 
 def log_event(message):
 
-    print(message)
+    timestamp = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    full_message = (
+        f"{timestamp} | {message}"
+    )
+
+    print(full_message)
 
     with state_lock:
 
-        trade_logs.append(
-            f"{datetime.now().strftime('%H:%M:%S')} | {message}"
-        )
+        trade_logs.append(full_message)
 
         if len(trade_logs) > 500:
+
             del trade_logs[:-500]
 
     db_log_event(message)
+
+
+def log_exception(
+    prefix,
+    exc
+):
+
+    print(
+        f"❌ {prefix}: "
+        f"{type(exc).__name__}: {exc}"
+    )
+
+    traceback.print_exc()
+
+    log_event(
+        f"{prefix} | "
+        f"{type(exc).__name__}: {exc}"
+    )
+
+
+# ============================================================
+# GENERIC HTTP REQUEST
+# ============================================================
+
+def bybit_get(
+    path,
+    params=None,
+    retries=None
+):
+
+    global bybit_request_count
+    global last_bybit_error
+
+    if retries is None:
+        retries = BYBIT_MAX_RETRIES
+
+    url = (
+        BYBIT_BASE_URL
+        + path
+    )
+
+    last_exception = None
+
+    for attempt in range(
+        1,
+        retries + 1
+    ):
+
+        try:
+
+            bybit_request_count += 1
+
+            response = requests.get(
+                url,
+                params=params or {},
+                timeout=API_TIMEOUT,
+                headers={
+                    "User-Agent":
+                        "Rulebook-SMC-Bot/1.0"
+                }
+            )
+
+            status_code = response.status_code
+
+            response_text = response.text[:1000]
+
+            if status_code != 200:
+
+                error_message = (
+                    f"HTTP {status_code} | "
+                    f"URL={url} | "
+                    f"Response={response_text}"
+                )
+
+                last_bybit_error = error_message
+
+                print(
+                    f"[Bybit] Attempt "
+                    f"{attempt}/{retries} FAILED: "
+                    f"{error_message}"
+                )
+
+                if (
+                    status_code in
+                    [429, 500, 502, 503, 504]
+                ):
+
+                    time.sleep(
+                        BYBIT_RETRY_DELAY
+                        * attempt
+                    )
+
+                    continue
+
+                raise RuntimeError(
+                    error_message
+                )
+
+            try:
+
+                data = response.json()
+
+            except Exception as e:
+
+                raise RuntimeError(
+                    "Invalid JSON from Bybit | "
+                    f"HTTP={status_code} | "
+                    f"Response={response_text}"
+                ) from e
+
+            ret_code = data.get(
+                "retCode"
+            )
+
+            if ret_code != 0:
+
+                ret_msg = data.get(
+                    "retMsg",
+                    "Unknown Bybit error"
+                )
+
+                error_message = (
+                    f"Bybit retCode={ret_code} | "
+                    f"retMsg={ret_msg} | "
+                    f"URL={url}"
+                )
+
+                last_bybit_error = error_message
+
+                print(
+                    f"[Bybit] Attempt "
+                    f"{attempt}/{retries} FAILED: "
+                    f"{error_message}"
+                )
+
+                if attempt < retries:
+
+                    time.sleep(
+                        BYBIT_RETRY_DELAY
+                        * attempt
+                    )
+
+                    continue
+
+                raise RuntimeError(
+                    error_message
+                )
+
+            last_bybit_error = None
+
+            return data
+
+        except Exception as e:
+
+            last_exception = e
+
+            last_bybit_error = (
+                f"{type(e).__name__}: {e}"
+            )
+
+            print(
+                f"[Bybit] Attempt "
+                f"{attempt}/{retries} exception: "
+                f"{type(e).__name__}: {e}"
+            )
+
+            if attempt < retries:
+
+                time.sleep(
+                    BYBIT_RETRY_DELAY
+                    * attempt
+                )
+
+    if last_exception:
+
+        raise last_exception
+
+    raise RuntimeError(
+        "Bybit request failed without exception."
+    )
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
+def telegram_configured():
+
+    return bool(
+        TELEGRAM_BOT_TOKEN
+        and TELEGRAM_CHAT_ID
+    )
+
+
 def send_telegram(message):
 
     global telegram_status
     global last_telegram_check
+    global last_telegram_error
 
     if not TELEGRAM_BOT_TOKEN:
 
         telegram_status = "NOT_CONFIGURED"
 
+        last_telegram_error = (
+            "TELEGRAM_BOT_TOKEN missing"
+        )
+
         print(
-            "[Telegram] TELEGRAM_BOT_TOKEN is missing."
+            "❌ Telegram token missing."
         )
 
         return False
@@ -293,8 +520,12 @@ def send_telegram(message):
 
         telegram_status = "NOT_CONFIGURED"
 
+        last_telegram_error = (
+            "TELEGRAM_CHAT_ID missing"
+        )
+
         print(
-            "[Telegram] TELEGRAM_CHAT_ID is missing."
+            "❌ Telegram chat ID missing."
         )
 
         return False
@@ -319,23 +550,46 @@ def send_telegram(message):
             timeout=10
         )
 
-        if response.status_code == 200:
+        response_text = response.text[:1000]
 
-            data = response.json()
+        if response.status_code != 200:
 
-            if data.get("ok"):
+            telegram_status = "ERROR"
 
-                telegram_status = "OK"
-                last_telegram_check = time.time()
+            last_telegram_error = (
+                f"HTTP {response.status_code} | "
+                f"{response_text}"
+            )
 
-                return True
+            print(
+                "[Telegram] ERROR:",
+                last_telegram_error
+            )
+
+            return False
+
+        data = response.json()
+
+        if data.get("ok"):
+
+            telegram_status = "OK"
+
+            last_telegram_check = time.time()
+
+            last_telegram_error = None
+
+            return True
 
         telegram_status = "ERROR"
 
+        last_telegram_error = (
+            f"Telegram API returned ok=false | "
+            f"{response_text}"
+        )
+
         print(
             "[Telegram] API error:",
-            response.status_code,
-            response.text
+            last_telegram_error
         )
 
         return False
@@ -344,31 +598,46 @@ def send_telegram(message):
 
         telegram_status = "ERROR"
 
+        last_telegram_error = (
+            f"{type(e).__name__}: {e}"
+        )
+
         print(
             "[Telegram] Exception:",
-            e
+            last_telegram_error
         )
 
         return False
 
 
 # ============================================================
-# TELEGRAM API CHECK
+# TELEGRAM DIAGNOSTICS
 # ============================================================
 
 def check_telegram_without_message():
 
     global telegram_status
     global last_telegram_check
+    global last_telegram_error
 
     if not TELEGRAM_BOT_TOKEN:
 
         telegram_status = "NOT_CONFIGURED"
+
+        last_telegram_error = (
+            "TELEGRAM_BOT_TOKEN missing"
+        )
+
         return False
 
     if not TELEGRAM_CHAT_ID:
 
         telegram_status = "NOT_CONFIGURED"
+
+        last_telegram_error = (
+            "TELEGRAM_CHAT_ID missing"
+        )
+
         return False
 
     url = (
@@ -383,51 +652,153 @@ def check_telegram_without_message():
             timeout=10
         )
 
+        response_text = response.text[:1000]
+
         if response.status_code != 200:
 
             telegram_status = "ERROR"
 
+            last_telegram_error = (
+                f"getMe HTTP "
+                f"{response.status_code} | "
+                f"{response_text}"
+            )
+
             print(
-                "[Telegram] getMe error:",
-                response.status_code,
-                response.text
+                "❌ Telegram getMe:",
+                last_telegram_error
             )
 
             return False
 
         data = response.json()
 
-        if data.get("ok"):
+        if not data.get("ok"):
 
-            telegram_status = "OK"
-            last_telegram_check = time.time()
+            telegram_status = "ERROR"
 
-            return True
+            last_telegram_error = (
+                f"getMe ok=false | "
+                f"{response_text}"
+            )
 
-        telegram_status = "ERROR"
+            print(
+                "❌ Telegram getMe:",
+                last_telegram_error
+            )
 
-        return False
+            return False
+
+        bot_info = data.get(
+            "result",
+            {}
+        )
+
+        bot_username = bot_info.get(
+            "username",
+            "unknown"
+        )
+
+        telegram_status = "OK"
+
+        last_telegram_check = time.time()
+
+        last_telegram_error = None
+
+        print(
+            "✅ Telegram API OK | "
+            f"Bot=@{bot_username}"
+        )
+
+        return True
 
     except Exception as e:
 
         telegram_status = "ERROR"
 
+        last_telegram_error = (
+            f"{type(e).__name__}: {e}"
+        )
+
         print(
-            "[Telegram] health error:",
-            e
+            "❌ Telegram health exception:",
+            last_telegram_error
         )
 
         return False
 
 
-# ============================================================
-# TELEGRAM STARTUP TEST
-# ============================================================
+def check_telegram_chat():
+
+    if not telegram_configured():
+
+        return False
+
+    url = (
+        "https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/getChat"
+    )
+
+    try:
+
+        response = requests.get(
+            url,
+            params={
+                "chat_id":
+                    TELEGRAM_CHAT_ID
+            },
+            timeout=10
+        )
+
+        data = response.json()
+
+        if not data.get("ok"):
+
+            print(
+                "❌ Telegram chat diagnostic failed:",
+                response.text[:1000]
+            )
+
+            return False
+
+        chat = data.get(
+            "result",
+            {}
+        )
+
+        print(
+            "✅ Telegram chat OK | "
+            f"id={chat.get('id')} | "
+            f"type={chat.get('type')} | "
+            f"title={chat.get('title', '')}"
+        )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            "❌ Telegram chat diagnostic exception:",
+            repr(e)
+        )
+
+        return False
+
 
 def telegram_connection_test():
 
+    global telegram_status
+
     print(
-        "Testing Telegram connection..."
+        "=========================================="
+    )
+
+    print(
+        "📱 TESTING TELEGRAM"
+    )
+
+    print(
+        "=========================================="
     )
 
     if not TELEGRAM_BOT_TOKEN:
@@ -453,15 +824,18 @@ def telegram_connection_test():
     if not check_telegram_without_message():
 
         print(
-            "❌ Telegram API connection failed."
+            "❌ Telegram bot API test failed."
         )
 
         return False
+
+    check_telegram_chat()
 
     message = (
         "<b>🟢 TELEGRAM CONNECTION OK</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "Telegram Bot: ✅ Connected\n"
+        "Chat ID: ✅ Valid\n"
         "Backend: ✅ Starting\n"
         "Bybit: ⏳ Checking...\n"
         "Mode: 🟡 PAPER / SIGNAL ONLY\n"
@@ -469,12 +843,14 @@ def telegram_connection_test():
         "Rulebook scanner is starting."
     )
 
-    success = send_telegram(message)
+    success = send_telegram(
+        message
+    )
 
     if success:
 
         print(
-            "✅ Telegram connection test successful."
+            "✅ Telegram message test successful."
         )
 
     else:
@@ -487,111 +863,204 @@ def telegram_connection_test():
 
 
 # ============================================================
-# BYBIT MARKET LOADING
+# BYBIT PUBLIC SERVER TIME
 # ============================================================
 
-def load_bybit_markets():
+def check_bybit_server_time():
+
+    try:
+
+        data = bybit_get(
+            "/v5/market/time",
+            retries=3
+        )
+
+        result = data.get(
+            "result",
+            {}
+        )
+
+        print(
+            "✅ Bybit server time OK | "
+            f"timeSecond={result.get('timeSecond')}"
+        )
+
+        return True
+
+    except Exception as e:
+
+        log_exception(
+            "BYBIT SERVER TIME CHECK FAILED",
+            e
+        )
+
+        return False
+
+
+# ============================================================
+# BYBIT PUBLIC MARKET LOADING
+# ============================================================
+
+def load_bybit_public_markets():
 
     global SYMBOLS
+    global BYBIT_SYMBOL_MAP
     global bybit_status
     global last_bybit_check
     global market_load_error
 
-    max_attempts = 3
+    print(
+        "=========================================="
+    )
 
-    for attempt in range(
-        1,
-        max_attempts + 1
-    ):
+    print(
+        "📊 BYBIT PUBLIC MARKET LOADING"
+    )
 
-        try:
+    print(
+        f"Endpoint: "
+        f"{BYBIT_BASE_URL}/v5/market/instruments-info"
+    )
 
-            print(
-                f"Loading Bybit markets... "
-                f"Attempt {attempt}/{max_attempts}"
+    print(
+        f"Category: {BYBIT_CATEGORY}"
+    )
+
+    print(
+        "=========================================="
+    )
+
+    try:
+
+        check_bybit_server_time()
+
+        data = bybit_get(
+            "/v5/market/instruments-info",
+            params={
+                "category":
+                    BYBIT_CATEGORY,
+                "status":
+                    "Trading"
+            }
+        )
+
+        result = data.get(
+            "result",
+            {}
+        )
+
+        market_list = result.get(
+            "list",
+            []
+        )
+
+        if not market_list:
+
+            raise RuntimeError(
+                "Bybit returned zero spot markets."
             )
 
-            exchange.load_markets(
-                reload=True
+        available_native = {
+            item.get("symbol")
+            for item in market_list
+            if item.get("symbol")
+        }
+
+        available = []
+
+        new_map = {}
+
+        for requested in REQUESTED_SYMBOLS:
+
+            native_symbol = (
+                requested
+                .replace("/", "")
+                .upper()
             )
 
-            available = []
+            if native_symbol in available_native:
 
-            for symbol in REQUESTED_SYMBOLS:
-
-                if symbol not in exchange.markets:
-
-                    print(
-                        f"[SKIP] {symbol} "
-                        "not found on Bybit."
-                    )
-
-                    continue
-
-                market = exchange.markets[symbol]
-
-                if not market.get("spot"):
-
-                    print(
-                        f"[SKIP] {symbol} "
-                        "is not a spot market."
-                    )
-
-                    continue
-
-                if market.get("quote") != "USDT":
-
-                    print(
-                        f"[SKIP] {symbol} "
-                        "is not USDT."
-                    )
-
-                    continue
-
-                available.append(symbol)
-
-            SYMBOLS = available
-
-            bybit_status = "OK"
-            last_bybit_check = time.time()
-            market_load_error = None
-
-            print(
-                "=========================================="
-            )
-
-            print(
-                "✅ BYBIT MARKETS LOADED"
-            )
-
-            print(
-                f"Available symbols: "
-                f"{', '.join(SYMBOLS)}"
-            )
-
-            print(
-                "=========================================="
-            )
-
-            return True
-
-        except Exception as e:
-
-            market_load_error = str(e)
-            bybit_status = "ERROR"
-
-            print(
-                f"❌ Bybit market load failed "
-                f"(attempt {attempt}): {e}"
-            )
-
-            if attempt < max_attempts:
-
-                time.sleep(
-                    attempt * 5
+                available.append(
+                    requested
                 )
 
-    return False
+                new_map[
+                    requested
+                ] = native_symbol
+
+                print(
+                    f"✅ Market available: "
+                    f"{requested} -> "
+                    f"{native_symbol}"
+                )
+
+            else:
+
+                print(
+                    f"⚠️ Market unavailable: "
+                    f"{requested}"
+                )
+
+        SYMBOLS = available
+
+        BYBIT_SYMBOL_MAP = new_map
+
+        if not SYMBOLS:
+
+            raise RuntimeError(
+                "None of REQUESTED_SYMBOLS "
+                "are available on Bybit Spot."
+            )
+
+        bybit_status = "OK"
+
+        last_bybit_check = time.time()
+
+        market_load_error = None
+
+        print(
+            "=========================================="
+        )
+
+        print(
+            "✅ BYBIT PUBLIC MARKETS LOADED"
+        )
+
+        print(
+            f"Requested: "
+            f"{len(REQUESTED_SYMBOLS)}"
+        )
+
+        print(
+            f"Available: "
+            f"{len(SYMBOLS)}"
+        )
+
+        print(
+            f"Symbols: "
+            f"{', '.join(SYMBOLS)}"
+        )
+
+        print(
+            "=========================================="
+        )
+
+        return True
+
+    except Exception as e:
+
+        bybit_status = "ERROR"
+
+        market_load_error = (
+            f"{type(e).__name__}: {e}"
+        )
+
+        log_exception(
+            "BYBIT PUBLIC MARKET LOAD FAILED",
+            e
+        )
+
+        return False
 
 
 # ============================================================
@@ -602,13 +1071,53 @@ def check_bybit_connection():
 
     global bybit_status
     global last_bybit_check
+    global market_load_error
 
     try:
 
-        exchange.fetch_time()
+        data = bybit_get(
+            "/v5/market/tickers",
+            params={
+                "category":
+                    BYBIT_CATEGORY,
+                "symbol":
+                    "BTCUSDT"
+            },
+            retries=3
+        )
+
+        ticker_list = (
+            data
+            .get("result", {})
+            .get("list", [])
+        )
+
+        if not ticker_list:
+
+            raise RuntimeError(
+                "BTCUSDT ticker response empty."
+            )
+
+        last_price = ticker_list[0].get(
+            "lastPrice"
+        )
+
+        if not last_price:
+
+            raise RuntimeError(
+                "BTCUSDT lastPrice missing."
+            )
 
         bybit_status = "OK"
+
         last_bybit_check = time.time()
+
+        market_load_error = None
+
+        print(
+            "✅ Bybit public API health OK | "
+            f"BTCUSDT={last_price}"
+        )
 
         return True
 
@@ -616,12 +1125,61 @@ def check_bybit_connection():
 
         bybit_status = "ERROR"
 
-        print(
-            "❌ Bybit health check failed:",
+        market_load_error = (
+            f"{type(e).__name__}: {e}"
+        )
+
+        log_exception(
+            "BYBIT HEALTH CHECK FAILED",
             e
         )
 
         return False
+
+
+# ============================================================
+# BYBIT SYMBOL CONVERSION
+# ============================================================
+
+def native_symbol(symbol):
+
+    native = BYBIT_SYMBOL_MAP.get(
+        symbol
+    )
+
+    if native:
+
+        return native
+
+    return (
+        symbol
+        .replace("/", "")
+        .upper()
+    )
+
+
+# ============================================================
+# TIMEFRAME CONVERSION
+# ============================================================
+
+BYBIT_INTERVALS = {
+
+    "1m": "1",
+    "3m": "3",
+    "5m": "5",
+    "15m": "15",
+    "30m": "30",
+
+    "1h": "60",
+    "2h": "120",
+    "4h": "240",
+    "6h": "360",
+    "12h": "720",
+
+    "1d": "D",
+    "1w": "W",
+    "1M": "M"
+}
 
 
 # ============================================================
@@ -634,26 +1192,87 @@ def fetch_candles(
     limit=CANDLE_LIMIT
 ):
 
-    try:
+    native = native_symbol(
+        symbol
+    )
 
-        candles = exchange.fetch_ohlcv(
-            symbol,
-            timeframe=timeframe,
-            limit=limit
+    interval = BYBIT_INTERVALS.get(
+        timeframe
+    )
+
+    if interval is None:
+
+        print(
+            f"❌ Unsupported timeframe: "
+            f"{timeframe}"
         )
 
-        if not candles:
+        return []
+
+    try:
+
+        data = bybit_get(
+            "/v5/market/kline",
+            params={
+                "category":
+                    BYBIT_CATEGORY,
+                "symbol":
+                    native,
+                "interval":
+                    interval,
+                "limit":
+                    min(
+                        int(limit),
+                        1000
+                    )
+            }
+        )
+
+        rows = (
+            data
+            .get("result", {})
+            .get("list", [])
+        )
+
+        if not rows:
+
+            print(
+                f"⚠️ Empty candles | "
+                f"{symbol} | "
+                f"{timeframe}"
+            )
 
             return []
+
+        candles = []
+
+        for row in rows:
+
+            if len(row) < 6:
+                continue
+
+            candles.append([
+                int(row[0]),
+                float(row[1]),
+                float(row[2]),
+                float(row[3]),
+                float(row[4]),
+                float(row[5])
+            ])
+
+        # Bybit returns newest first.
+        # Strategy expects oldest -> newest.
+        candles.reverse()
 
         return candles
 
     except Exception as e:
 
         print(
-            f"Candle error | "
+            f"❌ Candle error | "
             f"{symbol} | "
-            f"{timeframe} | {e}"
+            f"{timeframe} | "
+            f"{type(e).__name__}: {e}"
         )
 
         return []
@@ -661,15 +1280,39 @@ def fetch_candles(
 
 def fetch_price(symbol):
 
+    native = native_symbol(
+        symbol
+    )
+
     try:
 
-        ticker = exchange.fetch_ticker(
-            symbol
+        data = bybit_get(
+            "/v5/market/tickers",
+            params={
+                "category":
+                    BYBIT_CATEGORY,
+                "symbol":
+                    native
+            },
+            retries=3
         )
 
-        last = ticker.get("last")
+        rows = (
+            data
+            .get("result", {})
+            .get("list", [])
+        )
+
+        if not rows:
+
+            return None
+
+        last = rows[0].get(
+            "lastPrice"
+        )
 
         if last is None:
+
             return None
 
         return float(last)
@@ -677,8 +1320,9 @@ def fetch_price(symbol):
     except Exception as e:
 
         print(
-            f"Price error | "
-            f"{symbol}: {e}"
+            f"❌ Price error | "
+            f"{symbol} | "
+            f"{type(e).__name__}: {e}"
         )
 
         return None
@@ -759,6 +1403,7 @@ def find_swing_highs(
     highs = []
 
     if len(candles) < left + right + 1:
+
         return highs
 
     for i in range(
@@ -766,10 +1411,14 @@ def find_swing_highs(
         len(candles) - right
     ):
 
-        h = candle_high(candles[i])
+        h = candle_high(
+            candles[i]
+        )
 
         left_highs = [
-            candle_high(candles[j])
+            candle_high(
+                candles[j]
+            )
             for j in range(
                 i - left,
                 i
@@ -777,7 +1426,9 @@ def find_swing_highs(
         ]
 
         right_highs = [
-            candle_high(candles[j])
+            candle_high(
+                candles[j]
+            )
             for j in range(
                 i + 1,
                 i + right + 1
@@ -805,6 +1456,7 @@ def find_swing_lows(
     lows = []
 
     if len(candles) < left + right + 1:
+
         return lows
 
     for i in range(
@@ -812,10 +1464,14 @@ def find_swing_lows(
         len(candles) - right
     ):
 
-        l = candle_low(candles[i])
+        l = candle_low(
+            candles[i]
+        )
 
         left_lows = [
-            candle_low(candles[j])
+            candle_low(
+                candles[j]
+            )
             for j in range(
                 i - left,
                 i
@@ -823,7 +1479,9 @@ def find_swing_lows(
         ]
 
         right_lows = [
-            candle_low(candles[j])
+            candle_low(
+                candles[j]
+            )
             for j in range(
                 i + 1,
                 i + right + 1
@@ -860,8 +1518,13 @@ def detect_structure(candles):
 
     closed = candles[:-1]
 
-    highs = find_swing_highs(closed)
-    lows = find_swing_lows(closed)
+    highs = find_swing_highs(
+        closed
+    )
+
+    lows = find_swing_lows(
+        closed
+    )
 
     if len(highs) < 2 or len(lows) < 2:
 
@@ -917,6 +1580,7 @@ def get_structure(
     )
 
     if not candles:
+
         return None, []
 
     return (
@@ -967,14 +1631,25 @@ def get_mtf_bias(symbol):
         h1["trend"]
     ]
 
-    bullish = trends.count("BULLISH")
-    bearish = trends.count("BEARISH")
+    bullish = trends.count(
+        "BULLISH"
+    )
 
-    if bullish >= 2 and bullish > bearish:
+    bearish = trends.count(
+        "BEARISH"
+    )
+
+    if (
+        bullish >= 2
+        and bullish > bearish
+    ):
 
         direction = "BULLISH"
 
-    elif bearish >= 2 and bearish > bullish:
+    elif (
+        bearish >= 2
+        and bearish > bullish
+    ):
 
         direction = "BEARISH"
 
@@ -1009,8 +1684,13 @@ def detect_choch(
 
     closed = candles[:-1]
 
-    highs = find_swing_highs(closed)
-    lows = find_swing_lows(closed)
+    highs = find_swing_highs(
+        closed
+    )
+
+    lows = find_swing_lows(
+        closed
+    )
 
     if direction == "BUY":
 
@@ -1020,7 +1700,9 @@ def detect_choch(
         previous_high = highs[-1][1]
 
         return (
-            candle_close(closed[-1])
+            candle_close(
+                closed[-1]
+            )
             > previous_high
         )
 
@@ -1032,7 +1714,9 @@ def detect_choch(
         previous_low = lows[-1][1]
 
         return (
-            candle_close(closed[-1])
+            candle_close(
+                closed[-1]
+            )
             < previous_low
         )
 
@@ -1187,7 +1871,9 @@ def detect_fvg(
 
 def detect_double_bottom(candles):
 
-    lows = find_swing_lows(candles)
+    lows = find_swing_lows(
+        candles
+    )
 
     if len(lows) < 2:
         return False
@@ -1197,12 +1883,16 @@ def detect_double_bottom(candles):
 
     tolerance = abs(l1) * 0.002
 
-    return abs(l1 - l2) <= tolerance
+    return abs(
+        l1 - l2
+    ) <= tolerance
 
 
 def detect_double_top(candles):
 
-    highs = find_swing_highs(candles)
+    highs = find_swing_highs(
+        candles
+    )
 
     if len(highs) < 2:
         return False
@@ -1212,7 +1902,9 @@ def detect_double_top(candles):
 
     tolerance = abs(h1) * 0.002
 
-    return abs(h1 - h2) <= tolerance
+    return abs(
+        h1 - h2
+    ) <= tolerance
 
 
 # ============================================================
@@ -1248,9 +1940,14 @@ def detect_demand_zone(candles):
         ):
 
             return {
-                "low": candle_low(base),
-                "high": candle_high(base),
-                "index": i
+                "low":
+                    candle_low(base),
+
+                "high":
+                    candle_high(base),
+
+                "index":
+                    i
             }
 
     return None
@@ -1285,9 +1982,14 @@ def detect_supply_zone(candles):
         ):
 
             return {
-                "low": candle_low(base),
-                "high": candle_high(base),
-                "index": i
+                "low":
+                    candle_low(base),
+
+                "high":
+                    candle_high(base),
+
+                "index":
+                    i
             }
 
     return None
@@ -1326,13 +2028,19 @@ def detect_tgl(
             if (
                 is_bearish(current)
                 and is_bullish(following)
-                and body_ratio(following) >= 0.55
+                and body_ratio(following)
+                >= 0.55
             ):
 
                 return {
-                    "low": candle_low(current),
-                    "high": candle_high(current),
-                    "index": i
+                    "low":
+                        candle_low(current),
+
+                    "high":
+                        candle_high(current),
+
+                    "index":
+                        i
                 }
 
         elif direction == "SELL":
@@ -1340,13 +2048,19 @@ def detect_tgl(
             if (
                 is_bullish(current)
                 and is_bearish(following)
-                and body_ratio(following) >= 0.55
+                and body_ratio(following)
+                >= 0.55
             ):
 
                 return {
-                    "low": candle_low(current),
-                    "high": candle_high(current),
-                    "index": i
+                    "low":
+                        candle_low(current),
+
+                    "high":
+                        candle_high(current),
+
+                    "index":
+                        i
                 }
 
     return None
@@ -1373,15 +2087,19 @@ def level_invalidated(
     if direction == "BUY":
 
         return (
-            candle_close(c1) < zone["low"]
-            and candle_close(c2) < zone["low"]
+            candle_close(c1)
+            < zone["low"]
+            and candle_close(c2)
+            < zone["low"]
         )
 
     if direction == "SELL":
 
         return (
-            candle_close(c1) > zone["high"]
-            and candle_close(c2) > zone["high"]
+            candle_close(c1)
+            > zone["high"]
+            and candle_close(c2)
+            > zone["high"]
         )
 
     return False
@@ -1398,6 +2116,7 @@ def session_filter():
     ).hour
 
     if 0 <= hour < 4:
+
         return False
 
     return True
@@ -1416,18 +2135,22 @@ def calculate_setup(
     if not session_filter():
         return None
 
-    bias = get_mtf_bias(symbol)
+    bias = get_mtf_bias(
+        symbol
+    )
 
     if (
         direction == "BUY"
         and bias["direction"] != "BULLISH"
     ):
+
         return None
 
     if (
         direction == "SELL"
         and bias["direction"] != "BEARISH"
     ):
+
         return None
 
     h1 = fetch_candles(
@@ -1456,21 +2179,40 @@ def calculate_setup(
         or not m5
         or not m1
     ):
+
         return None
 
     if direction == "BUY":
 
-        demand = detect_demand_zone(h1)
-        tgl = detect_tgl(h1, "BUY")
+        demand = detect_demand_zone(
+            h1
+        )
 
-        level = demand or tgl
+        tgl = detect_tgl(
+            h1,
+            "BUY"
+        )
+
+        level = (
+            demand
+            or tgl
+        )
 
     else:
 
-        supply = detect_supply_zone(h1)
-        tgl = detect_tgl(h1, "SELL")
+        supply = detect_supply_zone(
+            h1
+        )
 
-        level = supply or tgl
+        tgl = detect_tgl(
+            h1,
+            "SELL"
+        )
+
+        level = (
+            supply
+            or tgl
+        )
 
     if not level:
         return None
@@ -1480,6 +2222,7 @@ def calculate_setup(
         level,
         direction
     ):
+
         return None
 
     zone_size = (
@@ -1497,12 +2240,14 @@ def calculate_setup(
         <= price
         <= level["high"] + tolerance
     ):
+
         return None
 
     if not detect_choch(
         m1,
         direction
     ):
+
         return None
 
     last_closed = m1[-2]
@@ -1533,6 +2278,7 @@ def calculate_setup(
             )
 
     if not confirmed and not engulfing:
+
         return None
 
     # ========================================================
@@ -1543,16 +2289,24 @@ def calculate_setup(
     reasons = []
 
     score += 30
-    reasons.append("MTF_STRUCTURE")
+    reasons.append(
+        "MTF_STRUCTURE"
+    )
 
     score += 25
-    reasons.append("VALID_LEVEL")
+    reasons.append(
+        "VALID_LEVEL"
+    )
 
     score += 25
-    reasons.append("1M_CHOCH")
+    reasons.append(
+        "1M_CHOCH"
+    )
 
     score += 10
-    reasons.append("CANDLE_CONFIRMATION")
+    reasons.append(
+        "CANDLE_CONFIRMATION"
+    )
 
     if detect_fvg(
         m15,
@@ -1560,7 +2314,10 @@ def calculate_setup(
     ):
 
         score += 5
-        reasons.append("FVG")
+
+        reasons.append(
+            "FVG"
+        )
 
     if detect_liquidity_sweep(
         m15,
@@ -1568,23 +2325,37 @@ def calculate_setup(
     ):
 
         score += 10
-        reasons.append("LIQUIDITY_SWEEP")
+
+        reasons.append(
+            "LIQUIDITY_SWEEP"
+        )
 
     if direction == "BUY":
 
-        if detect_double_bottom(m15):
+        if detect_double_bottom(
+            m15
+        ):
 
             score += 5
-            reasons.append("DOUBLE_BOTTOM")
+
+            reasons.append(
+                "DOUBLE_BOTTOM"
+            )
 
     else:
 
-        if detect_double_top(m15):
+        if detect_double_top(
+            m15
+        ):
 
             score += 5
-            reasons.append("DOUBLE_TOP")
+
+            reasons.append(
+                "DOUBLE_TOP"
+            )
 
     if score < MIN_SETUP_SCORE:
+
         return None
 
     # ========================================================
@@ -1593,11 +2364,15 @@ def calculate_setup(
 
     if direction == "BUY":
 
-        swing_lows = find_swing_lows(m1)
+        swing_lows = find_swing_lows(
+            m1
+        )
 
         if swing_lows:
 
-            swing_low = swing_lows[-1][1]
+            swing_low = (
+                swing_lows[-1][1]
+            )
 
         else:
 
@@ -1606,20 +2381,30 @@ def calculate_setup(
                 for c in m1[-10:-1]
             )
 
-        sl = swing_low * 0.999
+        sl = (
+            swing_low
+            * 0.999
+        )
 
         if sl >= price:
+
             return None
 
-        risk = price - sl
+        risk = (
+            price - sl
+        )
 
     else:
 
-        swing_highs = find_swing_highs(m1)
+        swing_highs = find_swing_highs(
+            m1
+        )
 
         if swing_highs:
 
-            swing_high = swing_highs[-1][1]
+            swing_high = (
+                swing_highs[-1][1]
+            )
 
         else:
 
@@ -1628,14 +2413,21 @@ def calculate_setup(
                 for c in m1[-10:-1]
             )
 
-        sl = swing_high * 1.001
+        sl = (
+            swing_high
+            * 1.001
+        )
 
         if sl <= price:
+
             return None
 
-        risk = sl - price
+        risk = (
+            sl - price
+        )
 
     if risk <= 0:
+
         return None
 
     sl_percent = (
@@ -1643,6 +2435,7 @@ def calculate_setup(
     ) * 100
 
     if sl_percent > MAX_SL_PERCENT:
+
         return None
 
     # ========================================================
@@ -1651,7 +2444,9 @@ def calculate_setup(
 
     if direction == "BUY":
 
-        m15_highs = find_swing_highs(m15)
+        m15_highs = find_swing_highs(
+            m15
+        )
 
         resistance = [
             h[1]
@@ -1659,26 +2454,40 @@ def calculate_setup(
             if h[1] > price
         ]
 
-        tp1 = price + risk * 1.0
+        tp1 = (
+            price
+            + risk * 1.0
+        )
 
         if resistance:
 
-            tp2 = min(resistance)
+            tp2 = min(
+                resistance
+            )
 
             if (
-                (tp2 - price) / risk
+                (tp2 - price)
+                / risk
                 < MIN_RR
             ):
 
-                tp2 = price + risk * MIN_RR
+                tp2 = (
+                    price
+                    + risk * MIN_RR
+                )
 
         else:
 
-            tp2 = price + risk * 2.0
+            tp2 = (
+                price
+                + risk * 2.0
+            )
 
     else:
 
-        m15_lows = find_swing_lows(m15)
+        m15_lows = find_swing_lows(
+            m15
+        )
 
         support = [
             l[1]
@@ -1686,22 +2495,34 @@ def calculate_setup(
             if l[1] < price
         ]
 
-        tp1 = price - risk * 1.0
+        tp1 = (
+            price
+            - risk * 1.0
+        )
 
         if support:
 
-            tp2 = max(support)
+            tp2 = max(
+                support
+            )
 
             if (
-                (price - tp2) / risk
+                (price - tp2)
+                / risk
                 < MIN_RR
             ):
 
-                tp2 = price - risk * MIN_RR
+                tp2 = (
+                    price
+                    - risk * MIN_RR
+                )
 
         else:
 
-            tp2 = price - risk * 2.0
+            tp2 = (
+                price
+                - risk * 2.0
+            )
 
     if direction == "BUY":
 
@@ -1716,19 +2537,39 @@ def calculate_setup(
         ) / risk
 
     if rr < MIN_RR:
+
         return None
 
     return {
-        "direction": direction,
-        "entry": price,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "rr": rr,
-        "score": score,
-        "reason": ", ".join(reasons),
-        "bias": bias,
-        "level": level
+        "direction":
+            direction,
+
+        "entry":
+            price,
+
+        "sl":
+            sl,
+
+        "tp1":
+            tp1,
+
+        "tp2":
+            tp2,
+
+        "rr":
+            rr,
+
+        "score":
+            score,
+
+        "reason":
+            ", ".join(reasons),
+
+        "bias":
+            bias,
+
+        "level":
+            level
     }
 
 
@@ -1756,7 +2597,9 @@ def signal_allowed(
 
     now = time.time()
 
-    previous = last_signal_key.get(key)
+    previous = last_signal_key.get(
+        key
+    )
 
     if previous:
 
@@ -1776,7 +2619,9 @@ def signal_allowed(
 # ACTIVE TRADE
 # ============================================================
 
-def has_active_trade(symbol):
+def has_active_trade(
+    symbol
+):
 
     with state_lock:
 
@@ -1795,18 +2640,26 @@ def create_trade(
     setup
 ):
 
-    if has_active_trade(symbol):
+    if has_active_trade(
+        symbol
+    ):
+
         return
 
     with state_lock:
 
-        if len(active_trades) >= MAX_ACTIVE_TRADES:
+        if (
+            len(active_trades)
+            >= MAX_ACTIVE_TRADES
+        ):
+
             return
 
     if not signal_allowed(
         symbol,
         setup
     ):
+
         return
 
     trade = {
@@ -1855,7 +2708,9 @@ def create_trade(
 
     with state_lock:
 
-        active_trades.append(trade)
+        active_trades.append(
+            trade
+        )
 
     icon = (
         "🟢"
@@ -1868,20 +2723,30 @@ def create_trade(
         f"<b>⚡ RULEBOOK SIGNAL {icon}</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"📍 <b>Asset:</b> {symbol}\n"
-        f"📈 <b>Direction:</b> {trade['type']}\n"
-        f"💰 <b>Entry:</b> {trade['entry']:.6f}\n"
-        f"🛑 <b>SL:</b> {trade['sl']:.6f}\n"
-        f"🎯 <b>TP1:</b> {trade['tp1']:.6f}\n"
-        f"🎯 <b>TP2:</b> {trade['tp2']:.6f}\n"
-        f"📊 <b>RR:</b> {trade['rr']:.2f}\n"
-        f"⭐ <b>Score:</b> {trade['score']}\n"
-        f"🧠 <b>Reason:</b> {trade['reason']}\n"
+        f"📈 <b>Direction:</b> "
+        f"{trade['type']}\n"
+        f"💰 <b>Entry:</b> "
+        f"{trade['entry']:.6f}\n"
+        f"🛑 <b>SL:</b> "
+        f"{trade['sl']:.6f}\n"
+        f"🎯 <b>TP1:</b> "
+        f"{trade['tp1']:.6f}\n"
+        f"🎯 <b>TP2:</b> "
+        f"{trade['tp2']:.6f}\n"
+        f"📊 <b>RR:</b> "
+        f"{trade['rr']:.2f}\n"
+        f"⭐ <b>Score:</b> "
+        f"{trade['score']}\n"
+        f"🧠 <b>Reason:</b> "
+        f"{trade['reason']}\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "<b>🟡 PAPER TRADE ONLY</b>\n"
         "No real Bybit order was placed."
     )
 
-    telegram_sent = send_telegram(message)
+    telegram_sent = send_telegram(
+        message
+    )
 
     log_event(
         f"NEW {trade['type']} | "
@@ -1889,7 +2754,8 @@ def create_trade(
         f"Entry={trade['entry']:.6f} | "
         f"Score={trade['score']} | "
         f"RR={trade['rr']:.2f} | "
-        f"Telegram={'OK' if telegram_sent else 'FAILED'}"
+        f"Telegram="
+        f"{'OK' if telegram_sent else 'FAILED'}"
     )
 
 
@@ -1904,7 +2770,10 @@ def close_trade(
 ):
 
     entry = trade["entry"]
-    initial_sl = trade["initial_sl"]
+
+    initial_sl = trade[
+        "initial_sl"
+    ]
 
     risk = abs(
         entry - initial_sl
@@ -1949,17 +2818,25 @@ def close_trade(
 
         f"<b>TRADE RESULT {emoji}</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"📍 <b>Asset:</b> {trade['symbol']}\n"
-        f"📈 <b>Type:</b> {trade['type']}\n"
-        f"📌 <b>Result:</b> {result}\n"
-        f"💰 <b>Entry:</b> {entry:.6f}\n"
-        f"🚪 <b>Exit:</b> {exit_price:.6f}\n"
-        f"📊 <b>R:</b> {r_multiple:.2f}\n"
+        f"📍 <b>Asset:</b> "
+        f"{trade['symbol']}\n"
+        f"📈 <b>Type:</b> "
+        f"{trade['type']}\n"
+        f"📌 <b>Result:</b> "
+        f"{result}\n"
+        f"💰 <b>Entry:</b> "
+        f"{entry:.6f}\n"
+        f"🚪 <b>Exit:</b> "
+        f"{exit_price:.6f}\n"
+        f"📊 <b>R:</b> "
+        f"{r_multiple:.2f}\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "<b>🟡 PAPER TRADE</b>"
     )
 
-    send_telegram(message)
+    send_telegram(
+        message
+    )
 
     log_event(
         f"RESULT {result} | "
@@ -1971,7 +2848,9 @@ def close_trade(
 
         if trade in active_trades:
 
-            active_trades.remove(trade)
+            active_trades.remove(
+                trade
+            )
 
 
 # ============================================================
@@ -2003,7 +2882,10 @@ def manage_trade(
         ):
 
             trade["tp1_hit"] = True
-            trade["sl"] = trade["entry"]
+
+            trade["sl"] = (
+                trade["entry"]
+            )
 
             send_telegram(
                 "<b>🎯 TP1 HIT</b>\n"
@@ -2051,7 +2933,10 @@ def manage_trade(
         ):
 
             trade["tp1_hit"] = True
-            trade["sl"] = trade["entry"]
+
+            trade["sl"] = (
+                trade["entry"]
+            )
 
             send_telegram(
                 "<b>🎯 TP1 HIT</b>\n"
@@ -2086,11 +2971,16 @@ def manage_trade(
 # SCAN SYMBOL
 # ============================================================
 
-def scan_symbol(symbol):
+def scan_symbol(
+    symbol
+):
 
-    price = fetch_price(symbol)
+    price = fetch_price(
+        symbol
+    )
 
     if price is None:
+
         return
 
     with state_lock:
@@ -2108,7 +2998,10 @@ def scan_symbol(symbol):
             price
         )
 
-    if has_active_trade(symbol):
+    if has_active_trade(
+        symbol
+    ):
+
         return
 
     try:
@@ -2130,9 +3023,9 @@ def scan_symbol(symbol):
 
     except Exception as e:
 
-        print(
-            f"BUY setup error | "
-            f"{symbol}: {e}"
+        log_exception(
+            f"BUY setup error | {symbol}",
+            e
         )
 
     try:
@@ -2154,14 +3047,14 @@ def scan_symbol(symbol):
 
     except Exception as e:
 
-        print(
-            f"SELL setup error | "
-            f"{symbol}: {e}"
+        log_exception(
+            f"SELL setup error | {symbol}",
+            e
         )
 
 
 # ============================================================
-# 3-HOUR HEALTH MONITOR
+# HEALTH MONITOR
 # ============================================================
 
 def health_monitor():
@@ -2172,23 +3065,33 @@ def health_monitor():
 
         try:
 
-            telegram_ok = check_telegram_without_message()
+            telegram_ok = (
+                check_telegram_without_message()
+            )
 
-            bybit_ok = check_bybit_connection()
+            bybit_ok = (
+                check_bybit_connection()
+            )
 
             with state_lock:
-                active_count = len(active_trades)
+
+                active_count = len(
+                    active_trades
+                )
 
             uptime_seconds = (
-                time.time() - bot_started_at
+                time.time()
+                - bot_started_at
             )
 
             uptime_hours = (
-                uptime_seconds / 3600
+                uptime_seconds
+                / 3600
             )
 
             scanner_ok = (
-                scanner_status == "RUNNING"
+                scanner_status
+                == "RUNNING"
             )
 
             telegram_text = (
@@ -2215,43 +3118,138 @@ def health_monitor():
                 and scanner_ok
             ):
 
-                title = "🟢 BOT HEALTH CHECK"
-                final = "Backend is healthy. ✅"
+                title = (
+                    "🟢 BOT HEALTH CHECK"
+                )
+
+                final = (
+                    "Backend is healthy. ✅"
+                )
 
             else:
 
-                title = "🔴 BOT HEALTH ALERT"
+                title = (
+                    "🔴 BOT HEALTH ALERT"
+                )
+
                 final = (
-                    "⚠️ Please check Render logs."
+                    "⚠️ Check Render logs."
                 )
 
             message = (
 
                 f"<b>{title}</b>\n"
                 "━━━━━━━━━━━━━━━━━━\n"
-                f"Telegram: {telegram_text}\n"
-                f"Bybit API: {bybit_text}\n"
-                f"Scanner: {scanner_text}\n"
-                f"Mode: 🟡 {TRADING_MODE}\n"
-                f"Symbols: {len(SYMBOLS)}\n"
-                f"Active Trades: {active_count}\n"
-                f"Uptime: {uptime_hours:.1f} hours\n"
+                f"Telegram: "
+                f"{telegram_text}\n"
+                f"Bybit API: "
+                f"{bybit_text}\n"
+                f"Scanner: "
+                f"{scanner_text}\n"
+                f"Mode: 🟡 "
+                f"{TRADING_MODE}\n"
+                f"Symbols: "
+                f"{len(SYMBOLS)}\n"
+                f"Active Trades: "
+                f"{active_count}\n"
+                f"Uptime: "
+                f"{uptime_hours:.1f} hours\n"
                 "━━━━━━━━━━━━━━━━━━\n"
                 f"{final}"
             )
 
-            send_telegram(message)
+            send_telegram(
+                message
+            )
 
         except Exception as e:
 
-            print(
-                "Health monitor error:",
+            log_exception(
+                "Health monitor error",
                 e
             )
 
         time.sleep(
             HEALTH_CHECK_INTERVAL
         )
+
+
+# ============================================================
+# STARTUP DIAGNOSTICS
+# ============================================================
+
+def startup_diagnostics():
+
+    print(
+        "=========================================="
+    )
+
+    print(
+        "🔍 STARTUP DIAGNOSTICS"
+    )
+
+    print(
+        "=========================================="
+    )
+
+    print(
+        f"Bybit URL: "
+        f"{BYBIT_BASE_URL}"
+    )
+
+    print(
+        f"Bybit Category: "
+        f"{BYBIT_CATEGORY}"
+    )
+
+    print(
+        f"Telegram configured: "
+        f"{'YES' if telegram_configured() else 'NO'}"
+    )
+
+    # Never print actual token/chat ID.
+
+    if telegram_configured():
+
+        print(
+            "Telegram credentials: "
+            "PRESENT"
+        )
+
+    else:
+
+        print(
+            "⚠️ Telegram credentials "
+            "are incomplete."
+        )
+
+    print(
+        f"Requested symbols: "
+        f"{', '.join(REQUESTED_SYMBOLS)}"
+    )
+
+    print(
+        f"Scan interval: "
+        f"{SCAN_INTERVAL}s"
+    )
+
+    print(
+        f"API timeout: "
+        f"{API_TIMEOUT}s"
+    )
+
+    print(
+        f"Bybit max retries: "
+        f"{BYBIT_MAX_RETRIES}"
+    )
+
+    print(
+        "Real orders: DISABLED"
+    )
+
+    print(
+        "=========================================="
+    )
 
 
 # ============================================================
@@ -2287,6 +3285,8 @@ def background_trading_scanner():
         "=========================================="
     )
 
+    startup_diagnostics()
+
     # --------------------------------------------------------
     # Telegram
     # --------------------------------------------------------
@@ -2294,41 +3294,102 @@ def background_trading_scanner():
     telegram_connection_test()
 
     # --------------------------------------------------------
-    # Bybit
+    # Bybit PUBLIC market loading
     # --------------------------------------------------------
 
-    loaded = load_bybit_markets()
+    loaded = (
+        load_bybit_public_markets()
+    )
+
+    retry_round = 0
 
     while not loaded:
 
-        scanner_status = "BYBIT_ERROR"
+        retry_round += 1
+
+        scanner_status = (
+            "BYBIT_ERROR"
+        )
+
+        error_text = (
+            market_load_error
+            or "Unknown Bybit error"
+        )
+
+        print(
+            "=========================================="
+        )
+
+        print(
+            "🔴 BYBIT MARKET LOAD FAILED"
+        )
+
+        print(
+            f"Retry round: "
+            f"{retry_round}"
+        )
+
+        print(
+            f"Detailed error: "
+            f"{error_text}"
+        )
+
+        print(
+            "=========================================="
+        )
 
         send_telegram(
+
             "<b>🔴 BOT STARTUP ALERT</b>\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            "Telegram: Checked\n"
+            "Telegram: ✅ Checked\n"
             "Bybit: ❌ Market loading failed\n"
             "Scanner: ⚠️ Retrying\n"
+            f"Error: <code>{error_text[:500]}</code>\n"
             "Mode: 🟡 PAPER / SIGNAL ONLY"
         )
 
-        time.sleep(30)
+        time.sleep(
+            min(
+                60,
+                10 * retry_round
+            )
+        )
 
-        loaded = load_bybit_markets()
+        loaded = (
+            load_bybit_public_markets()
+        )
 
     if not SYMBOLS:
 
-        scanner_status = "WAITING_FOR_SYMBOLS"
+        scanner_status = (
+            "WAITING_FOR_SYMBOLS"
+        )
+
+        send_telegram(
+            "<b>🔴 NO BYBIT SYMBOLS</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "Public market API responded,\n"
+            "but requested symbols were not found.\n"
+            "Scanner stopped."
+        )
 
         return
+
+    # --------------------------------------------------------
+    # Initial health check
+    # --------------------------------------------------------
+
+    check_bybit_connection()
 
     scanner_status = "RUNNING"
 
     send_telegram(
+
         "<b>🟢 SCANNER READY</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "Telegram: ✅ Connected\n"
-        "Bybit API: ✅ Connected\n"
+        "Bybit Public API: ✅ Connected\n"
         f"Symbols: {len(SYMBOLS)}\n"
         f"{', '.join(SYMBOLS)}\n"
         "Scanner: ✅ Running\n"
@@ -2344,44 +3405,60 @@ def background_trading_scanner():
 
         try:
 
-            if bybit_status != "OK":
+            # Periodic public API health check.
+            if (
+                last_bybit_check is None
+                or
+                time.time()
+                - last_bybit_check
+                > 300
+            ):
 
-                print(
-                    "⚠️ Bybit status not OK. "
-                    "Reloading markets..."
-                )
+                if not check_bybit_connection():
 
-                if not load_bybit_markets():
+                    scanner_status = (
+                        "BYBIT_ERROR"
+                    )
 
-                    scanner_status = "BYBIT_ERROR"
-
-                    time.sleep(30)
+                    time.sleep(10)
 
                     continue
 
-                scanner_status = "RUNNING"
+                scanner_status = (
+                    "RUNNING"
+                )
 
-            for symbol in list(SYMBOLS):
+            for symbol in list(
+                SYMBOLS
+            ):
 
                 try:
 
-                    scan_symbol(symbol)
+                    scan_symbol(
+                        symbol
+                    )
 
                 except Exception as e:
 
-                    print(
+                    log_exception(
                         f"Scanner error | "
-                        f"{symbol}: {e}"
+                        f"{symbol}",
+                        e
                     )
 
                 time.sleep(1)
 
-            last_scanner_run = time.time()
+            last_scanner_run = (
+                time.time()
+            )
 
-            scanner_status = "RUNNING"
+            scanner_status = (
+                "RUNNING"
+            )
 
             elapsed = (
-                time.time() - started
+                time.time()
+                - started
             )
 
             print(
@@ -2394,19 +3471,21 @@ def background_trading_scanner():
 
             scanner_status = "ERROR"
 
-            print(
-                "Main scanner error:",
+            log_exception(
+                "Main scanner error",
                 e
             )
 
         elapsed = (
-            time.time() - started
+            time.time()
+            - started
         )
 
         time.sleep(
             max(
                 5,
-                SCAN_INTERVAL - elapsed
+                SCAN_INTERVAL
+                - elapsed
             )
         )
 
@@ -2476,42 +3555,50 @@ def get_statistics():
         )
 
         profit_factor = (
-            gross_profit / gross_loss
+            gross_profit
+            / gross_loss
             if gross_loss > 0
             else 0
         )
 
         return {
 
-            "total": total,
+            "total":
+                total,
 
-            "wins": wins,
+            "wins":
+                wins,
 
-            "losses": losses,
+            "losses":
+                losses,
 
-            "breakeven": breakeven,
+            "breakeven":
+                breakeven,
 
-            "win_rate": round(
-                win_rate,
-                2
-            ),
+            "win_rate":
+                round(
+                    win_rate,
+                    2
+                ),
 
-            "total_r": round(
-                total_r,
-                2
-            ),
+            "total_r":
+                round(
+                    total_r,
+                    2
+                ),
 
-            "profit_factor": round(
-                profit_factor,
-                2
-            )
+            "profit_factor":
+                round(
+                    profit_factor,
+                    2
+                )
         }
 
     except Exception as e:
 
         print(
             "Statistics error:",
-            e
+            repr(e)
         )
 
         return {
@@ -2536,28 +3623,52 @@ def api_status():
 
     with state_lock:
 
-        trades = list(active_trades)
+        trades = list(
+            active_trades
+        )
 
     uptime = (
-        time.time() - bot_started_at
+        time.time()
+        - bot_started_at
     )
 
     return jsonify({
 
-        "status": scanner_status,
+        "status":
+            scanner_status,
 
-        "mode": "PAPER",
+        "mode":
+            "PAPER",
 
         "real_orders_enabled":
             REAL_ORDERS_ENABLED,
 
-        "exchange": "BYBIT",
+        "exchange":
+            "BYBIT",
+
+        "bybit_base_url":
+            BYBIT_BASE_URL,
+
+        "bybit_category":
+            BYBIT_CATEGORY,
 
         "telegram":
             telegram_status,
 
+        "telegram_configured":
+            telegram_configured(),
+
+        "telegram_last_error":
+            last_telegram_error,
+
         "bybit":
             bybit_status,
+
+        "bybit_last_error":
+            last_bybit_error,
+
+        "bybit_request_count":
+            bybit_request_count,
 
         "symbols":
             SYMBOLS,
@@ -2604,7 +3715,10 @@ HTML_TEMPLATE = """
 
 <title>Rulebook SMC Trading Bot</title>
 
-<meta http-equiv="refresh" content="15">
+<meta
+    http-equiv="refresh"
+    content="15"
+>
 
 <style>
 
@@ -2665,6 +3779,10 @@ body {
     color:#facc15;
 }
 
+.info {
+    color:#60a5fa;
+}
+
 table {
     width:100%;
     border-collapse:collapse;
@@ -2692,6 +3810,16 @@ th {
     font-family:monospace;
 }
 
+.error-box {
+    background:#450a0a;
+    border:1px solid #991b1b;
+    color:#fecaca;
+    padding:15px;
+    border-radius:10px;
+    margin:20px 0;
+    word-break:break-word;
+}
+
 </style>
 
 </head>
@@ -2711,9 +3839,9 @@ CHOCH → Confirmation → Risk
 
 <p>
 Status:
-<span class="online">
+<b class="online">
 {{ scanner_status }}
-</span>
+</b>
 </p>
 
 <p class="warning">
@@ -2731,7 +3859,9 @@ Real Bybit Orders:
 <div class="cards">
 
 <div class="card">
+
 <h3>Telegram</h3>
+
 <p class="
 {% if telegram_status == 'OK' %}
 online
@@ -2739,13 +3869,18 @@ online
 error
 {% endif %}
 ">
+
 {{ telegram_status }}
+
 </p>
+
 </div>
 
 
 <div class="card">
+
 <h3>Bybit API</h3>
+
 <p class="
 {% if bybit_status == 'OK' %}
 online
@@ -2753,47 +3888,106 @@ online
 error
 {% endif %}
 ">
+
 {{ bybit_status }}
+
 </p>
+
 </div>
 
 
 <div class="card">
+
+<h3>Symbols</h3>
+
+<p>
+{{ symbols|length }}
+</p>
+
+</div>
+
+
+<div class="card">
+
 <h3>Active Trades</h3>
-<p>{{ active_trades|length }}</p>
+
+<p>
+{{ active_trades|length }}
+</p>
+
 </div>
 
 
 <div class="card">
+
 <h3>Total Trades</h3>
-<p>{{ stats.total }}</p>
+
+<p>
+{{ stats.total }}
+</p>
+
 </div>
 
 
 <div class="card">
+
 <h3>Wins</h3>
-<p class="online">{{ stats.wins }}</p>
+
+<p class="online">
+{{ stats.wins }}
+</p>
+
 </div>
 
 
 <div class="card">
+
 <h3>Losses</h3>
-<p class="error">{{ stats.losses }}</p>
+
+<p class="error">
+{{ stats.losses }}
+</p>
+
 </div>
 
 
 <div class="card">
+
 <h3>Win Rate</h3>
-<p>{{ stats.win_rate }}%</p>
+
+<p>
+{{ stats.win_rate }}%
+</p>
+
 </div>
 
 
 <div class="card">
+
 <h3>Profit Factor</h3>
-<p>{{ stats.profit_factor }}</p>
+
+<p>
+{{ stats.profit_factor }}
+</p>
+
 </div>
 
 </div>
+
+
+{% if market_load_error %}
+
+<div class="error-box">
+
+<b>⚠️ Last Bybit Error:</b>
+
+<br><br>
+
+{{ market_load_error }}
+
+</div>
+
+{% endif %}
 
 
 <h2>📊 Active Positions</h2>
@@ -2801,6 +3995,7 @@ error
 <table>
 
 <tr>
+
 <th>Symbol</th>
 <th>Direction</th>
 <th>Entry</th>
@@ -2809,27 +4004,44 @@ error
 <th>TP2</th>
 <th>RR</th>
 <th>Score</th>
+
 </tr>
 
 {% for trade in active_trades %}
 
 <tr>
 
-<td><b>{{ trade.symbol }}</b></td>
+<td>
+<b>{{ trade.symbol }}</b>
+</td>
 
-<td>{{ trade.type }}</td>
+<td>
+{{ trade.type }}
+</td>
 
-<td>{{ "%.6f"|format(trade.entry) }}</td>
+<td>
+{{ "%.6f"|format(trade.entry) }}
+</td>
 
-<td>{{ "%.6f"|format(trade.sl) }}</td>
+<td>
+{{ "%.6f"|format(trade.sl) }}
+</td>
 
-<td>{{ "%.6f"|format(trade.tp1) }}</td>
+<td>
+{{ "%.6f"|format(trade.tp1) }}
+</td>
 
-<td>{{ "%.6f"|format(trade.tp2) }}</td>
+<td>
+{{ "%.6f"|format(trade.tp2) }}
+</td>
 
-<td>{{ "%.2f"|format(trade.rr) }}</td>
+<td>
+{{ "%.2f"|format(trade.rr) }}
+</td>
 
-<td>{{ trade.score }}</td>
+<td>
+{{ trade.score }}
+</td>
 
 </tr>
 
@@ -2837,8 +4049,13 @@ error
 
 <tr>
 
-<td colspan="8" style="text-align:center;">
+<td
+    colspan="8"
+    style="text-align:center;"
+>
+
 No active Rulebook setup.
+
 </td>
 
 </tr>
@@ -2887,8 +4104,13 @@ def home():
 
     with state_lock:
 
-        trades = list(active_trades)
-        logs = list(trade_logs)
+        trades = list(
+            active_trades
+        )
+
+        logs = list(
+            trade_logs
+        )
 
     return render_template_string(
         HTML_TEMPLATE,
@@ -2897,7 +4119,9 @@ def home():
         stats=stats,
         scanner_status=scanner_status,
         telegram_status=telegram_status,
-        bybit_status=bybit_status
+        bybit_status=bybit_status,
+        symbols=SYMBOLS,
+        market_load_error=market_load_error
     )
 
 
@@ -2910,7 +4134,8 @@ def health():
 
     return jsonify({
 
-        "status": "ok",
+        "status":
+            "ok",
 
         "scanner":
             scanner_status,
@@ -2962,12 +4187,12 @@ if __name__ == "__main__":
     )
 
     print(
-        "=========================================="
+        "Bybit: PUBLIC REST API"
     )
 
-    # --------------------------------------------------------
-    # Scanner
-    # --------------------------------------------------------
+    print(
+        "=========================================="
+    )
 
     scanner_thread = threading.Thread(
         target=background_trading_scanner,
@@ -2977,10 +4202,6 @@ if __name__ == "__main__":
 
     scanner_thread.start()
 
-    # --------------------------------------------------------
-    # Health monitor
-    # --------------------------------------------------------
-
     health_thread = threading.Thread(
         target=health_monitor,
         daemon=True,
@@ -2988,10 +4209,6 @@ if __name__ == "__main__":
     )
 
     health_thread.start()
-
-    # --------------------------------------------------------
-    # Render PORT
-    # --------------------------------------------------------
 
     port = int(
         os.getenv(
