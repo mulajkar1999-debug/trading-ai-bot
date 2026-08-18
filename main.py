@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -10,10 +11,10 @@ import numpy as np
 
 # ============================================================
 # TRADEBRAIN AI
-# RULEBOOK-BASED PAPER TRADING ENGINE
+# BTCUSDT RULEBOOK-BASED PAPER TRADING ENGINE
 # ============================================================
 
-SYMBOL = os.getenv("SYMBOL", "BTCUSDT").upper()
+SYMBOL = "BTCUSDT"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
 
@@ -30,14 +31,18 @@ RISK_PERCENT = float(
 )
 
 TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN", ""
+    "TELEGRAM_BOT_TOKEN",
+    ""
 )
 
 TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID", ""
+    "TELEGRAM_CHAT_ID",
+    ""
 )
 
 BINANCE_URL = "https://api.binance.com"
+
+STATE_FILE = "tradebrain_btcusdt_state.json"
 
 # Rulebook timeframes
 DAILY = "1d"
@@ -67,11 +72,9 @@ logger = logging.getLogger("TradeBrain")
 def send_telegram(message):
 
     if not TELEGRAM_BOT_TOKEN:
-        logger.warning("Telegram token missing")
         return
 
     if not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram chat ID missing")
         return
 
     url = (
@@ -86,19 +89,22 @@ def send_telegram(message):
     }
 
     try:
-        r = requests.post(
+
+        response = requests.post(
             url,
             json=payload,
             timeout=15
         )
 
-        if r.status_code != 200:
+        if response.status_code != 200:
+
             logger.error(
                 "Telegram error: %s",
-                r.text[:500]
+                response.text[:300]
             )
 
     except Exception as e:
+
         logger.error(
             "Telegram exception: %s",
             e
@@ -106,94 +112,129 @@ def send_telegram(message):
 
 
 # ============================================================
-# BINANCE PUBLIC DATA
-# API KEY NOT REQUIRED
+# BINANCE DATA
 # ============================================================
 
 def get_klines(
     symbol,
     interval,
-    limit=300
+    limit=300,
+    retries=3
 ):
 
-    try:
+    for attempt in range(retries):
 
-        response = requests.get(
-            f"{BINANCE_URL}/api/v3/klines",
-            params={
-                "symbol": symbol,
-                "interval": interval,
-                "limit": limit
-            },
-            timeout=15
-        )
+        try:
 
-        response.raise_for_status()
-
-        raw = response.json()
-
-        columns = [
-            "open_time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "close_time",
-            "quote_volume",
-            "trades",
-            "taker_base",
-            "taker_quote",
-            "ignore"
-        ]
-
-        df = pd.DataFrame(
-            raw,
-            columns=columns
-        )
-
-        numeric_columns = [
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume"
-        ]
-
-        for col in numeric_columns:
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce"
+            response = requests.get(
+                f"{BINANCE_URL}/api/v3/klines",
+                params={
+                    "symbol": symbol,
+                    "interval": interval,
+                    "limit": limit
+                },
+                timeout=15
             )
 
-        df["open_time"] = pd.to_datetime(
-            df["open_time"],
-            unit="ms",
-            utc=True
-        )
+            response.raise_for_status()
 
-        df["close_time"] = pd.to_datetime(
-            df["close_time"],
-            unit="ms",
-            utc=True
-        )
+            raw = response.json()
 
-        return df
+            if not isinstance(raw, list) or len(raw) < 20:
+                raise ValueError("Invalid Binance response")
 
-    except Exception as e:
+            columns = [
+                "open_time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "close_time",
+                "quote_volume",
+                "trades",
+                "taker_base",
+                "taker_quote",
+                "ignore"
+            ]
 
-        logger.error(
-            "Binance data error %s %s: %s",
-            symbol,
-            interval,
-            e
-        )
+            df = pd.DataFrame(
+                raw,
+                columns=columns
+            )
 
-        return pd.DataFrame()
+            numeric_columns = [
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume"
+            ]
+
+            for col in numeric_columns:
+
+                df[col] = pd.to_numeric(
+                    df[col],
+                    errors="coerce"
+                )
+
+            df["open_time"] = pd.to_datetime(
+                df["open_time"],
+                unit="ms",
+                utc=True
+            )
+
+            df["close_time"] = pd.to_datetime(
+                df["close_time"],
+                unit="ms",
+                utc=True
+            )
+
+            df = df.dropna(
+                subset=[
+                    "open",
+                    "high",
+                    "low",
+                    "close"
+                ]
+            )
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            # Remove current unfinished candle.
+            # ------------------------------------------------
+
+            now = pd.Timestamp.now(
+                tz="UTC"
+            )
+
+            df = df[
+                df["close_time"] <= now
+            ].copy()
+
+            return df.reset_index(
+                drop=True
+            )
+
+        except Exception as e:
+
+            logger.warning(
+                "Binance %s %s attempt %d/%d: %s",
+                symbol,
+                interval,
+                attempt + 1,
+                retries,
+                e
+            )
+
+            if attempt < retries - 1:
+                time.sleep(2)
+
+    return pd.DataFrame()
 
 
 # ============================================================
-# INDICATORS
+# ATR
 # ============================================================
 
 def calculate_atr(
@@ -201,20 +242,38 @@ def calculate_atr(
     period=14
 ):
 
+    if len(df) < period + 2:
+        return pd.Series(
+            np.nan,
+            index=df.index
+        )
+
     prev_close = df["close"].shift(1)
 
-    tr1 = df["high"] - df["low"]
+    tr1 = (
+        df["high"]
+        -
+        df["low"]
+    )
 
     tr2 = (
-        df["high"] - prev_close
+        df["high"]
+        -
+        prev_close
     ).abs()
 
     tr3 = (
-        df["low"] - prev_close
+        df["low"]
+        -
+        prev_close
     ).abs()
 
     tr = pd.concat(
-        [tr1, tr2, tr3],
+        [
+            tr1,
+            tr2,
+            tr3
+        ],
         axis=1
     ).max(axis=1)
 
@@ -222,6 +281,10 @@ def calculate_atr(
         period
     ).mean()
 
+
+# ============================================================
+# EMA
+# ============================================================
 
 def calculate_ema(
     df,
@@ -247,7 +310,7 @@ def find_swings(
     swing_highs = []
     swing_lows = []
 
-    if len(df) < 20:
+    if len(df) < left + right + 5:
         return swing_highs, swing_lows
 
     for i in range(
@@ -255,59 +318,75 @@ def find_swings(
         len(df) - right
     ):
 
-        current_high = float(
+        high = float(
             df["high"].iloc[i]
         )
 
-        current_low = float(
+        low = float(
             df["low"].iloc[i]
         )
 
         left_high = float(
             df["high"]
-            .iloc[i-left:i]
+            .iloc[
+                i-left:i
+            ]
             .max()
         )
 
         right_high = float(
             df["high"]
-            .iloc[i+1:i+right+1]
+            .iloc[
+                i+1:i+right+1
+            ]
             .max()
         )
 
         left_low = float(
             df["low"]
-            .iloc[i-left:i]
+            .iloc[
+                i-left:i
+            ]
             .min()
         )
 
         right_low = float(
             df["low"]
-            .iloc[i+1:i+right+1]
+            .iloc[
+                i+1:i+right+1
+            ]
             .min()
         )
 
         if (
-            current_high > left_high
+            high > left_high
             and
-            current_high > right_high
+            high > right_high
         ):
+
             swing_highs.append(
                 {
                     "index": i,
-                    "price": current_high
+                    "price": high,
+                    "time": str(
+                        df["close_time"].iloc[i]
+                    )
                 }
             )
 
         if (
-            current_low < left_low
+            low < left_low
             and
-            current_low < right_low
+            low < right_low
         ):
+
             swing_lows.append(
                 {
                     "index": i,
-                    "price": current_low
+                    "price": low,
+                    "time": str(
+                        df["close_time"].iloc[i]
+                    )
                 }
             )
 
@@ -316,7 +395,6 @@ def find_swings(
 
 # ============================================================
 # MARKET STRUCTURE
-# HH / HL / LH / LL
 # ============================================================
 
 def get_structure(df):
@@ -324,62 +402,82 @@ def get_structure(df):
     highs, lows = find_swings(df)
 
     result = {
+
         "trend": "UNKNOWN",
+
         "last_high": None,
         "previous_high": None,
+
         "last_low": None,
         "previous_low": None,
+
+        "last_high_index": None,
+        "last_low_index": None,
+
         "labels": []
     }
 
     if len(highs) >= 2:
 
-        previous_high = highs[-2]["price"]
-        last_high = highs[-1]["price"]
+        previous = highs[-2]
+        last = highs[-1]
 
-        result["previous_high"] = previous_high
-        result["last_high"] = last_high
+        result["previous_high"] = previous["price"]
+        result["last_high"] = last["price"]
+        result["last_high_index"] = last["index"]
 
-        if last_high > previous_high:
+        if last["price"] > previous["price"]:
+
             result["labels"].append("HH")
+
         else:
+
             result["labels"].append("LH")
 
     if len(lows) >= 2:
 
-        previous_low = lows[-2]["price"]
-        last_low = lows[-1]["price"]
+        previous = lows[-2]
+        last = lows[-1]
 
-        result["previous_low"] = previous_low
-        result["last_low"] = last_low
+        result["previous_low"] = previous["price"]
+        result["last_low"] = last["price"]
+        result["last_low_index"] = last["index"]
 
-        if last_low > previous_low:
+        if last["price"] > previous["price"]:
+
             result["labels"].append("HL")
+
         else:
+
             result["labels"].append("LL")
 
     labels = result["labels"]
 
     if (
         "HH" in labels
-        and "HL" in labels
+        and
+        "HL" in labels
     ):
+
         result["trend"] = "BULLISH"
 
     elif (
         "LH" in labels
-        and "LL" in labels
+        and
+        "LL" in labels
     ):
+
         result["trend"] = "BEARISH"
 
     elif labels:
+
         result["trend"] = "RANGE"
 
     return result
 
 
 # ============================================================
-# TWO CONSECUTIVE CLOSES
+# TWO CLOSES
 # ============================================================
 
 def two_consecutive_closes(
@@ -394,28 +492,28 @@ def two_consecutive_closes(
     if len(df) < 3:
         return False
 
-    close_1 = float(
+    c1 = float(
         df["close"].iloc[-2]
     )
 
-    close_2 = float(
+    c2 = float(
         df["close"].iloc[-1]
     )
 
     if direction == "BULLISH":
 
         return (
-            close_1 > level
+            c1 > level
             and
-            close_2 > level
+            c2 > level
         )
 
     if direction == "BEARISH":
 
         return (
-            close_1 < level
+            c1 < level
             and
-            close_2 < level
+            c2 < level
         )
 
     return False
@@ -434,6 +532,7 @@ def detect_bos(df):
         or
         structure["last_low"] is None
     ):
+
         return "NONE"
 
     if two_consecutive_closes(
@@ -441,6 +540,7 @@ def detect_bos(df):
         structure["last_high"],
         "BULLISH"
     ):
+
         return "BULLISH_BOS"
 
     if two_consecutive_closes(
@@ -448,6 +548,7 @@ def detect_bos(df):
         structure["last_low"],
         "BEARISH"
     ):
+
         return "BEARISH_BOS"
 
     return "NONE"
@@ -455,10 +556,6 @@ def detect_bos(df):
 
 # ============================================================
 # CHOCH
-#
-# Simplified programmable interpretation:
-# previous directional structure + opposite structural break
-# + two consecutive closes.
 # ============================================================
 
 def detect_choch(df):
@@ -467,13 +564,6 @@ def detect_choch(df):
         return "NONE"
 
     structure = get_structure(df)
-
-    if (
-        structure["last_high"] is None
-        or
-        structure["last_low"] is None
-    ):
-        return "NONE"
 
     trend = structure["trend"]
 
@@ -484,6 +574,7 @@ def detect_choch(df):
             structure["last_high"],
             "BULLISH"
         ):
+
             return "BULLISH_CHOCH"
 
     if trend == "BULLISH":
@@ -493,6 +584,7 @@ def detect_choch(df):
             structure["last_low"],
             "BEARISH"
         ):
+
             return "BEARISH_CHOCH"
 
     return "NONE"
@@ -509,39 +601,49 @@ def confirmation_candle(df):
 
     candle = df.iloc[-1]
 
-    body = abs(
-        float(candle["close"])
-        -
-        float(candle["open"])
+    open_price = float(
+        candle["open"]
     )
 
-    candle_range = (
-        float(candle["high"])
-        -
-        float(candle["low"])
+    close = float(
+        candle["close"]
     )
+
+    high = float(
+        candle["high"]
+    )
+
+    low = float(
+        candle["low"]
+    )
+
+    candle_range = high - low
 
     if candle_range <= 0:
         return "NONE"
+
+    body = abs(
+        close - open_price
+    )
 
     body_ratio = (
         body / candle_range
     )
 
     if (
-        candle["close"] >
-        candle["open"]
+        close > open_price
         and
         body_ratio >= 0.55
     ):
+
         return "BULLISH"
 
     if (
-        candle["close"] <
-        candle["open"]
+        close < open_price
         and
         body_ratio >= 0.55
     ):
+
         return "BEARISH"
 
     return "NONE"
@@ -565,24 +667,32 @@ def detect_two_candle_retracement(
     if direction == "BULLISH":
 
         return (
-            c1["close"] < c1["open"]
+            float(c1["close"])
+            <
+            float(c1["open"])
             and
-            c2["close"] > c2["open"]
+            float(c2["close"])
+            >
+            float(c2["open"])
         )
 
     if direction == "BEARISH":
 
         return (
-            c1["close"] > c1["open"]
+            float(c1["close"])
+            >
+            float(c1["open"])
             and
-            c2["close"] < c2["open"]
+            float(c2["close"])
+            <
+            float(c2["open"])
         )
 
     return False
 
 
 # ============================================================
-# SUPPLY / DEMAND ZONE
+# DEMAND / SUPPLY
 # ============================================================
 
 def detect_zones(df):
@@ -594,9 +704,11 @@ def detect_zones(df):
     atr = atr_series.iloc[-1]
 
     if pd.isna(atr):
-        atr = float(
-            df["close"].iloc[-1]
-        ) * 0.002
+
+        atr = (
+            float(df["close"].iloc[-1])
+            * 0.002
+        )
 
     atr = float(atr)
 
@@ -605,20 +717,24 @@ def detect_zones(df):
 
     if structure["last_low"] is not None:
 
-        low = structure["last_low"]
+        low = float(
+            structure["last_low"]
+        )
 
         demand = (
-            low - atr * 0.25,
-            low + atr * 0.25
+            low - atr * 0.30,
+            low + atr * 0.30
         )
 
     if structure["last_high"] is not None:
 
-        high = structure["last_high"]
+        high = float(
+            structure["last_high"]
+        )
 
         supply = (
-            high - atr * 0.25,
-            high + atr * 0.25
+            high - atr * 0.30,
+            high + atr * 0.30
         )
 
     return {
@@ -638,53 +754,67 @@ def detect_fvg(df):
         return {
             "bullish": False,
             "bearish": False,
-            "zone": None
+            "zone": None,
+            "type": "NONE"
         }
 
-    first = df.iloc[-3]
-    third = df.iloc[-1]
+    c1 = df.iloc[-3]
+    c2 = df.iloc[-2]
+    c3 = df.iloc[-1]
+
+    c1_high = float(c1["high"])
+    c1_low = float(c1["low"])
+
+    c2_open = float(c2["open"])
+    c2_close = float(c2["close"])
+
+    c3_high = float(c3["high"])
+    c3_low = float(c3["low"])
 
     # Bullish FVG
     if (
-        float(third["low"])
-        >
-        float(first["high"])
+        c3_low > c1_high
+        and
+        c2_close > c2_open
     ):
 
         return {
             "bullish": True,
             "bearish": False,
             "zone": (
-                float(first["high"]),
-                float(third["low"])
-            )
+                c1_high,
+                c3_low
+            ),
+            "type": "BULLISH"
         }
 
     # Bearish FVG
     if (
-        float(third["high"])
-        <
-        float(first["low"])
+        c3_high < c1_low
+        and
+        c2_close < c2_open
     ):
 
         return {
             "bullish": False,
             "bearish": True,
             "zone": (
-                float(third["high"]),
-                float(first["low"])
-            )
+                c3_high,
+                c1_low
+            ),
+            "type": "BEARISH"
         }
 
     return {
         "bullish": False,
         "bearish": False,
-        "zone": None
+        "zone": None,
+        "type": "NONE"
     }
 
 
 # ============================================================
-# PRICE TAP
+# PRICE IN ZONE
 # ============================================================
 
 def price_tapped_zone(
@@ -711,12 +841,12 @@ def price_tapped_zone(
 
 
 # ============================================================
-# LIQUIDITY
+# LIQUIDITY SWEEP
 # ============================================================
 
 def detect_liquidity(df):
 
-    if len(df) < 20:
+    if len(df) < 30:
 
         return {
             "bullish": False,
@@ -728,31 +858,38 @@ def detect_liquidity(df):
     last_high = structure["last_high"]
     last_low = structure["last_low"]
 
-    price = float(
+    if last_high is None or last_low is None:
+
+        return {
+            "bullish": False,
+            "bearish": False
+        }
+
+    recent = df.tail(5)
+
+    recent_low = float(
+        recent["low"].min()
+    )
+
+    recent_high = float(
+        recent["high"].max()
+    )
+
+    close = float(
         df["close"].iloc[-1]
     )
 
-    bullish = False
-    bearish = False
+    bullish = (
+        recent_low < last_low
+        and
+        close > last_low
+    )
 
-    if last_low is not None:
-
-        # Price recently swept below a low
-        recent_low = float(
-            df["low"].tail(5).min()
-        )
-
-        if recent_low < last_low:
-            bullish = True
-
-    if last_high is not None:
-
-        recent_high = float(
-            df["high"].tail(5).max()
-        )
-
-        if recent_high > last_high:
-            bearish = True
+    bearish = (
+        recent_high > last_high
+        and
+        close < last_high
+    )
 
     return {
         "bullish": bullish,
@@ -763,13 +900,9 @@ def detect_liquidity(df):
 # ============================================================
 # TGL
 #
-# IMPORTANT:
-# The transcript available to us does not contain a complete
-# mathematical TGL formula.
-#
-# Therefore this function deliberately stays isolated.
-# When the exact Rulebook formula is available, ONLY this
-# function needs replacement.
+# NOTE:
+# Exact mathematical Rulebook TGL formula has not been
+# supplied. This remains an isolated approximation.
 # ============================================================
 
 def calculate_tgl(df):
@@ -789,6 +922,13 @@ def calculate_tgl(df):
     movement = abs(
         high - low
     )
+
+    if movement <= 0:
+
+        return {
+            "level1": None,
+            "level2": None
+        }
 
     if structure["trend"] == "BULLISH":
 
@@ -823,17 +963,6 @@ def calculate_tgl(df):
 
 # ============================================================
 # HTF PRIORITY
-#
-# Rulebook:
-#
-# Daily = 4H = 1H
-#       -> 1H priority
-#
-# 1H opposite Daily + 4H
-#       -> 4H priority
-#
-# 4H + 1H opposite Daily
-#       -> Daily priority
 # ============================================================
 
 def select_priority(
@@ -846,62 +975,63 @@ def select_priority(
     four = h4["trend"]
     one = h1["trend"]
 
+    valid = [
+        "BULLISH",
+        "BEARISH"
+    ]
+
+    # Daily = 4H = 1H
     if (
         d == four
         and
         four == one
         and
-        d in ["BULLISH", "BEARISH"]
+        d in valid
     ):
 
         return {
             "timeframe": H1,
-            "data": h1,
             "direction": d
         }
 
+    # Daily = 4H, 1H opposite
     if (
         d == four
         and
-        one != d
+        d in valid
         and
-        d in ["BULLISH", "BEARISH"]
+        one != d
     ):
 
         return {
             "timeframe": H4,
-            "data": h4,
             "direction": d
         }
 
+    # 4H = 1H, both opposite Daily
     if (
         four == one
         and
-        four != d
+        four in valid
         and
-        four in ["BULLISH", "BEARISH"]
+        d != four
     ):
 
         return {
             "timeframe": DAILY,
-            "data": daily,
-            "direction": d
+            "direction": four
         }
 
     return None
 
 
 # ============================================================
-# REQUIRED LOWER TF
-#
-# 1H -> 1M
-# 4H -> 5M
-# Daily -> 1H + 1M
+# REQUIRED CHOCH
 # ============================================================
 
 def required_choch(
     priority_tf,
-    data,
+    market,
     direction
 ):
 
@@ -914,28 +1044,36 @@ def required_choch(
     if priority_tf == H1:
 
         return (
-            data[M1]["choch"] == expected
+            market[M1]["choch"]
+            ==
+            expected
         )
 
     if priority_tf == H4:
 
         return (
-            data[M5]["choch"] == expected
+            market[M5]["choch"]
+            ==
+            expected
         )
 
     if priority_tf == DAILY:
 
         return (
-            data[H1]["choch"] == expected
+            market[H1]["choch"]
+            ==
+            expected
             and
-            data[M1]["choch"] == expected
+            market[M1]["choch"]
+            ==
+            expected
         )
 
     return False
 
 
 # ============================================================
-# FAKEOUT FILTER
+# FAKEOUT
 # ============================================================
 
 def is_fakeout(
@@ -946,13 +1084,12 @@ def is_fakeout(
     if len(df) < 5:
         return True
 
-    current = df.iloc[-1]
-    previous = df.iloc[-2]
+    candle = df.iloc[-1]
 
-    high = float(current["high"])
-    low = float(current["low"])
-    close = float(current["close"])
-    open_price = float(current["open"])
+    high = float(candle["high"])
+    low = float(candle["low"])
+    close = float(candle["close"])
+    open_price = float(candle["open"])
 
     candle_range = high - low
 
@@ -967,9 +1104,10 @@ def is_fakeout(
         body / candle_range
     )
 
-    # Weak candle
     if body_ratio < 0.30:
         return True
+
+    previous = df.iloc[-2]
 
     previous_high = float(
         previous["high"]
@@ -979,7 +1117,6 @@ def is_fakeout(
         previous["low"]
     )
 
-    # Bullish breakout rejected
     if direction == "BULLISH":
 
         if (
@@ -987,9 +1124,9 @@ def is_fakeout(
             and
             close < previous_high
         ):
+
             return True
 
-    # Bearish breakout rejected
     if direction == "BEARISH":
 
         if (
@@ -997,13 +1134,14 @@ def is_fakeout(
             and
             close > previous_low
         ):
+
             return True
 
     return False
 
 
 # ============================================================
-# ALREADY PLAYED LEVEL
+# LEVEL ALREADY PLAYED
 # ============================================================
 
 def level_already_played(
@@ -1046,16 +1184,14 @@ def level_already_played(
             and
             candle_low <= high
         ):
+
             touches += 1
 
-    # Conservative filter.
-    # Exact Rulebook retest count should replace this
-    # when the transcript gives an explicit number.
     return touches >= 3
 
 
 # ============================================================
-# EMA DIRECTION
+# EMA SUPPORT
 # ============================================================
 
 def ema_confirmation(
@@ -1063,7 +1199,7 @@ def ema_confirmation(
     direction
 ):
 
-    if len(df) < 50:
+    if len(df) < 60:
         return False
 
     ema20 = calculate_ema(
@@ -1076,12 +1212,18 @@ def ema_confirmation(
         50
     )
 
+    price = float(
+        df["close"].iloc[-1]
+    )
+
     if direction == "BULLISH":
 
         return (
             ema20.iloc[-1]
             >
             ema50.iloc[-1]
+            and
+            price > ema20.iloc[-1]
         )
 
     if direction == "BEARISH":
@@ -1090,13 +1232,15 @@ def ema_confirmation(
             ema20.iloc[-1]
             <
             ema50.iloc[-1]
+            and
+            price < ema20.iloc[-1]
         )
 
     return False
 
 
 # ============================================================
-# LOAD ALL TIMEFRAMES
+# LOAD MARKET
 # ============================================================
 
 def load_market():
@@ -1121,24 +1265,39 @@ def load_market():
         )
 
         if df.empty:
+
+            logger.warning(
+                "No BTCUSDT data for %s",
+                tf
+            )
+
             return None
 
         market[tf] = {
+
             "df": df,
+
             "structure":
                 get_structure(df),
+
             "bos":
                 detect_bos(df),
+
             "choch":
                 detect_choch(df),
+
             "fvg":
                 detect_fvg(df),
+
             "zones":
                 detect_zones(df),
+
             "liquidity":
                 detect_liquidity(df),
+
             "confirmation":
                 confirmation_candle(df),
+
             "tgl":
                 calculate_tgl(df)
         }
@@ -1188,13 +1347,22 @@ def analyze_rulebook(
 
         "tp2": None,
 
-        "reasons": []
+        "rr1": None,
 
+        "rr2": None,
+
+        "reasons": []
     }
 
     # --------------------------------------------------------
-    # HTF PRIORITY
+    # HTF STATUS
     # --------------------------------------------------------
+
+    result["reasons"].append(
+        f"HTF: Daily={daily['trend']} | "
+        f"4H={h4['trend']} | "
+        f"1H={h1['trend']}"
+    )
 
     priority = select_priority(
         daily,
@@ -1202,14 +1370,76 @@ def analyze_rulebook(
         h1
     )
 
+    # --------------------------------------------------------
+    # No priority
+    # --------------------------------------------------------
+
     if priority is None:
 
+        result["checks"][
+            "HTF_DIRECTION"
+        ] = False
+
+        result["checks"][
+            "STRUCTURE"
+        ] = False
+
         result["reasons"].append(
-            "Daily/4H/1H do not satisfy "
-            "the Rulebook priority condition"
+            "No Rulebook HTF priority condition currently active"
         )
 
+        # Diagnostic confluence.
+        #
+        # This is deliberately NOT treated as a trade score.
+        # It prevents the misleading impression that nothing
+        # was analysed.
+
+        direction_votes = []
+
+        for structure in [
+            daily,
+            h4,
+            h1
+        ]:
+
+            if structure["trend"] in [
+                "BULLISH",
+                "BEARISH"
+            ]:
+
+                direction_votes.append(
+                    structure["trend"]
+                )
+
+        if direction_votes:
+
+            bullish = direction_votes.count(
+                "BULLISH"
+            )
+
+            bearish = direction_votes.count(
+                "BEARISH"
+            )
+
+            if bullish > bearish:
+
+                result["direction"] = "BULLISH"
+
+            elif bearish > bullish:
+
+                result["direction"] = "BEARISH"
+
+            else:
+
+                result["direction"] = "MIXED"
+
+        result["confidence"] = 0
+
         return result
+
+    # --------------------------------------------------------
+    # Priority
+    # --------------------------------------------------------
 
     direction = priority["direction"]
     priority_tf = priority["timeframe"]
@@ -1222,74 +1452,70 @@ def analyze_rulebook(
     ] = True
 
     result["reasons"].append(
-        f"{priority_tf} priority selected "
-        f"with {direction} direction"
+        f"{priority_tf} priority selected: {direction}"
     )
 
-    # --------------------------------------------------------
-    # STRUCTURE
-    # --------------------------------------------------------
-
-    selected_structure = priority[
-        "data"
+    selected = market[
+        priority_tf
     ]
+
+    structure = selected[
+        "structure"
+    ]
+
+    selected_df = selected[
+        "df"
+    ]
+
+    # --------------------------------------------------------
+    # Structure
+    # --------------------------------------------------------
 
     if direction == "BULLISH":
 
         structure_ok = (
-            "HH"
-            in selected_structure["labels"]
+            "HH" in structure["labels"]
             and
-            "HL"
-            in selected_structure["labels"]
+            "HL" in structure["labels"]
         )
 
     else:
 
         structure_ok = (
-            "LH"
-            in selected_structure["labels"]
+            "LH" in structure["labels"]
             and
-            "LL"
-            in selected_structure["labels"]
+            "LL" in structure["labels"]
         )
 
     result["checks"][
         "STRUCTURE"
     ] = structure_ok
 
-    if structure_ok:
-
-        result["reasons"].append(
-            "Valid directional structure"
+    result["reasons"].append(
+        "Structure: "
+        +
+        (
+            "PASS"
+            if structure_ok
+            else "FAIL"
         )
-
-    else:
-
-        result["reasons"].append(
-            "Directional structure not confirmed"
-        )
+    )
 
     # --------------------------------------------------------
-    # PRICE TAP
+    # Zone
     # --------------------------------------------------------
 
     if direction == "BULLISH":
 
-        zone = selected_structure[
-            "data"
-            if False else "zones"
+        zone = selected[
+            "zones"
         ]["demand"]
 
     else:
 
-        zone = selected_structure[
-            "data"
-            if False else "zones"
+        zone = selected[
+            "zones"
         ]["supply"]
-
-    # Above expression resolves to selected_structure["zones"]
-    # and keeps the logic explicit.
 
     tapped = price_tapped_zone(
         price,
@@ -1303,54 +1529,42 @@ def analyze_rulebook(
     if tapped:
 
         result["reasons"].append(
-            "Price tapped selected HTF zone"
+            "Price tapped HTF zone"
         )
 
     else:
 
         result["reasons"].append(
-            "Waiting for price to tap selected HTF zone"
+            "Waiting for HTF zone tap"
         )
 
     # --------------------------------------------------------
-    # ALREADY PLAYED
+    # Already played
     # --------------------------------------------------------
-
-    already_played = level_already_played(
-        selected_structure["data"]
-        if "data" in selected_structure
-        else market[priority_tf]["df"],
-        zone
-    )
-
-    # Correct dataframe:
-    selected_df = market[
-        priority_tf
-    ]["df"]
 
     already_played = level_already_played(
         selected_df,
         zone
     )
 
+    level_ok = not already_played
+
     result["checks"][
         "LEVEL_NOT_PLAYED"
-    ] = not already_played
+    ] = level_ok
 
-    if already_played:
-
-        result["reasons"].append(
-            "Selected level appears already played/retested"
+    result["reasons"].append(
+        "Level retest filter: "
+        +
+        (
+            "PASS"
+            if level_ok
+            else "ALREADY PLAYED"
         )
-
-    else:
-
-        result["reasons"].append(
-            "Level-retouch filter passed"
-        )
+    )
 
     # --------------------------------------------------------
-    # LOWER TF CHOCH
+    # Lower TF CHOCH
     # --------------------------------------------------------
 
     choch_ok = required_choch(
@@ -1372,15 +1586,12 @@ def analyze_rulebook(
     else:
 
         if priority_tf == H1:
-
             required_tf = "1M"
 
         elif priority_tf == H4:
-
             required_tf = "5M"
 
         else:
-
             required_tf = "1H + 1M"
 
         result["reasons"].append(
@@ -1388,7 +1599,7 @@ def analyze_rulebook(
         )
 
     # --------------------------------------------------------
-    # 2 CANDLE RETRACEMENT
+    # 2 candle retracement
     # --------------------------------------------------------
 
     retracement_ok = detect_two_candle_retracement(
@@ -1400,20 +1611,8 @@ def analyze_rulebook(
         "TWO_CANDLE_RETRACEMENT"
     ] = retracement_ok
 
-    if retracement_ok:
-
-        result["reasons"].append(
-            "2-candle retracement detected"
-        )
-
-    else:
-
-        result["reasons"].append(
-            "2-candle retracement not confirmed"
-        )
-
     # --------------------------------------------------------
-    # CONFIRMATION CANDLE
+    # Confirmation
     # --------------------------------------------------------
 
     confirmation = market[M1][
@@ -1428,20 +1627,8 @@ def analyze_rulebook(
         "CONFIRMATION"
     ] = confirmation_ok
 
-    if confirmation_ok:
-
-        result["reasons"].append(
-            "Entry confirmation candle valid"
-        )
-
-    else:
-
-        result["reasons"].append(
-            "Waiting for directional confirmation candle"
-        )
-
     # --------------------------------------------------------
-    # FAKEOUT
+    # Fakeout
     # --------------------------------------------------------
 
     fakeout = is_fakeout(
@@ -1454,18 +1641,6 @@ def analyze_rulebook(
     result["checks"][
         "NO_FAKEOUT"
     ] = fakeout_ok
-
-    if fakeout_ok:
-
-        result["reasons"].append(
-            "Fakeout filter passed"
-        )
-
-    else:
-
-        result["reasons"].append(
-            "Possible fakeout detected"
-        )
 
     # --------------------------------------------------------
     # FVG
@@ -1485,20 +1660,8 @@ def analyze_rulebook(
         "FVG"
     ] = fvg_ok
 
-    if fvg_ok:
-
-        result["reasons"].append(
-            "Directional FVG present"
-        )
-
-    else:
-
-        result["reasons"].append(
-            "No directional FVG"
-        )
-
     # --------------------------------------------------------
-    # LIQUIDITY
+    # Liquidity
     # --------------------------------------------------------
 
     liquidity = market[M5][
@@ -1521,20 +1684,8 @@ def analyze_rulebook(
         "LIQUIDITY"
     ] = liquidity_ok
 
-    if liquidity_ok:
-
-        result["reasons"].append(
-            "Liquidity interaction detected"
-        )
-
-    else:
-
-        result["reasons"].append(
-            "Liquidity confirmation not detected"
-        )
-
     # --------------------------------------------------------
-    # EMA = SUPPORTING CONFLUENCE ONLY
+    # EMA
     # --------------------------------------------------------
 
     ema_ok = ema_confirmation(
@@ -1547,10 +1698,71 @@ def analyze_rulebook(
     ] = ema_ok
 
     # --------------------------------------------------------
-    # CONFLUENCE SCORE
-    #
-    # This is NOT win probability.
-    # It measures technical confluence.
+    # Reasons
+    # --------------------------------------------------------
+
+    result["reasons"].append(
+        "2-candle retracement: "
+        +
+        (
+            "PASS"
+            if retracement_ok
+            else "WAIT"
+        )
+    )
+
+    result["reasons"].append(
+        "Confirmation candle: "
+        +
+        (
+            "PASS"
+            if confirmation_ok
+            else "WAIT"
+        )
+    )
+
+    result["reasons"].append(
+        "Fakeout filter: "
+        +
+        (
+            "PASS"
+            if fakeout_ok
+            else "FAIL"
+        )
+    )
+
+    result["reasons"].append(
+        "FVG: "
+        +
+        (
+            "PASS"
+            if fvg_ok
+            else "NONE"
+        )
+    )
+
+    result["reasons"].append(
+        "Liquidity: "
+        +
+        (
+            "PASS"
+            if liquidity_ok
+            else "NONE"
+        )
+    )
+
+    result["reasons"].append(
+        "EMA support: "
+        +
+        (
+            "PASS"
+            if ema_ok
+            else "NONE"
+        )
+    )
+
+    # --------------------------------------------------------
+    # Confluence
     # --------------------------------------------------------
 
     weights = {
@@ -1574,7 +1786,6 @@ def analyze_rulebook(
         "LIQUIDITY": 2,
 
         "EMA_SUPPORT": 1
-
     }
 
     score = 0
@@ -1591,57 +1802,27 @@ def analyze_rulebook(
     result["confidence"] = score
 
     # --------------------------------------------------------
-    # MANDATORY CONDITIONS
-    #
-    # Direct BUY/SELL is forbidden unless these pass.
+    # Mandatory
     # --------------------------------------------------------
 
-    mandatory = [
+    mandatory_keys = [
 
-        result["checks"].get(
-            "HTF_DIRECTION",
-            False
-        ),
-
-        result["checks"].get(
-            "STRUCTURE",
-            False
-        ),
-
-        result["checks"].get(
-            "PRICE_TAP",
-            False
-        ),
-
-        result["checks"].get(
-            "LEVEL_NOT_PLAYED",
-            False
-        ),
-
-        result["checks"].get(
-            "LOWER_TF_CHOCH",
-            False
-        ),
-
-        result["checks"].get(
-            "TWO_CANDLE_RETRACEMENT",
-            False
-        ),
-
-        result["checks"].get(
-            "CONFIRMATION",
-            False
-        ),
-
-        result["checks"].get(
-            "NO_FAKEOUT",
-            False
-        )
-
+        "HTF_DIRECTION",
+        "STRUCTURE",
+        "PRICE_TAP",
+        "LEVEL_NOT_PLAYED",
+        "LOWER_TF_CHOCH",
+        "TWO_CANDLE_RETRACEMENT",
+        "CONFIRMATION",
+        "NO_FAKEOUT"
     ]
 
     all_mandatory = all(
-        mandatory
+        result["checks"].get(
+            key,
+            False
+        )
+        for key in mandatory_keys
     )
 
     result["mandatory_pass"] = (
@@ -1649,7 +1830,7 @@ def analyze_rulebook(
     )
 
     # --------------------------------------------------------
-    # FINAL DECISION
+    # Final signal
     # --------------------------------------------------------
 
     if (
@@ -1669,7 +1850,7 @@ def analyze_rulebook(
         result["signal"] = "WAIT"
 
     # --------------------------------------------------------
-    # ENTRY / SL / TP
+    # Entry / SL / TP
     # --------------------------------------------------------
 
     if result["signal"] in [
@@ -1685,19 +1866,9 @@ def analyze_rulebook(
 
         if pd.isna(atr):
 
-            atr = (
-                price * 0.002
-            )
+            atr = price * 0.002
 
         atr = float(atr)
-
-        selected = market[
-            priority_tf
-        ]
-
-        structure = selected[
-            "structure"
-        ]
 
         tgl = selected[
             "tgl"
@@ -1707,22 +1878,24 @@ def analyze_rulebook(
 
             entry = price
 
-            swing_low = (
-                structure["last_low"]
-            )
+            swing_low = structure[
+                "last_low"
+            ]
 
             if swing_low is not None:
 
                 sl = (
                     swing_low
-                    - atr * 0.20
+                    -
+                    atr * 0.20
                 )
 
             else:
 
                 sl = (
                     entry
-                    - atr * 1.5
+                    -
+                    atr * 1.5
                 )
 
             risk = entry - sl
@@ -1738,7 +1911,8 @@ def analyze_rulebook(
 
                 tp1 = (
                     entry
-                    + risk * 1.5
+                    +
+                    risk * 1.5
                 )
 
             if (
@@ -1749,29 +1923,32 @@ def analyze_rulebook(
 
                 tp2 = (
                     entry
-                    + risk * 2.5
+                    +
+                    risk * 2.5
                 )
 
         else:
 
             entry = price
 
-            swing_high = (
-                structure["last_high"]
-            )
+            swing_high = structure[
+                "last_high"
+            ]
 
             if swing_high is not None:
 
                 sl = (
                     swing_high
-                    + atr * 0.20
+                    +
+                    atr * 0.20
                 )
 
             else:
 
                 sl = (
                     entry
-                    + atr * 1.5
+                    +
+                    atr * 1.5
                 )
 
             risk = sl - entry
@@ -1787,7 +1964,8 @@ def analyze_rulebook(
 
                 tp1 = (
                     entry
-                    - risk * 1.5
+                    -
+                    risk * 1.5
                 )
 
             if (
@@ -1798,8 +1976,19 @@ def analyze_rulebook(
 
                 tp2 = (
                     entry
-                    - risk * 2.5
+                    -
+                    risk * 2.5
                 )
+
+        if risk > 0:
+
+            result["rr1"] = abs(
+                tp1 - entry
+            ) / risk
+
+            result["rr2"] = abs(
+                tp2 - entry
+            ) / risk
 
         result["entry"] = float(entry)
         result["sl"] = float(sl)
@@ -1825,6 +2014,130 @@ class PaperTrader:
         self.wins = 0
         self.losses = 0
 
+        self.tp1_hits = 0
+
+        self.load_state()
+
+    # --------------------------------------------------------
+    # LOAD
+    # --------------------------------------------------------
+
+    def load_state(self):
+
+        if not os.path.exists(
+            STATE_FILE
+        ):
+
+            return
+
+        try:
+
+            with open(
+                STATE_FILE,
+                "r"
+            ) as f:
+
+                data = json.load(f)
+
+            self.balance = float(
+                data.get(
+                    "balance",
+                    PAPER_BALANCE
+                )
+            )
+
+            self.total = int(
+                data.get(
+                    "total",
+                    0
+                )
+            )
+
+            self.wins = int(
+                data.get(
+                    "wins",
+                    0
+                )
+            )
+
+            self.losses = int(
+                data.get(
+                    "losses",
+                    0
+                )
+            )
+
+            self.tp1_hits = int(
+                data.get(
+                    "tp1_hits",
+                    0
+                )
+            )
+
+            self.trade = data.get(
+                "trade"
+            )
+
+            logger.info(
+                "Paper state restored | "
+                "Trades=%d | Wins=%d | Losses=%d",
+                self.total,
+                self.wins,
+                self.losses
+            )
+
+        except Exception as e:
+
+            logger.warning(
+                "Could not load paper state: %s",
+                e
+            )
+
+    # --------------------------------------------------------
+    # SAVE
+    # --------------------------------------------------------
+
+    def save_state(self):
+
+        data = {
+
+            "balance": self.balance,
+
+            "total": self.total,
+
+            "wins": self.wins,
+
+            "losses": self.losses,
+
+            "tp1_hits": self.tp1_hits,
+
+            "trade": self.trade
+        }
+
+        try:
+
+            with open(
+                STATE_FILE,
+                "w"
+            ) as f:
+
+                json.dump(
+                    data,
+                    f,
+                    indent=2
+                )
+
+        except Exception as e:
+
+            logger.warning(
+                "Could not save paper state: %s",
+                e
+            )
+
+    # --------------------------------------------------------
+    # OPEN
+    # --------------------------------------------------------
+
     def open(
         self,
         setup
@@ -1837,7 +2150,36 @@ class PaperTrader:
             "BUY",
             "SELL"
         ]:
+
             return False
+
+        entry = float(
+            setup["entry"]
+        )
+
+        sl = float(
+            setup["sl"]
+        )
+
+        risk_distance = abs(
+            entry - sl
+        )
+
+        risk_money = (
+            self.balance
+            *
+            RISK_PERCENT
+            /
+            100
+        )
+
+        quantity = (
+            risk_money
+            /
+            risk_distance
+            if risk_distance > 0
+            else 0
+        )
 
         self.trade = {
 
@@ -1845,27 +2187,41 @@ class PaperTrader:
                 setup["signal"],
 
             "entry":
-                setup["entry"],
+                entry,
 
             "sl":
-                setup["sl"],
+                sl,
 
             "tp1":
-                setup["tp1"],
+                float(setup["tp1"]),
 
             "tp2":
-                setup["tp2"],
+                float(setup["tp2"]),
+
+            "quantity":
+                float(quantity),
+
+            "risk_money":
+                float(risk_money),
+
+            "tp1_hit":
+                False,
 
             "opened":
                 datetime.now(
                     timezone.utc
                 ).isoformat()
-
         }
 
         self.total += 1
 
+        self.save_state()
+
         return True
+
+    # --------------------------------------------------------
+    # CHECK
+    # --------------------------------------------------------
 
     def check(
         self,
@@ -1879,74 +2235,183 @@ class PaperTrader:
 
         side = trade["side"]
 
-        result = None
-        exit_price = None
+        price = float(price)
+
+        # ----------------------------------------------------
+        # BUY
+        # ----------------------------------------------------
 
         if side == "BUY":
 
+            # SL first
             if price <= trade["sl"]:
 
-                result = "LOSS"
-                exit_price = trade["sl"]
+                result = self.close(
+                    "LOSS",
+                    trade["sl"]
+                )
 
-            elif price >= trade["tp2"]:
+                return result
 
-                result = "WIN"
-                exit_price = trade["tp2"]
+            # TP2
+            if price >= trade["tp2"]:
+
+                result = self.close(
+                    "WIN",
+                    trade["tp2"]
+                )
+
+                return result
+
+            # TP1
+            if (
+                not trade["tp1_hit"]
+                and
+                price >= trade["tp1"]
+            ):
+
+                trade["tp1_hit"] = True
+
+                self.tp1_hits += 1
+
+                # Move SL to breakeven
+                trade["sl"] = trade[
+                    "entry"
+                ]
+
+                self.save_state()
+
+                return {
+                    "type": "TP1",
+                    **trade,
+                    "price": price
+                }
+
+        # ----------------------------------------------------
+        # SELL
+        # ----------------------------------------------------
 
         elif side == "SELL":
 
             if price >= trade["sl"]:
 
-                result = "LOSS"
-                exit_price = trade["sl"]
+                result = self.close(
+                    "LOSS",
+                    trade["sl"]
+                )
 
-            elif price <= trade["tp2"]:
+                return result
 
-                result = "WIN"
-                exit_price = trade["tp2"]
+            if price <= trade["tp2"]:
 
-        if result is None:
-            return None
+                result = self.close(
+                    "WIN",
+                    trade["tp2"]
+                )
+
+                return result
+
+            if (
+                not trade["tp1_hit"]
+                and
+                price <= trade["tp1"]
+            ):
+
+                trade["tp1_hit"] = True
+
+                self.tp1_hits += 1
+
+                trade["sl"] = trade[
+                    "entry"
+                ]
+
+                self.save_state()
+
+                return {
+                    "type": "TP1",
+                    **trade,
+                    "price": price
+                }
+
+        return None
+
+    # --------------------------------------------------------
+    # CLOSE
+    # --------------------------------------------------------
+
+    def close(
+        self,
+        result,
+        exit_price
+    ):
+
+        trade = self.trade
+
+        side = trade["side"]
+
+        entry = trade["entry"]
+
+        quantity = trade[
+            "quantity"
+        ]
 
         if side == "BUY":
 
             pnl = (
                 exit_price
                 -
-                trade["entry"]
-            )
+                entry
+            ) * quantity
 
         else:
 
             pnl = (
-                trade["entry"]
+                entry
                 -
                 exit_price
-            )
-
-        if result == "WIN":
-            self.wins += 1
-        else:
-            self.losses += 1
+            ) * quantity
 
         self.balance += pnl
 
+        if result == "WIN":
+
+            self.wins += 1
+
+        else:
+
+            self.losses += 1
+
         completed = {
+
             **trade,
-            "exit": exit_price,
-            "result": result,
-            "pnl": pnl
+
+            "exit":
+                float(exit_price),
+
+            "result":
+                result,
+
+            "pnl":
+                float(pnl),
+
+            "balance":
+                float(self.balance)
         }
 
         self.trade = None
 
+        self.save_state()
+
         return completed
+
+    # --------------------------------------------------------
+    # WIN RATE
+    # --------------------------------------------------------
 
     def win_rate(self):
 
-        if self.total == 0:
-            return 0
+        if self.total <= 0:
+            return 0.0
 
         return (
             self.wins
@@ -1956,7 +2421,7 @@ class PaperTrader:
 
 
 # ============================================================
-# TELEGRAM MESSAGE
+# TELEGRAM SETUP MESSAGE
 # ============================================================
 
 def setup_message(
@@ -1965,12 +2430,14 @@ def setup_message(
 
     if setup["signal"] == "BUY":
         icon = "🟢"
+
     elif setup["signal"] == "SELL":
         icon = "🔴"
+
     else:
         icon = "🟡"
 
-    lines = []
+    checks = []
 
     for key, value in setup[
         "checks"
@@ -1982,15 +2449,15 @@ def setup_message(
             else "✗"
         )
 
-        lines.append(
+        checks.append(
             f"{symbol} {key}"
         )
 
     checks_text = "\n".join(
-        lines
+        checks
     )
 
-    reasons_text = "\n".join(
+    reasons = "\n".join(
         f"• {x}"
         for x in setup["reasons"]
     )
@@ -1999,7 +2466,7 @@ def setup_message(
 
         f"{icon} <b>TRADEBRAIN AI</b>\n\n"
 
-        f"<b>Symbol:</b> {SYMBOL}\n"
+        f"<b>Symbol:</b> BTCUSDT\n"
 
         f"<b>Signal:</b> "
         f"{setup['signal']}\n"
@@ -2020,7 +2487,7 @@ def setup_message(
         f"{checks_text}\n\n"
 
         f"<b>Analysis</b>\n"
-        f"{reasons_text}"
+        f"{reasons}"
     )
 
     if setup["signal"] in [
@@ -2031,6 +2498,7 @@ def setup_message(
         text += (
 
             "\n\n"
+
             f"<b>ENTRY:</b> "
             f"{setup['entry']:.2f}\n"
 
@@ -2043,29 +2511,75 @@ def setup_message(
             f"<b>TP2:</b> "
             f"{setup['tp2']:.2f}\n"
 
-            "\n<b>MODE:</b> PAPER TRADE"
+            f"<b>RR1:</b> "
+            f"{setup['rr1']:.2f}\n"
+
+            f"<b>RR2:</b> "
+            f"{setup['rr2']:.2f}\n\n"
+
+            "<b>MODE:</b> PAPER TRADE"
         )
 
     return text
 
+
+# ============================================================
+# WAIT MESSAGE
+# ============================================================
+
+def wait_message(
+    setup
+):
+
+    reasons = "\n".join(
+        f"• {x}"
+        for x in setup["reasons"]
+    )
+
+    return (
+
+        "🟡 <b>BTCUSDT WAIT</b>\n\n"
+
+        f"<b>Price:</b> "
+        f"{setup['price']:.2f}\n"
+
+        f"<b>Direction:</b> "
+        f"{setup['direction']}\n"
+
+        f"<b>Priority:</b> "
+        f"{setup['priority_tf']}\n"
+
+        f"<b>Confluence:</b> "
+        f"{setup['confidence']}/100\n\n"
+
+        f"<b>Why WAIT?</b>\n"
+        f"{reasons}"
+    )
+
+
+# ============================================================
+# RESULT MESSAGE
+# ============================================================
 
 def result_message(
     result,
     trader
 ):
 
-    icon = (
-        "✅"
-        if result["result"] == "WIN"
-        else "❌"
-    )
+    if result["result"] == "WIN":
+
+        icon = "✅"
+
+    else:
+
+        icon = "❌"
 
     return (
 
         f"{icon} <b>PAPER TRADE "
         f"{result['result']}</b>\n\n"
 
-        f"<b>Symbol:</b> {SYMBOL}\n"
+        f"<b>Symbol:</b> BTCUSDT\n"
 
         f"<b>Side:</b> "
         f"{result['side']}\n"
@@ -2077,7 +2591,7 @@ def result_message(
         f"{result['exit']:.2f}\n"
 
         f"<b>P/L:</b> "
-        f"{result['pnl']:.4f}\n\n"
+        f"{result['pnl']:.2f}\n\n"
 
         f"<b>Total Trades:</b> "
         f"{trader.total}\n"
@@ -2097,37 +2611,123 @@ def result_message(
 
 
 # ============================================================
-# DUPLICATE SIGNAL PROTECTION
+# TP1 MESSAGE
 # ============================================================
 
-last_trade_signal = None
+def tp1_message(
+    trade
+):
+
+    return (
+
+        "🎯 <b>BTCUSDT TP1 HIT</b>\n\n"
+
+        f"<b>Side:</b> "
+        f"{trade['side']}\n"
+
+        f"<b>Entry:</b> "
+        f"{trade['entry']:.2f}\n"
+
+        f"<b>TP1:</b> "
+        f"{trade['tp1']:.2f}\n\n"
+
+        "SL moved to <b>BREAK-EVEN</b>\n"
+
+        "Paper trade remains active."
+    )
+
+
+# ============================================================
+# SIGNAL DUPLICATION PROTECTION
+# ============================================================
+
+last_signal_key = None
 
 
 def signal_is_new(
-    setup
+    setup,
+    market
 ):
 
-    global last_trade_signal
+    global last_signal_key
 
     if setup["signal"] not in [
         "BUY",
         "SELL"
     ]:
+
         return False
 
-    candle_time = (
-        setup["price"],
-        setup["priority_tf"],
-        setup["direction"]
+    tf = setup[
+        "priority_tf"
+    ]
+
+    if tf not in market:
+        return False
+
+    df = market[tf]["df"]
+
+    candle_time = str(
+        df["close_time"].iloc[-1]
     )
 
-    if candle_time == last_trade_signal:
+    key = (
+        SYMBOL,
+        setup["signal"],
+        tf,
+        candle_time
+    )
+
+    if key == last_signal_key:
 
         return False
 
-    last_trade_signal = candle_time
+    last_signal_key = key
 
     return True
+
+
+# ============================================================
+# STATUS LOG
+# ============================================================
+
+def log_market_status(
+    market,
+    setup,
+    trader
+):
+
+    d = market[
+        DAILY
+    ]["structure"]["trend"]
+
+    h4 = market[
+        H4
+    ]["structure"]["trend"]
+
+    h1 = market[
+        H1
+    ]["structure"]["trend"]
+
+    logger.info(
+        "BTCUSDT | %s | Price %.2f | "
+        "Confidence %d/100 | "
+        "Bias %s | Priority %s | "
+        "D=%s H4=%s H1=%s | "
+        "Trades=%d W=%d L=%d WR=%.2f%%",
+        setup["signal"],
+        setup["price"],
+        setup["confidence"],
+        setup["direction"],
+        setup["priority_tf"],
+        d,
+        h4,
+        h1,
+        trader.total,
+        trader.wins,
+        trader.losses,
+        trader.win_rate()
+    )
 
 
 # ============================================================
@@ -2141,12 +2741,15 @@ def main():
     )
 
     logger.info(
-        "TradeBrain Rulebook Engine STARTED"
+        "TradeBrain BTCUSDT Rulebook Engine STARTED"
     )
 
     logger.info(
-        "Symbol: %s",
-        SYMBOL
+        "Symbol: BTCUSDT"
+    )
+
+    logger.info(
+        "Data source: Binance Public API"
     )
 
     logger.info(
@@ -2158,8 +2761,13 @@ def main():
     )
 
     logger.info(
-        "Minimum Confluence: %s",
+        "Minimum Confluence: %d",
         MIN_CONFLUENCE
+    )
+
+    logger.info(
+        "Scan Interval: %d sec",
+        SCAN_INTERVAL
     )
 
     logger.info(
@@ -2170,16 +2778,20 @@ def main():
 
         "🚀 <b>TradeBrain AI Started</b>\n\n"
 
-        f"Symbol: {SYMBOL}\n"
+        "<b>Symbol:</b> BTCUSDT\n"
 
-        "Mode: PAPER TRADING\n"
+        "<b>Data:</b> Binance\n"
 
-        "Live trading: OFF\n\n"
+        "<b>Mode:</b> PAPER TRADING\n"
+
+        "<b>Live:</b> OFF\n\n"
 
         "Rulebook engine: ACTIVE"
     )
 
     trader = PaperTrader()
+
+    last_wait_log = 0
 
     while True:
 
@@ -2190,7 +2802,7 @@ def main():
             if market is None:
 
                 logger.warning(
-                    "Market data unavailable"
+                    "BTCUSDT market data unavailable"
                 )
 
                 time.sleep(
@@ -2206,7 +2818,7 @@ def main():
             )
 
             # ------------------------------------------------
-            # Existing paper trade
+            # Check existing paper trade
             # ------------------------------------------------
 
             completed = trader.check(
@@ -2215,54 +2827,67 @@ def main():
 
             if completed:
 
-                logger.info(
-                    "PAPER %s | P/L %.4f",
-                    completed["result"],
-                    completed["pnl"]
-                )
+                if completed.get(
+                    "type"
+                ) == "TP1":
 
-                send_telegram(
-                    result_message(
-                        completed,
-                        trader
+                    logger.info(
+                        "BTCUSDT PAPER TP1 HIT"
                     )
-                )
+
+                    send_telegram(
+                        tp1_message(
+                            completed
+                        )
+                    )
+
+                else:
+
+                    logger.info(
+                        "BTCUSDT PAPER %s | "
+                        "P/L %.2f | "
+                        "Balance %.2f",
+                        completed["result"],
+                        completed["pnl"],
+                        trader.balance
+                    )
+
+                    send_telegram(
+                        result_message(
+                            completed,
+                            trader
+                        )
+                    )
 
             # ------------------------------------------------
-            # Rulebook analysis
+            # Analyze
             # ------------------------------------------------
 
             setup = analyze_rulebook(
                 market
             )
 
-            logger.info(
-
-                "%s | Price %.2f | "
-                "Confidence %d/100 | "
-                "Direction %s | "
-                "Priority %s",
-
-                setup["signal"],
-
-                price,
-
-                setup["confidence"],
-
-                setup["direction"],
-
-                setup["priority_tf"]
+            log_market_status(
+                market,
+                setup,
+                trader
             )
 
             # ------------------------------------------------
-            # Send BUY / SELL only
+            # BUY / SELL
             # ------------------------------------------------
 
             if (
                 setup["signal"]
-                in ["BUY", "SELL"]
+                in [
+                    "BUY",
+                    "SELL"
+                ]
                 and
-                signal_is_new(setup)
+                signal_is_new(
+                    setup,
+                    market
+                )
             ):
 
                 send_telegram(
@@ -2271,31 +2896,63 @@ def main():
                     )
                 )
 
-                opened = trader.open(
-                    setup
-                )
+                if trader.trade is None:
 
-                if opened:
+                    opened = trader.open(
+                        setup
+                    )
+
+                    if opened:
+
+                        send_telegram(
+
+                            "📌 <b>PAPER TRADE OPENED</b>\n\n"
+
+                            "<b>Symbol:</b> BTCUSDT\n"
+
+                            f"<b>Side:</b> "
+                            f"{setup['signal']}\n"
+
+                            f"<b>Entry:</b> "
+                            f"{setup['entry']:.2f}\n"
+
+                            f"<b>SL:</b> "
+                            f"{setup['sl']:.2f}\n"
+
+                            f"<b>TP1:</b> "
+                            f"{setup['tp1']:.2f}\n"
+
+                            f"<b>TP2:</b> "
+                            f"{setup['tp2']:.2f}\n"
+
+                            f"<b>RR2:</b> "
+                            f"{setup['rr2']:.2f}"
+                        )
+
+            # ------------------------------------------------
+            # WAIT logging
+            # ------------------------------------------------
+
+            else:
+
+                now = time.time()
+
+                # Avoid Telegram spam.
+                # WAIT is logged locally every scan,
+                # Telegram WAIT only every 10 minutes.
+
+                if (
+                    now - last_wait_log
+                    >= 600
+                ):
 
                     send_telegram(
-
-                        "📌 <b>PAPER TRADE OPENED</b>\n\n"
-
-                        f"<b>Side:</b> "
-                        f"{setup['signal']}\n"
-
-                        f"<b>Entry:</b> "
-                        f"{setup['entry']:.2f}\n"
-
-                        f"<b>SL:</b> "
-                        f"{setup['sl']:.2f}\n"
-
-                        f"<b>TP1:</b> "
-                        f"{setup['tp1']:.2f}\n"
-
-                        f"<b>TP2:</b> "
-                        f"{setup['tp2']:.2f}"
+                        wait_message(
+                            setup
+                        )
                     )
+
+                    last_wait_log = now
 
             time.sleep(
                 SCAN_INTERVAL
@@ -2304,7 +2961,7 @@ def main():
         except KeyboardInterrupt:
 
             logger.info(
-                "Bot stopped manually"
+                "TradeBrain stopped manually"
             )
 
             break
@@ -2323,7 +2980,7 @@ def main():
 
                     f"<code>{str(e)[:500]}</code>\n\n"
 
-                    "Bot will retry."
+                    "BTCUSDT engine will retry."
                 )
 
             except Exception:
@@ -2337,4 +2994,5 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     main()
