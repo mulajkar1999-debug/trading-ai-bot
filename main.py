@@ -14,7 +14,6 @@ MARKETS = [x.strip().upper() for x in os.getenv('MARKETS','BTCUSD,XAUUSD,ETHUSDT
 
 CONFIG={
  'BTCUSD':('yahoo','BTC-USD',2),
- 'XAUUSD':('yahoo','XAUUSD=X',2),
  'ETHUSDT':('binance','ETHUSDT',2),
  'GBPUSD':('yahoo','GBPUSD=X',5),
 }
